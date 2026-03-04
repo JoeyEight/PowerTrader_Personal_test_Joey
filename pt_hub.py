@@ -10,6 +10,7 @@ import subprocess
 import shutil
 import glob
 import bisect
+import signal
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import tkinter as tk
@@ -20,6 +21,13 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.patches import Rectangle
 from matplotlib.ticker import FuncFormatter
 from matplotlib.transforms import blended_transform_factory
+from path_utils import resolve_runtime_paths, resolve_settings_path, read_settings_file, log_once
+from broker_alpaca import AlpacaBrokerClient
+from broker_oanda import OandaBrokerClient
+from stock_thinker import run_scan as run_stock_scan
+from forex_thinker import run_scan as run_forex_scan
+from stock_trader import run_step as run_stock_trader_step
+from forex_trader import run_step as run_forex_trader_step
 
 DARK_BG = "#070B10"
 DARK_BG2 = "#0B1220"
@@ -32,6 +40,7 @@ DARK_ACCENT = "#00FF66"
 DARK_ACCENT2 = "#00E5FF"   
 DARK_SELECT_BG = "#17324A"
 DARK_SELECT_FG = "#00FF66"
+BASE_DIR, SETTINGS_PATH, DEFAULT_HUB_DATA_DIR, _BOOT_SETTINGS = resolve_runtime_paths(__file__, "pt_hub")
 
 
 @dataclass
@@ -316,6 +325,8 @@ DEFAULT_SETTINGS = {
     "pm_start_pct_no_dca": 5.0,
     "pm_start_pct_with_dca": 2.5,
     "trailing_gap_pct": 0.5,
+    "max_position_usd_per_coin": 0.0,
+    "max_total_exposure_pct": 0.0,
 
     "default_timeframe": "1hour",
     "timeframes": [
@@ -330,8 +341,33 @@ DEFAULT_SETTINGS = {
     "script_neural_runner2": "pt_thinker.py",
     "script_neural_trainer": "pt_trainer.py",
     "script_trader": "pt_trader.py",
+    "alpaca_api_key_id": "",
+    "alpaca_secret_key": "",
+    "alpaca_base_url": "https://paper-api.alpaca.markets",
+    "alpaca_data_url": "https://data.alpaca.markets",
+    "alpaca_paper_mode": True,
+    "stock_auto_trade_enabled": False,
+    "stock_trade_notional_usd": 100.0,
+    "stock_max_open_positions": 1,
+    "stock_score_threshold": 0.2,
+    "stock_profit_target_pct": 0.35,
+    "stock_trailing_gap_pct": 0.2,
+    "stock_max_day_trades": 3,
+    "oanda_account_id": "",
+    "oanda_api_token": "",
+    "oanda_rest_url": "https://api-fxpractice.oanda.com",
+    "oanda_stream_url": "https://stream-fxpractice.oanda.com",
+    "oanda_practice_mode": True,
+    "forex_auto_trade_enabled": False,
+    "forex_trade_units": 1000,
+    "forex_max_open_positions": 1,
+    "forex_score_threshold": 0.2,
+    "forex_profit_target_pct": 0.25,
+    "forex_trailing_gap_pct": 0.15,
     "auto_start_scripts": False,
 }
+
+_READ_INT_FILE_CACHE: Dict[str, Tuple[float, int]] = {}
 
 
 
@@ -350,15 +386,25 @@ def _safe_read_json(path: str) -> Optional[dict]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except (FileNotFoundError, PermissionError, OSError, json.JSONDecodeError, ValueError) as exc:
+        log_once(
+            f"pt_hub:_safe_read_json:{path}:{type(exc).__name__}",
+            f"[pt_hub._safe_read_json] path={path} {type(exc).__name__}: {exc}",
+        )
         return None
 
 
 def _safe_write_json(path: str, data: dict) -> None:
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
+    try:
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except (PermissionError, OSError, TypeError, ValueError) as exc:
+        log_once(
+            f"pt_hub:_safe_write_json:{path}:{type(exc).__name__}",
+            f"[pt_hub._safe_write_json] path={path} {type(exc).__name__}: {exc}",
+        )
 
 
 def _read_trade_history_jsonl(path: str) -> List[dict]:
@@ -470,7 +516,7 @@ def build_coin_folders(main_dir: str, coins: List[str]) -> Dict[str, str]:
     Returns { "BTC": "...", "ETH": "...", ... }
     """
     out: Dict[str, str] = {}
-    main_dir = main_dir or os.getcwd()
+    main_dir = main_dir or BASE_DIR
 
     # BTC folder
     out["BTC"] = main_dir
@@ -552,11 +598,24 @@ def read_price_levels_from_html(path: str) -> List[float]:
 
 def read_int_from_file(path: str) -> int:
     try:
+        mtime = os.path.getmtime(path)
+    except (FileNotFoundError, PermissionError, OSError):
+        return 0
+    hit = _READ_INT_FILE_CACHE.get(path)
+    if hit and hit[0] == mtime:
+        return int(hit[1])
+    try:
         with open(path, "r", encoding="utf-8") as f:
             raw = f.read().strip()
-        return int(float(raw))
-    except Exception:
-        return 0
+        val = int(float(raw))
+    except (FileNotFoundError, PermissionError, OSError, ValueError) as exc:
+        log_once(
+            f"pt_hub:read_int_from_file:{path}:{type(exc).__name__}",
+            f"[pt_hub.read_int_from_file] path={path} {type(exc).__name__}: {exc}",
+        )
+        val = 0
+    _READ_INT_FILE_CACHE[path] = (mtime, val)
+    return val
 
 
 def read_short_signal(folder: str) -> int:
@@ -593,24 +652,17 @@ class CandleFetcher:
         # key: (pair, timeframe, limit) -> (saved_time_epoch, candles)
         self._cache: Dict[Tuple[str, str, int], Tuple[float, List[dict]]] = {}
         self._cache_ttl_seconds: float = 10.0
+        self._lock = threading.Lock()
+        self._pending: set[Tuple[str, str, int]] = set()
+        self._result_q: "queue.Queue[Tuple[Tuple[str, str, int], float, List[dict]]]" = queue.Queue()
 
 
-    def get_klines(self, symbol: str, timeframe: str, limit: int = 120) -> List[dict]:
+    def _fetch_klines_sync(self, pair: str, timeframe: str, limit: int, now: float) -> List[dict]:
         """
         Returns candles oldest->newest as:
           [{"ts": int, "open": float, "high": float, "low": float, "close": float}, ...]
         """
-        symbol = symbol.upper().strip()
-
-        # Your neural uses USDT pairs on KuCoin (ex: BTC-USDT)
-        pair = f"{symbol}-USDT"
         limit = int(limit or 0)
-
-        now = time.time()
-        cache_key = (pair, timeframe, limit)
-        cached = self._cache.get(cache_key)
-        if cached and (now - float(cached[0])) <= float(self._cache_ttl_seconds):
-            return cached[1]
 
         # rough window (timeframe-dependent) so we get enough candles
         tf_seconds = {
@@ -642,8 +694,6 @@ class CandleFetcher:
                 candles.sort(key=lambda x: x["ts"])
                 if limit and len(candles) > limit:
                     candles = candles[-limit:]
-
-                self._cache[cache_key] = (now, candles)
                 return candles
             except Exception:
                 return []
@@ -663,11 +713,59 @@ class CandleFetcher:
             candles.sort(key=lambda x: x["ts"])
             if limit and len(candles) > limit:
                 candles = candles[-limit:]
-
-            self._cache[cache_key] = (now, candles)
             return candles
         except Exception:
             return []
+
+
+    def _start_fetch(self, cache_key: Tuple[str, str, int]) -> None:
+        with self._lock:
+            if cache_key in self._pending:
+                return
+            self._pending.add(cache_key)
+
+        def _worker() -> None:
+            pair, timeframe, limit = cache_key
+            now = time.time()
+            candles = self._fetch_klines_sync(pair, timeframe, limit, now)
+            try:
+                self._result_q.put((cache_key, now, candles))
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+
+    def drain_results(self) -> bool:
+        changed = False
+        while True:
+            try:
+                cache_key, now, candles = self._result_q.get_nowait()
+            except queue.Empty:
+                break
+            with self._lock:
+                self._pending.discard(cache_key)
+                if candles:
+                    self._cache[cache_key] = (now, candles)
+                    changed = True
+        return changed
+
+
+    def get_klines(self, symbol: str, timeframe: str, limit: int = 120) -> List[dict]:
+        symbol = symbol.upper().strip()
+        pair = f"{symbol}-USDT"
+        limit = int(limit or 0)
+        now = time.time()
+        cache_key = (pair, timeframe, limit)
+        with self._lock:
+            cached = self._cache.get(cache_key)
+        if cached and (now - float(cached[0])) <= float(self._cache_ttl_seconds):
+            return cached[1]
+
+        self._start_fetch(cache_key)
+        if cached:
+            return cached[1]
+        return []
 
 
 
@@ -694,13 +792,22 @@ class CandleChart(ttk.Frame):
 
 
         top = ttk.Frame(self)
-        top.pack(fill="x", padx=6, pady=6)
+        top.pack(fill="x", padx=6, pady=(4, 4))
 
-        ttk.Label(top, text=f"{coin} chart").pack(side="left")
+        controls_row = ttk.Frame(top)
+        controls_row.pack(fill="x")
 
-        ttk.Label(top, text="Timeframe:").pack(side="left", padx=(12, 4))
+        status_row = ttk.Frame(top)
+        status_row.pack(fill="x", pady=(2, 0))
+
+        ttk.Label(controls_row, text=f"{coin} chart").pack(side="left")
+
+        display_controls = ttk.Frame(controls_row)
+        display_controls.pack(side="left", padx=(10, 0))
+
+        ttk.Label(display_controls, text="Timeframe:").pack(side="left", padx=(0, 4))
         self.tf_combo = ttk.Combobox(
-            top,
+            display_controls,
             textvariable=self.timeframe_var,
             values=self.settings_getter()["timeframes"],
             state="readonly",
@@ -729,11 +836,23 @@ class CandleChart(ttk.Frame):
 
         self.tf_combo.bind("<<ComboboxSelected>>", _debounced_tf_change)
 
+        self.detailed_overlays_var = tk.BooleanVar(value=False)
+        self.detailed_overlays_chk = ttk.Checkbutton(
+            display_controls,
+            text="Detailed overlays",
+            variable=self.detailed_overlays_var,
+            command=lambda: self.event_generate("<<TimeframeChanged>>", when="tail"),
+        )
+        self.detailed_overlays_chk.pack(side="left", padx=(10, 0))
 
-        self.neural_status_label = ttk.Label(top, text="Neural: N/A")
-        self.neural_status_label.pack(side="left", padx=(12, 0))
 
-        self.last_update_label = ttk.Label(top, text="Last: N/A")
+        self.neural_status_label = ttk.Label(status_row, text="Neural: N/A")
+        self.neural_status_label.pack(side="left")
+
+        self.chart_key_label = ttk.Label(status_row, text="Key: ★ Trail  ◆ DCA  ● Avg")
+        self.chart_key_label.pack(side="left", padx=(12, 0))
+
+        self.last_update_label = ttk.Label(status_row, text="Last: N/A")
         self.last_update_label.pack(side="right")
 
         # Figure
@@ -743,10 +862,9 @@ class CandleChart(ttk.Frame):
         self.fig = Figure(figsize=(6.5, 3.5), dpi=100)
         self.fig.patch.set_facecolor(DARK_BG)
 
-        # Reserve bottom space so date+time x tick labels are always visible
-        # Also reserve right space so the price labels (Bid/Ask/DCA/Sell) can sit outside the plot.
-        # Also reserve a bit of top space so the title never gets clipped.
-        self.fig.subplots_adjust(bottom=0.20, right=0.87, top=0.8)
+        # Keep a small margin for the title and two-line x-axis labels, but otherwise
+        # let the plot use as much of the canvas as possible.
+        self.fig.subplots_adjust(left=0.05, bottom=0.12, right=0.982, top=0.89)
 
         self.ax = self.fig.add_subplot(111)
         self._apply_dark_chart_style()
@@ -821,6 +939,7 @@ class CandleChart(ttk.Frame):
         trail_line: Optional[float] = None,
         dca_line_price: Optional[float] = None,
         avg_cost_basis: Optional[float] = None,
+        quantity: Optional[float] = None,
     ) -> None:
 
 
@@ -828,6 +947,202 @@ class CandleChart(ttk.Frame):
         cfg = self.settings_getter()
 
         tf = self.timeframe_var.get().strip()
+        max_trade_labels = 1
+        LABEL_MIN_SPACING_PX = 14.0
+
+        # Default to a cleaner chart and allow quick toggle without changing app settings.
+        if not hasattr(self, "_chart_level_mode"):
+            self._chart_level_mode = "clean"
+        if not hasattr(self, "_chart_level_mode_bound"):
+            try:
+                canvas_w = self.canvas.get_tk_widget()
+
+                def _toggle_chart_level_mode(_e=None):
+                    try:
+                        self._chart_level_mode = (
+                            "detailed" if self._chart_level_mode == "clean" else "clean"
+                        )
+                        if hasattr(self, "detailed_overlays_var"):
+                            self.detailed_overlays_var.set(self._chart_level_mode == "detailed")
+                        self.event_generate("<<TimeframeChanged>>", when="tail")
+                    except Exception:
+                        self._chart_level_mode = "clean"
+                        if hasattr(self, "detailed_overlays_var"):
+                            self.detailed_overlays_var.set(False)
+
+                # Double-click the chart to switch between Clean and Detailed overlays.
+                canvas_w.bind("<Double-Button-1>", _toggle_chart_level_mode, add="+")
+                self._chart_level_mode_bound = True
+            except Exception:
+                self._chart_level_mode_bound = False
+
+        try:
+            show_detailed_levels = bool(self.detailed_overlays_var.get())
+        except Exception:
+            show_detailed_levels = (getattr(self, "_chart_level_mode", "clean") == "detailed")
+        self._chart_level_mode = "detailed" if show_detailed_levels else "clean"
+        try:
+            self.chart_key_label.config(
+                text=("Key: ★ Trail  ◆ DCA  ● Avg  A Ask  B Bid" if show_detailed_levels else "Key: ★ Trail  ◆ DCA  ● Avg")
+            )
+        except Exception:
+            pass
+
+        if not hasattr(self, "_legend_hover_bound"):
+            try:
+                canvas_w = self.canvas.get_tk_widget()
+
+                def _reset_hover_lines() -> None:
+                    try:
+                        for item in getattr(self, "_line_hover_targets", []):
+                            artist = item.get("artist")
+                            if artist is None:
+                                continue
+                            artist.set_linewidth(float(item.get("line_width", 1.0)))
+                            artist.set_alpha(float(item.get("alpha", 0.9)))
+                        self._active_hover_line = None
+                    except Exception:
+                        pass
+
+                def _set_hover_line(active_item) -> None:
+                    if getattr(self, "_active_hover_line", None) is active_item:
+                        return
+                    _reset_hover_lines()
+                    if not active_item:
+                        return
+                    try:
+                        artist = active_item.get("artist")
+                        if artist is not None:
+                            artist.set_linewidth(float(active_item.get("hover_line_width", active_item.get("line_width", 1.0))))
+                            artist.set_alpha(float(active_item.get("hover_alpha", 1.0)))
+                            self._active_hover_line = active_item
+                    except Exception:
+                        self._active_hover_line = None
+
+                def _hide_legend_tooltip(_e=None):
+                    _reset_hover_lines()
+                    try:
+                        tw = getattr(self, "_legend_tooltip_win", None)
+                        if tw is not None and tw.winfo_exists():
+                            tw.destroy()
+                    except Exception:
+                        pass
+                    self._legend_tooltip_win = None
+                    self._legend_tooltip_label = None
+
+                def _show_legend_tooltip(x_root: int, y_root: int, text: str):
+                    try:
+                        tw = getattr(self, "_legend_tooltip_win", None)
+                        lbl = getattr(self, "_legend_tooltip_label", None)
+                        if tw is None or (not tw.winfo_exists()) or lbl is None or (not lbl.winfo_exists()):
+                            tw = tk.Toplevel(canvas_w)
+                            tw.withdraw()
+                            tw.overrideredirect(True)
+                            try:
+                                tw.attributes("-topmost", True)
+                            except Exception:
+                                pass
+                            lbl = tk.Label(
+                                tw,
+                                text=text,
+                                justify="left",
+                                anchor="w",
+                                padx=8,
+                                pady=6,
+                                bg=DARK_BG2,
+                                fg=DARK_FG,
+                                bd=1,
+                                relief="solid",
+                            )
+                            lbl.pack()
+                            self._legend_tooltip_win = tw
+                            self._legend_tooltip_label = lbl
+                        else:
+                            lbl.config(text=text)
+                        tw.geometry(f"+{int(x_root) + 14}+{int(y_root) + 12}")
+                        tw.deiconify()
+                    except Exception:
+                        pass
+
+                def _line_tooltip_for_event(mpl_event):
+                    x_disp = float(mpl_event.x)
+                    y_disp = float(mpl_event.y)
+
+                    for bbox_item in getattr(self, "_hover_regions_px", []):
+                        try:
+                            x0, y0, x1, y1 = bbox_item["bbox"]
+                            if x0 <= x_disp <= x1 and y0 <= y_disp <= y1:
+                                return str(bbox_item.get("text", "") or "").strip(), None
+                        except Exception:
+                            continue
+
+                    if mpl_event.inaxes is not self.ax:
+                        return "", None
+
+                    try:
+                        ax_bbox = self.ax.get_window_extent()
+                        if not (ax_bbox.x0 <= x_disp <= ax_bbox.x1 and ax_bbox.y0 <= y_disp <= ax_bbox.y1):
+                            return "", None
+                    except Exception:
+                        pass
+
+                    nearest_text = ""
+                    nearest_item = None
+                    nearest_dist = 9.0
+                    for line_item in getattr(self, "_line_hover_targets", []):
+                        try:
+                            dist = abs(y_disp - float(line_item["y_disp"]))
+                            if dist <= nearest_dist:
+                                nearest_text = str(line_item.get("text", "") or "").strip()
+                                nearest_item = line_item
+                                nearest_dist = dist
+                        except Exception:
+                            continue
+                    return nearest_text, nearest_item
+
+                def _on_legend_motion(mpl_event):
+                    try:
+                        if mpl_event.x is None or mpl_event.y is None:
+                            _hide_legend_tooltip()
+                            return
+                        tip_txt, active_item = _line_tooltip_for_event(mpl_event)
+                        if not tip_txt:
+                            _hide_legend_tooltip()
+                            return
+                        _set_hover_line(active_item)
+                        x_disp = float(mpl_event.x)
+                        y_disp = float(mpl_event.y)
+                        gui_evt = getattr(mpl_event, "guiEvent", None)
+                        if gui_evt is not None and hasattr(gui_evt, "x_root") and hasattr(gui_evt, "y_root"):
+                            x_root = int(gui_evt.x_root)
+                            y_root = int(gui_evt.y_root)
+                        else:
+                            x_root = int(canvas_w.winfo_rootx() + x_disp)
+                            y_root = int(canvas_w.winfo_rooty() + (canvas_w.winfo_height() - y_disp))
+                        _show_legend_tooltip(x_root, y_root, tip_txt)
+                    except Exception:
+                        _hide_legend_tooltip()
+
+                self._legend_hover_cid = self.canvas.mpl_connect("motion_notify_event", _on_legend_motion)
+                self._legend_hover_leave_cid = self.canvas.mpl_connect("figure_leave_event", _hide_legend_tooltip)
+                self._legend_hover_bound = True
+            except Exception:
+                self._legend_hover_bound = False
+
+        def _nearest_levels(levels: List[float], anchor: Optional[float], keep: int = 2) -> List[float]:
+            try:
+                vals = [float(v) for v in levels if math.isfinite(float(v)) and float(v) > 0]
+            except Exception:
+                vals = []
+            if show_detailed_levels:
+                return vals
+            try:
+                aa = float(anchor)
+                vals.sort(key=lambda v: abs(v - aa))
+                return vals[:keep]
+            except Exception:
+                return vals[:keep]
+
         limit = int(cfg.get("candles_limit", 120))
 
         candles = self.fetcher.get_klines(self.coin, tf, limit=limit)
@@ -855,6 +1170,47 @@ class CandleChart(ttk.Frame):
         long_levels = _cached(low_path, read_price_levels_from_html, []) if folder else []
         short_levels = _cached(high_path, read_price_levels_from_html, []) if folder else []
 
+        current_mid_price = None
+        try:
+            if (
+                current_buy_price is not None
+                and current_sell_price is not None
+                and float(current_buy_price) > 0
+                and float(current_sell_price) > 0
+            ):
+                current_mid_price = (float(current_buy_price) + float(current_sell_price)) / 2.0
+        except Exception:
+            current_mid_price = None
+        anchor_price = current_mid_price if current_mid_price is not None else avg_cost_basis
+
+        try:
+            position_qty = float(quantity or 0.0)
+        except Exception:
+            position_qty = 0.0
+
+        def _line_impact_text(line_name: str, line_price: Optional[float], meaning: str) -> str:
+            try:
+                price_txt = _fmt_price(float(line_price))
+            except Exception:
+                price_txt = "N/A"
+            base = f"{line_name}: {price_txt}\nMeaning: {meaning}"
+            try:
+                lp = float(line_price)
+                avg = float(avg_cost_basis or 0.0)
+                qtyf = float(position_qty or 0.0)
+                if lp > 0 and avg > 0 and qtyf > 0:
+                    est_value = qtyf * lp
+                    est_cost = qtyf * avg
+                    est_pnl = est_value - est_cost
+                    est_pct = ((lp - avg) / avg) * 100.0
+                    base += (
+                        f"\nImpact if hit: value {_fmt_money(est_value)}"
+                        f" | est. PnL {est_pnl:+.2f} ({est_pct:+.2f}%)"
+                    )
+            except Exception:
+                pass
+            return base
+
         long_sig_path = os.path.join(folder, "long_dca_signal.txt")
         long_sig = _cached(long_sig_path, read_int_from_file, 0) if folder else 0
         short_sig = read_short_signal(folder) if folder else 0
@@ -872,6 +1228,13 @@ class CandleChart(ttk.Frame):
 
 
         if not candles:
+            self._legend_panel_text = f"{self.coin}: waiting for candle data..."
+            self._legend_tooltip_text = ""
+            self._legend_bbox_px = None
+            self._legend_hover_artist = None
+            self._hover_regions_px = []
+            self._hover_text_artists = []
+            self._line_hover_targets = []
             self.ax.set_title(f"{self.coin} ({tf}) - no candles", color=DARK_FG)
             self.canvas.draw_idle()
             return
@@ -928,18 +1291,67 @@ class CandleChart(ttk.Frame):
         except Exception:
             pass
 
+        # Reset the axes to its base geometry; chart legend now lives in the side panel.
+        try:
+            if not hasattr(self, "_base_ax_pos"):
+                self._base_ax_pos = self.ax.get_position().frozen()
+            self.ax.set_position(self._base_ax_pos)
+        except Exception:
+            pass
+
 
 
         # Overlay Neural levels (blue long, orange short)
-        for lv in long_levels:
+        levels_to_draw_long = _nearest_levels(long_levels, anchor_price, keep=2)
+        levels_to_draw_short = _nearest_levels(short_levels, anchor_price, keep=2)
+        line_hover_targets = []
+        for lv in levels_to_draw_long:
             try:
-                self.ax.axhline(y=float(lv), linewidth=1, color="blue", alpha=0.8)
+                yy = float(lv)
+                artist = self.ax.axhline(
+                    y=yy,
+                    linewidth=1,
+                    color="blue",
+                    alpha=(0.8 if show_detailed_levels else 0.65),
+                )
+                line_hover_targets.append({
+                    "y": yy,
+                    "artist": artist,
+                    "line_width": 1.0,
+                    "hover_line_width": 1.8,
+                    "alpha": (0.8 if show_detailed_levels else 0.65),
+                    "hover_alpha": 1.0,
+                    "text": _line_impact_text(
+                        "Long level",
+                        yy,
+                        "Neural long support/reference level; price moving near it strengthens bullish context.",
+                    ),
+                })
             except Exception:
                 pass
 
-        for lv in short_levels:
+        for lv in levels_to_draw_short:
             try:
-                self.ax.axhline(y=float(lv), linewidth=1, color="orange", alpha=0.8)
+                yy = float(lv)
+                artist = self.ax.axhline(
+                    y=yy,
+                    linewidth=1,
+                    color="orange",
+                    alpha=(0.8 if show_detailed_levels else 0.65),
+                )
+                line_hover_targets.append({
+                    "y": yy,
+                    "artist": artist,
+                    "line_width": 1.0,
+                    "hover_line_width": 1.8,
+                    "alpha": (0.8 if show_detailed_levels else 0.65),
+                    "hover_alpha": 1.0,
+                    "text": _line_impact_text(
+                        "Short level",
+                        yy,
+                        "Neural short resistance/reference level; price moving near it strengthens bearish context.",
+                    ),
+                })
             except Exception:
                 pass
 
@@ -947,86 +1359,234 @@ class CandleChart(ttk.Frame):
         # Overlay Trailing PM line (sell) and next DCA line
         try:
             if trail_line is not None and float(trail_line) > 0:
-                self.ax.axhline(y=float(trail_line), linewidth=1.5, color="green", alpha=0.95)
+                yy = float(trail_line)
+                artist = self.ax.axhline(y=yy, linewidth=1.5, color="green", alpha=0.95)
+                line_hover_targets.append({
+                    "y": yy,
+                    "artist": artist,
+                    "line_width": 1.5,
+                    "hover_line_width": 2.2,
+                    "alpha": 0.95,
+                    "hover_alpha": 1.0,
+                    "text": _line_impact_text(
+                        "Trail line",
+                        yy,
+                        "Active trailing sell threshold for the current position.",
+                    ),
+                })
         except Exception:
             pass
 
         try:
             if dca_line_price is not None and float(dca_line_price) > 0:
-                self.ax.axhline(y=float(dca_line_price), linewidth=1.5, color="red", alpha=0.95)
+                yy = float(dca_line_price)
+                artist = self.ax.axhline(y=yy, linewidth=1.5, color="red", alpha=0.95)
+                line_hover_targets.append({
+                    "y": yy,
+                    "artist": artist,
+                    "line_width": 1.5,
+                    "hover_line_width": 2.2,
+                    "alpha": 0.95,
+                    "hover_alpha": 1.0,
+                    "text": _line_impact_text(
+                        "Next DCA",
+                        yy,
+                        "Next configured DCA trigger price; touching it makes the next averaging buy eligible.",
+                    ),
+                })
         except Exception:
             pass
 
         # Overlay avg cost basis (yellow)
         try:
             if avg_cost_basis is not None and float(avg_cost_basis) > 0:
-                self.ax.axhline(y=float(avg_cost_basis), linewidth=1.5, color="yellow", alpha=0.95)
+                yy = float(avg_cost_basis)
+                artist = self.ax.axhline(y=yy, linewidth=1.5, color="yellow", alpha=0.95)
+                line_hover_targets.append({
+                    "y": yy,
+                    "artist": artist,
+                    "line_width": 1.5,
+                    "hover_line_width": 2.2,
+                    "alpha": 0.95,
+                    "hover_alpha": 1.0,
+                    "text": _line_impact_text(
+                        "Average cost",
+                        yy,
+                        "Current blended entry price; near break-even before fees/slippage.",
+                    ),
+                })
         except Exception:
             pass
 
         # Overlay current ask/bid prices
         try:
             if current_buy_price is not None and float(current_buy_price) > 0:
-                self.ax.axhline(y=float(current_buy_price), linewidth=1.5, color="purple", alpha=0.95)
+                yy = float(current_buy_price)
+                artist = self.ax.axhline(y=yy, linewidth=1.5, color="purple", alpha=0.95)
+                if show_detailed_levels:
+                    line_hover_targets.append({
+                        "y": yy,
+                        "artist": artist,
+                        "line_width": 1.5,
+                        "hover_line_width": 2.2,
+                        "alpha": 0.95,
+                        "hover_alpha": 1.0,
+                        "text": _line_impact_text(
+                            "Ask",
+                            yy,
+                            "Current buy-side market reference price.",
+                        ),
+                    })
         except Exception:
             pass
 
         try:
             if current_sell_price is not None and float(current_sell_price) > 0:
-                self.ax.axhline(y=float(current_sell_price), linewidth=1.5, color="teal", alpha=0.95)
+                yy = float(current_sell_price)
+                artist = self.ax.axhline(y=yy, linewidth=1.5, color="teal", alpha=0.95)
+                if show_detailed_levels:
+                    line_hover_targets.append({
+                        "y": yy,
+                        "artist": artist,
+                        "line_width": 1.5,
+                        "hover_line_width": 2.2,
+                        "alpha": 0.95,
+                        "hover_alpha": 1.0,
+                        "text": _line_impact_text(
+                            "Bid",
+                            yy,
+                            "Current sell-side market reference price.",
+                        ),
+                    })
         except Exception:
             pass
 
-        # Right-side price labels (so you can read Bid/Ask/AVG/DCA/Sell at a glance)
+        # Right-side boxed price labels have been removed; line hover now carries the context instead.
+        self._hover_text_artists = []
+
+        # Build the chart legend text for the side panel.
         try:
-            trans = blended_transform_factory(self.ax.transAxes, self.ax.transData)
-            used_y: List[float] = []
-            y0, y1 = self.ax.get_ylim()
-            y_pad = max((y1 - y0) * 0.012, 1e-9)
+            trade_start_level = int(cfg.get("trade_start_level", 3) or 3)
+            dca_levels_cfg = list(cfg.get("dca_levels", []) or [])
+            dca_mult = float(cfg.get("dca_multiplier", 2.0) or 2.0)
+            max_dca_24h = int(cfg.get("max_dca_buys_per_24h", 2) or 2)
+            pm_no_dca = float(cfg.get("pm_start_pct_no_dca", 5.0) or 5.0)
+            pm_with_dca = float(cfg.get("pm_start_pct_with_dca", 2.5) or 2.5)
+            trail_gap = float(cfg.get("trailing_gap_pct", 0.5) or 0.5)
+            level_mode_label = "Detailed" if show_detailed_levels else "Clean"
 
-            def _label_right(y: Optional[float], tag: str, color: str) -> None:
-                if y is None:
-                    return
+            def _fmt_level_list(vals: List[float]) -> str:
                 try:
-                    yy = float(y)
-                    if (not math.isfinite(yy)) or yy <= 0:
-                        return
+                    if not vals:
+                        return "N/A"
+                    shown_vals = list(vals)
+                    extra_count = 0
+                    if show_detailed_levels and len(shown_vals) > 6:
+                        extra_count = len(shown_vals) - 6
+                        shown_vals = shown_vals[:6]
+                    txt = ", ".join(_fmt_price(float(v)) for v in shown_vals)
+                    if extra_count > 0:
+                        txt += f" (+{extra_count} more)"
+                    return txt
                 except Exception:
-                    return
+                    return "N/A"
 
-                # Nudge labels apart if levels are very close
-                for prev in used_y:
-                    if abs(yy - prev) < y_pad:
-                        yy = prev + y_pad
-                used_y.append(yy)
+            def _fmt_optional_price(v: Optional[float]) -> str:
+                try:
+                    vv = float(v)
+                    if vv > 0 and math.isfinite(vv):
+                        return _fmt_price(vv)
+                except Exception:
+                    pass
+                return "N/A"
 
-                self.ax.text(
-                    1.01,
-                    yy,
-                    f"{tag} {_fmt_price(yy)}",
-                    transform=trans,
-                    ha="left",
-                    va="center",
-                    fontsize=8,
-                    color=color,
-                    bbox=dict(
-                        facecolor=DARK_BG2,
-                        edgecolor=color,
-                        boxstyle="round,pad=0.18",
-                        alpha=0.85,
-                    ),
-                    zorder=20,
-                    clip_on=False,
-                )
+            def _fmt_delta(anchor_val: Optional[float], target_val: Optional[float]) -> str:
+                try:
+                    aa = float(anchor_val)
+                    tt = float(target_val)
+                    if (not math.isfinite(aa)) or (not math.isfinite(tt)) or aa <= 0 or tt <= 0:
+                        return "N/A"
+                    delta_pct = ((tt - aa) / aa) * 100.0
+                    return f"{delta_pct:+.2f}%"
+                except Exception:
+                    return "N/A"
 
-            # Map to your terminology: Ask=buy line, Bid=sell line
-            _label_right(current_buy_price, "ASK", "purple")
-            _label_right(current_sell_price, "BID", "teal")
-            _label_right(avg_cost_basis, "AVG", "yellow")
-            _label_right(dca_line_price, "DCA", "red")
-            _label_right(trail_line, "SELL", "green")
+            ask_text = _fmt_optional_price(current_buy_price)
+            bid_text = _fmt_optional_price(current_sell_price)
+            avg_text = _fmt_optional_price(avg_cost_basis)
+            dca_text = _fmt_optional_price(dca_line_price)
+            trail_text = _fmt_optional_price(trail_line)
+            anchor_text = _fmt_optional_price(anchor_price)
+            dca_delta_text = _fmt_delta(anchor_price, dca_line_price)
+            trail_delta_text = _fmt_delta(anchor_price, trail_line)
 
+            try:
+                dca_levels_shown = dca_levels_cfg[:4]
+                dca_extra = max(0, len(dca_levels_cfg) - len(dca_levels_shown))
+                dca_levels_text = ", ".join(str(v) for v in dca_levels_shown) if dca_levels_shown else "N/A"
+                if dca_extra > 0:
+                    dca_levels_text += f" (+{dca_extra} more)"
+            except Exception:
+                dca_levels_text = "N/A"
+
+            def _wrap_text_block(text: str, width: int = 60) -> str:
+                lines = []
+                for raw_line in str(text).splitlines():
+                    line = raw_line.strip()
+                    if len(line) <= width:
+                        lines.append(line)
+                        continue
+                    current = ""
+                    for word in line.split(" "):
+                        test = word if not current else f"{current} {word}"
+                        if len(test) <= width:
+                            current = test
+                        else:
+                            if current:
+                                lines.append(current)
+                            current = word
+                    if current:
+                        lines.append(current)
+                return "\n".join(lines)
+
+            legend_lines = [
+                f"Mode: {level_mode_label}",
+                "Key: ★ Trail | ◆ DCA | ● Avg",
+                f"Long: {_fmt_level_list(levels_to_draw_long)}",
+                f"Short: {_fmt_level_list(levels_to_draw_short)}",
+                f"Px: ● {avg_text} | ◆ {dca_text} | ★ {trail_text}",
+                f"Δ: ◆ {dca_delta_text} | ★ {trail_delta_text}",
+            ]
+            if show_detailed_levels:
+                legend_lines = [
+                    "Mode: Detailed",
+                    "Key: ★ Trail | ◆ DCA | ● Avg | A | B",
+                    f"Long: {_fmt_level_list(levels_to_draw_long)}",
+                    f"Short: {_fmt_level_list(levels_to_draw_short)}",
+                    f"Px: A {ask_text} | B {bid_text} | ● {avg_text} | ★ {trail_text}",
+                    f"Δ: ◆ {dca_delta_text} | ★ {trail_delta_text}",
+                    "Params:",
+                    f"Start L{trade_start_level}",
+                    f"DCA%: [{dca_levels_text}]",
+                    f"x{dca_mult:g} | Max {max_dca_24h}/coin/24h",
+                    f"PM: +{pm_no_dca:g}% / +{pm_with_dca:g}% | Gap {trail_gap:g}%",
+                ]
+
+            legend_text = _wrap_text_block("\n".join(legend_lines), width=60)
+
+            self._legend_panel_text = legend_text
+            self._legend_mode = level_mode_label
+            self._legend_tooltip_text = ""
+            self._legend_bbox_px = None
+            self._legend_hover_artist = None
+            self._legend_needs_scroll = bool(show_detailed_levels)
         except Exception:
+            self._legend_panel_text = "Legend unavailable"
+            self._legend_mode = "N/A"
+            self._legend_tooltip_text = ""
+            self._legend_bbox_px = None
+            self._legend_hover_artist = None
+            self._legend_needs_scroll = False
             pass
 
 
@@ -1035,11 +1595,13 @@ class CandleChart(ttk.Frame):
         # --- Trade dots (BUY / DCA / SELL) for THIS coin only ---
         try:
             trades = _read_trade_history_jsonl(self.trade_history_path) if self.trade_history_path else []
+            plotted_trade_points = []
             if trades:
                 candle_ts = [int(c["ts"]) for c in candles]  # oldest->newest
                 t_min = float(candle_ts[0])
                 t_max = float(candle_ts[-1])
 
+                plotted_trade_points = []
                 for tr in trades:
                     sym = str(tr.get("symbol", "")).upper()
                     base = sym.split("-")[0].strip() if sym else ""
@@ -1094,6 +1656,14 @@ class CandleChart(ttk.Frame):
 
                     x = idx
                     self.ax.scatter([x], [y], s=35, color=color, zorder=6)
+                    plotted_trade_points.append((tts, label, x, y))
+        except Exception:
+            pass
+
+        try:
+            if plotted_trade_points:
+                plotted_trade_points.sort(key=lambda item: item[0])
+                for _, label, x, y in plotted_trade_points[-max_trade_labels:]:
                     self.ax.annotate(
                         label,
                         (x, y),
@@ -1148,6 +1718,54 @@ class CandleChart(ttk.Frame):
 
 
         self.canvas.draw_idle()
+        try:
+            try:
+                self._line_hover_targets = [
+                    {
+                        "text": str(item.get("text", "") or "").strip(),
+                        "y_disp": float(self.ax.transData.transform((0.0, float(item.get("y", 0.0))))[1]),
+                        "artist": item.get("artist"),
+                        "line_width": float(item.get("line_width", 1.0)),
+                        "hover_line_width": float(item.get("hover_line_width", item.get("line_width", 1.0))),
+                        "alpha": float(item.get("alpha", 0.9)),
+                        "hover_alpha": float(item.get("hover_alpha", 1.0)),
+                    }
+                    for item in (line_hover_targets or [])
+                    if str(item.get("text", "") or "").strip()
+                ]
+            except Exception:
+                self._line_hover_targets = []
+
+            if getattr(self, "_hover_text_artists", []):
+                if getattr(self, "_legend_bbox_after_id", None):
+                    self.after_cancel(self._legend_bbox_after_id)
+
+                def _refresh_legend_bbox():
+                    try:
+                        renderer = self.canvas.get_renderer()
+                        hover_regions = []
+                        for artist, text in list(getattr(self, "_hover_text_artists", [])):
+                            try:
+                                bbox = artist.get_window_extent(renderer=renderer)
+                                hover_regions.append({"bbox": (bbox.x0, bbox.y0, bbox.x1, bbox.y1), "text": text})
+                            except Exception:
+                                continue
+                        self._hover_regions_px = hover_regions
+                    except Exception:
+                        self._hover_regions_px = []
+                    finally:
+                        self._legend_bbox_after_id = None
+
+                self._legend_bbox_after_id = self.after_idle(_refresh_legend_bbox)
+            else:
+                self._hover_regions_px = []
+                tw = getattr(self, "_legend_tooltip_win", None)
+                if tw is not None and tw.winfo_exists():
+                    tw.destroy()
+                    self._legend_tooltip_win = None
+                    self._legend_tooltip_label = None
+        except Exception:
+            pass
 
 
         self.neural_status_label.config(text=f"Neural: long={long_sig} short={short_sig} | levels L={len(long_levels)} S={len(short_levels)}")
@@ -1192,10 +1810,8 @@ class AccountValueChart(ttk.Frame):
         self.fig = Figure(figsize=(6.5, 3.5), dpi=100)
         self.fig.patch.set_facecolor(DARK_BG)
 
-        # Reserve bottom space so date+time x tick labels are always visible
-        # Also reserve right space so the price labels (Bid/Ask/DCA/Sell) can sit outside the plot.
-        # Also reserve a bit of top space so the title never gets clipped.
-        self.fig.subplots_adjust(bottom=0.25, right=0.87, top=0.8)
+        # Keep a modest buffer for labels/title while maximizing the visible chart area.
+        self.fig.subplots_adjust(left=0.05, bottom=0.14, right=0.988, top=0.89)
 
         self.ax = self.fig.add_subplot(111)
         self._apply_dark_chart_style()
@@ -1442,6 +2058,10 @@ class AccountValueChart(ttk.Frame):
                     y = ys[idx]
 
                     self.ax.scatter([x], [y], s=30, color=color, zorder=6)
+                    plotted_trade_points.append((tts, label, x, y))
+
+                plotted_trade_points.sort(key=lambda item: item[0])
+                for _, label, x, y in plotted_trade_points[-3:]:
                     self.ax.annotate(
                         label,
                         (x, y),
@@ -1556,7 +2176,7 @@ class PowerTraderHub(tk.Tk):
 
         self.settings = self._load_settings()
 
-        self.project_dir = os.path.abspath(os.path.dirname(__file__))
+        self.project_dir = BASE_DIR
 
         main_dir = str(self.settings.get("main_neural_dir") or "").strip()
         if main_dir and not os.path.isabs(main_dir):
@@ -1567,15 +2187,53 @@ class PowerTraderHub(tk.Tk):
 
 
         # hub data dir
-        hub_dir = self.settings.get("hub_data_dir") or os.path.join(self.project_dir, "hub_data")
+        hub_dir = str(self.settings.get("hub_data_dir") or "").strip()
+        if hub_dir and not os.path.isabs(hub_dir):
+            hub_dir = os.path.abspath(os.path.join(self.project_dir, hub_dir))
+        if (not hub_dir) or (not os.path.isdir(hub_dir)):
+            hub_dir = DEFAULT_HUB_DATA_DIR
         self.hub_dir = os.path.abspath(hub_dir)
         _ensure_dir(self.hub_dir)
 
         # file paths written by pt_trader.py (after edits below)
         self.trader_status_path = os.path.join(self.hub_dir, "trader_status.json")
+        self.trader_data_path = os.path.join(self.hub_dir, "trader_data.json")
         self.trade_history_path = os.path.join(self.hub_dir, "trade_history.jsonl")
         self.pnl_ledger_path = os.path.join(self.hub_dir, "pnl_ledger.json")
         self.account_value_history_path = os.path.join(self.hub_dir, "account_value_history.jsonl")
+        self.runner_pid_path = os.path.join(self.hub_dir, "runner.pid")
+        self.stop_flag_path = os.path.join(self.hub_dir, "stop_trading.flag")
+        self.runner_logs_dir = os.path.join(self.hub_dir, "logs")
+        _ensure_dir(self.runner_logs_dir)
+        self.runner_log_path = os.path.join(self.runner_logs_dir, "runner.log")
+        self.runner_launch_log_path = os.path.join(self.runner_logs_dir, "runner_ui_launch.log")
+        self.trader_log_path = os.path.join(self.runner_logs_dir, "trader.log")
+        self.market_state_dirs = {
+            "stocks": os.path.join(self.hub_dir, "stocks"),
+            "forex": os.path.join(self.hub_dir, "forex"),
+        }
+        for _mk_dir in self.market_state_dirs.values():
+            _ensure_dir(_mk_dir)
+        self.market_status_paths = {
+            "stocks": os.path.join(self.market_state_dirs["stocks"], "alpaca_status.json"),
+            "forex": os.path.join(self.market_state_dirs["forex"], "oanda_status.json"),
+        }
+        self.market_thinker_paths = {
+            "stocks": os.path.join(self.market_state_dirs["stocks"], "stock_thinker_status.json"),
+            "forex": os.path.join(self.market_state_dirs["forex"], "forex_thinker_status.json"),
+        }
+        self.market_trader_paths = {
+            "stocks": os.path.join(self.market_state_dirs["stocks"], "stock_trader_status.json"),
+            "forex": os.path.join(self.market_state_dirs["forex"], "forex_trader_status.json"),
+        }
+        self.market_panels: Dict[str, Dict[str, Any]] = {}
+        self._market_test_busy: Dict[str, bool] = {}
+        self._market_refresh_busy: Dict[str, bool] = {}
+        self._market_thinker_busy: Dict[str, bool] = {}
+        self._market_trader_busy: Dict[str, bool] = {}
+        self._last_market_refresh_ts: Dict[str, float] = {}
+        self._last_market_thinker_ts: Dict[str, float] = {}
+        self._last_market_trader_ts: Dict[str, float] = {}
 
         # file written by pt_thinker.py (runner readiness gate used for Start All)
         self.runner_ready_path = os.path.join(self.hub_dir, "runner_ready.json")
@@ -1612,6 +2270,10 @@ class PowerTraderHub(tk.Tk):
             name="Trader",
             path=os.path.abspath(os.path.join(self.project_dir, self.settings["script_trader"]))
         )
+        self.proc_runner = ProcInfo(
+            name="Trade Supervisor",
+            path=os.path.abspath(os.path.join(self.project_dir, "pt_runner.py"))
+        )
 
         self.proc_trainer_path = os.path.abspath(os.path.join(self.project_dir, self.settings["script_neural_trainer"]))
 
@@ -1624,8 +2286,12 @@ class PowerTraderHub(tk.Tk):
 
         self.fetcher = CandleFetcher()
 
-
-        self.fetcher = CandleFetcher()
+        # Shared fixed-width font used by multiple UI panels (legend + logs).
+        # It must exist before _build_layout() because some left-side widgets use it.
+        _base = tkfont.nametofont("TkFixedFont")
+        _half = max(8, int(round(abs(int(_base.cget("size"))) * 0.82)))
+        self._live_log_font = _base.copy()
+        self._live_log_font.configure(size=_half)
 
         self._build_menu()
         self._build_layout()
@@ -1695,7 +2361,14 @@ class PowerTraderHub(tk.Tk):
                 pass
 
         try:
-            style.configure("TLabelframe", background=DARK_BG, foreground=DARK_FG, bordercolor=DARK_BORDER)
+            style.configure(
+                "TLabelframe",
+                background=DARK_BG,
+                foreground=DARK_FG,
+                bordercolor=DARK_BORDER,
+                relief="solid",
+                borderwidth=1,
+            )
             style.configure("TLabelframe.Label", background=DARK_BG, foreground=DARK_ACCENT)
         except Exception:
             pass
@@ -1714,12 +2387,13 @@ class PowerTraderHub(tk.Tk):
                 bordercolor=DARK_BORDER,
                 focusthickness=1,
                 focuscolor=DARK_ACCENT,
-                padding=(10, 6),
+                relief="flat",
+                padding=(14, 8),
             )
             style.map(
                 "TButton",
                 background=[
-                    ("active", DARK_PANEL2),
+                    ("active", "#102036"),
                     ("pressed", DARK_PANEL),
                     ("disabled", DARK_BG2),
                 ],
@@ -1731,6 +2405,20 @@ class PowerTraderHub(tk.Tk):
                     ("active", DARK_ACCENT2),
                     ("focus", DARK_ACCENT),
                 ],
+            )
+            style.configure(
+                "Accent.TButton",
+                background=DARK_PANEL2,
+                foreground=DARK_ACCENT2,
+                bordercolor=DARK_ACCENT2,
+                relief="flat",
+                padding=(14, 8),
+            )
+            style.map(
+                "Accent.TButton",
+                background=[("active", "#15304D"), ("pressed", DARK_PANEL)],
+                foreground=[("active", DARK_ACCENT)],
+                bordercolor=[("active", DARK_ACCENT), ("focus", DARK_ACCENT2)],
             )
         except Exception:
             pass
@@ -1755,12 +2443,13 @@ class PowerTraderHub(tk.Tk):
                 foreground=DARK_FG,
                 bordercolor=DARK_BORDER,
                 arrowcolor=DARK_ACCENT,
+                padding=4,
             )
             style.map(
                 "TCombobox",
                 fieldbackground=[
                     ("readonly", DARK_PANEL),
-                    ("focus", DARK_PANEL2),
+                    ("focus", "#102036"),
                 ],
                 foreground=[("readonly", DARK_FG)],
                 background=[("readonly", DARK_PANEL)],
@@ -1771,11 +2460,11 @@ class PowerTraderHub(tk.Tk):
         # Notebooks
         try:
             style.configure("TNotebook", background=DARK_BG, bordercolor=DARK_BORDER)
-            style.configure("TNotebook.Tab", background=DARK_BG2, foreground=DARK_FG, padding=(10, 6))
+            style.configure("TNotebook.Tab", background=DARK_BG2, foreground=DARK_FG, padding=(14, 8))
             style.map(
                 "TNotebook.Tab",
                 background=[
-                    ("selected", DARK_PANEL),
+                    ("selected", "#102036"),
                     ("active", DARK_PANEL2),
                 ],
                 foreground=[
@@ -1842,6 +2531,7 @@ class PowerTraderHub(tk.Tk):
                 bordercolor=DARK_BORDER,
                 lightcolor=DARK_BORDER,
                 darkcolor=DARK_BORDER,
+                rowheight=26,
             )
             style.map(
                 "Treeview",
@@ -1879,7 +2569,7 @@ class PowerTraderHub(tk.Tk):
     # ---- settings ----
 
     def _load_settings(self) -> dict:
-        settings_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), SETTINGS_FILE)
+        settings_path = resolve_settings_path(BASE_DIR) or SETTINGS_PATH or os.path.join(BASE_DIR, SETTINGS_FILE)
         data = _safe_read_json(settings_path)
         if not isinstance(data, dict):
             data = {}
@@ -1891,7 +2581,7 @@ class PowerTraderHub(tk.Tk):
         return merged
 
     def _save_settings(self) -> None:
-        settings_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), SETTINGS_FILE)
+        settings_path = resolve_settings_path(BASE_DIR) or SETTINGS_PATH or os.path.join(BASE_DIR, SETTINGS_FILE)
         _safe_write_json(settings_path, self.settings)
 
 
@@ -1907,7 +2597,7 @@ class PowerTraderHub(tk.Tk):
         """
         try:
             coins = [str(c).strip().upper() for c in (self.settings.get("coins") or []) if str(c).strip()]
-            main_dir = (self.settings.get("main_neural_dir") or self.project_dir or os.getcwd()).strip()
+            main_dir = (self.settings.get("main_neural_dir") or self.project_dir or BASE_DIR).strip()
 
             trainer_name = os.path.basename(str(self.settings.get("script_neural_trainer", "neural_trainer.py")))
 
@@ -1959,8 +2649,8 @@ class PowerTraderHub(tk.Tk):
             activebackground=DARK_SELECT_BG,
             activeforeground=DARK_SELECT_FG,
         )
-        m_scripts.add_command(label="Start All", command=self.start_all_scripts)
-        m_scripts.add_command(label="Stop All", command=self.stop_all_scripts)
+        m_scripts.add_command(label="Start Trades", command=self.start_all_scripts)
+        m_scripts.add_command(label="Stop Trades", command=self.stop_all_scripts)
         m_scripts.add_separator()
         m_scripts.add_command(label="Start Neural Runner", command=self.start_neural)
         m_scripts.add_command(label="Stop Neural Runner", command=self.stop_neural)
@@ -1995,7 +2685,18 @@ class PowerTraderHub(tk.Tk):
 
 
     def _build_layout(self) -> None:
-        outer = ttk.Panedwindow(self, orient="horizontal")
+        self.market_nb = ttk.Notebook(self)
+        self.market_nb.pack(fill="both", expand=True)
+
+        self.crypto_market_tab = ttk.Frame(self.market_nb)
+        self.stocks_market_tab = ttk.Frame(self.market_nb)
+        self.forex_market_tab = ttk.Frame(self.market_nb)
+
+        self.market_nb.add(self.crypto_market_tab, text="Crypto")
+        self.market_nb.add(self.stocks_market_tab, text="Stocks")
+        self.market_nb.add(self.forex_market_tab, text="Forex")
+
+        outer = ttk.Panedwindow(self.crypto_market_tab, orient="horizontal")
         outer.pack(fill="both", expand=True)
 
         # LEFT + RIGHT panes
@@ -2084,56 +2785,24 @@ class PowerTraderHub(tk.Tk):
 
 
         # ----------------------------
-        # LEFT: 1) Controls / Health (pane)
+        # LEFT: 1) Dashboard (pane)
         # ----------------------------
-        top_controls = ttk.LabelFrame(left_split, text="Controls / Health")
+        top_controls = ttk.LabelFrame(left_split, text="Dashboard")
 
         # Layout requirement:
         #   - Buttons (full width) ABOVE
         #   - Dual section BELOW:
         #       LEFT  = Status + Account + Profit
-        #       RIGHT = Training
+        #       RIGHT = free for future expansion (training now lives in Live Output)
         buttons_bar = ttk.Frame(top_controls)
         buttons_bar.pack(fill="x", expand=False, padx=0, pady=0)
 
         info_row = ttk.Frame(top_controls)
         info_row.pack(fill="x", expand=False, padx=0, pady=0)
 
-        # LEFT column (status + account/profit)
+        # LEFT column (status + account/legend)
         controls_left = ttk.Frame(info_row)
         controls_left.pack(side="left", fill="both", expand=True)
-
-        # RIGHT column (training)
-        training_section = ttk.LabelFrame(info_row, text="Training")
-        training_section.pack(side="right", fill="both", expand=False, padx=6, pady=6)
-
-        training_left = ttk.Frame(training_section)
-        training_left.pack(side="left", fill="both", expand=True)
-
-        # Train coin selector (so you can choose what "Train Selected" targets)
-        train_row = ttk.Frame(training_left)
-        train_row.pack(fill="x", padx=6, pady=(6, 0))
-
-        self.train_coin_var = tk.StringVar(value=(self.coins[0] if self.coins else ""))
-        ttk.Label(train_row, text="Train coin:").pack(side="left")
-        self.train_coin_combo = ttk.Combobox(
-            train_row,
-            textvariable=self.train_coin_var,
-            values=self.coins,
-            width=8,
-            state="readonly",
-        )
-        self.train_coin_combo.pack(side="left", padx=(6, 0))
-
-        def _sync_train_coin(*_):
-            try:
-                # keep the Trainers tab dropdown in sync (if present)
-                self.trainer_coin_var.set(self.train_coin_var.get())
-            except Exception:
-                pass
-
-        self.train_coin_combo.bind("<<ComboboxSelected>>", _sync_train_coin)
-        _sync_train_coin()
 
 
 
@@ -2239,85 +2908,110 @@ class PowerTraderHub(tk.Tk):
 
 
 
-        self.lbl_neural = ttk.Label(controls_left, text="Neural: stopped")
-        self.lbl_neural.pack(anchor="w", padx=6, pady=(0, 2))
+        system_box = ttk.LabelFrame(controls_left, text="System")
+        system_box.pack(fill="x", padx=6, pady=(0, 6))
 
-        self.lbl_trader = ttk.Label(controls_left, text="Trader: stopped")
+        self.lbl_neural = ttk.Label(system_box, text="Neural: stopped")
+        self.lbl_neural.pack(anchor="w", padx=6, pady=(2, 2))
+
+        self.lbl_trader = ttk.Label(system_box, text="Trader: stopped")
         self.lbl_trader.pack(anchor="w", padx=6, pady=(0, 6))
 
-        self.lbl_last_status = ttk.Label(controls_left, text="Last status: N/A")
+        self.lbl_last_status = ttk.Label(system_box, text="Last status: N/A")
         self.lbl_last_status.pack(anchor="w", padx=6, pady=(0, 2))
-
-
-        # ----------------------------
-        # Training section (everything training-specific lives here)
-        # ----------------------------
-        train_buttons_row = ttk.Frame(training_left)
-        train_buttons_row.pack(fill="x", padx=6, pady=(6, 6))
-
-        ttk.Button(train_buttons_row, text="Train Selected", width=BTN_W, command=self.train_selected_coin).pack(anchor="w", pady=(0, 6))
-        ttk.Button(train_buttons_row, text="Train All", width=BTN_W, command=self.train_all_coins).pack(anchor="w")
-
-        # Training status (per-coin + gating reason)
-        self.lbl_training_overview = ttk.Label(training_left, text="Training: N/A")
-        self.lbl_training_overview.pack(anchor="w", padx=6, pady=(0, 2))
-
-        self.lbl_flow_hint = ttk.Label(training_left, text="Flow: Train → Start All")
-        self.lbl_flow_hint.pack(anchor="w", padx=6, pady=(0, 6))
-
-        self.training_list = tk.Listbox(
-            training_left,
-            height=5,
-            bg=DARK_PANEL,
-            fg=DARK_FG,
-            selectbackground=DARK_SELECT_BG,
-            selectforeground=DARK_SELECT_FG,
-            highlightbackground=DARK_BORDER,
-            highlightcolor=DARK_ACCENT,
-            activestyle="none",
-        )
-        self.training_list.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-
-
-        # Start All (moved here: LEFT side of the dual section, directly above Account)
-        start_all_row = ttk.Frame(controls_left)
+        # Start Trades (left control column; does not affect layout elsewhere)
+        start_all_row = ttk.Frame(system_box)
         start_all_row.pack(fill="x", padx=6, pady=(0, 6))
 
         self.btn_toggle_all = ttk.Button(
             start_all_row,
-            text="Start All",
+            text="Start Trades",
             width=BTN_W,
             command=self.toggle_all_scripts,
         )
         self.btn_toggle_all.pack(side="left")
 
-
-        # Account info (LEFT column, under status)
-        acct_box = ttk.LabelFrame(controls_left, text="Account")
+        acct_box = ttk.LabelFrame(controls_left, text="Portfolio")
         acct_box.pack(fill="x", padx=6, pady=6)
+        self.acct_box = acct_box
 
+        portfolio_grid = ttk.Frame(acct_box)
+        portfolio_grid.pack(fill="x", padx=6, pady=4)
+        portfolio_grid.columnconfigure(0, weight=0)
+        portfolio_grid.columnconfigure(1, weight=1)
 
-        self.lbl_acct_total_value = ttk.Label(acct_box, text="Total Account Value: N/A")
-        self.lbl_acct_total_value.pack(anchor="w", padx=6, pady=(2, 0))
+        def _add_portfolio_metric(row: int, label: str):
+            ttk.Label(portfolio_grid, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=2)
+            value_lbl = ttk.Label(portfolio_grid, text="N/A", foreground=DARK_FG)
+            value_lbl.grid(row=row, column=1, sticky="e", pady=2)
+            return value_lbl
 
-        self.lbl_acct_holdings_value = ttk.Label(acct_box, text="Holdings Value: N/A")
-        self.lbl_acct_holdings_value.pack(anchor="w", padx=6, pady=(2, 0))
+        self.lbl_acct_total_value = _add_portfolio_metric(0, "Total Account Value")
+        self.lbl_acct_holdings_value = _add_portfolio_metric(1, "Holdings Value")
+        self.lbl_acct_buying_power = _add_portfolio_metric(2, "Buying Power")
+        self.lbl_acct_percent_in_trade = _add_portfolio_metric(3, "Percent In Trade")
+        self.lbl_acct_dca_spread = _add_portfolio_metric(4, "DCA Levels (spread)")
+        self.lbl_acct_dca_single = _add_portfolio_metric(5, "DCA Levels (single)")
+        self.lbl_pnl = _add_portfolio_metric(6, "Total realized")
 
-        self.lbl_acct_buying_power = ttk.Label(acct_box, text="Buying Power: N/A")
-        self.lbl_acct_buying_power.pack(anchor="w", padx=6, pady=(2, 0))
+        chart_legend_header = ttk.Frame(controls_left)
+        chart_legend_header.pack(fill="x", padx=6, pady=(0, 0))
+        self.chart_legend_header = chart_legend_header
 
-        self.lbl_acct_percent_in_trade = ttk.Label(acct_box, text="Percent In Trade: N/A")
-        self.lbl_acct_percent_in_trade.pack(anchor="w", padx=6, pady=(2, 0))
+        ttk.Label(chart_legend_header, text="Chart Legend", foreground=DARK_ACCENT).pack(side="left")
+        self.chart_legend_collapsed = tk.BooleanVar(value=False)
 
-        # DCA affordability
-        self.lbl_acct_dca_spread = ttk.Label(acct_box, text="DCA Levels (spread): N/A")
-        self.lbl_acct_dca_spread.pack(anchor="w", padx=6, pady=(2, 0))
+        def _toggle_chart_legend() -> None:
+            try:
+                self.chart_legend_collapsed.set(not self.chart_legend_collapsed.get())
+                self._refresh_chart_legend_panel()
+            except Exception:
+                pass
 
-        self.lbl_acct_dca_single = ttk.Label(acct_box, text="DCA Levels (single): N/A")
-        self.lbl_acct_dca_single.pack(anchor="w", padx=6, pady=(2, 0))
+        self.btn_chart_legend_toggle = ttk.Button(
+            chart_legend_header,
+            text="Hide",
+            width=6,
+            command=_toggle_chart_legend,
+        )
+        self.btn_chart_legend_toggle.pack(side="right")
 
-        self.lbl_pnl = ttk.Label(acct_box, text="Total realized: N/A")
-        self.lbl_pnl.pack(anchor="w", padx=6, pady=(2, 2))
+        chart_legend_box = ttk.LabelFrame(controls_left, text="")
+        chart_legend_box.pack(fill="x", padx=6, pady=(0, 6))
+        self.chart_legend_box = chart_legend_box
+
+        chart_legend_body = ttk.Frame(chart_legend_box)
+        chart_legend_body.pack(fill="both", expand=True, padx=6, pady=6)
+
+        self.chart_legend_text = tk.Text(
+            chart_legend_body,
+            height=7,
+            wrap="word",
+            bg=DARK_PANEL,
+            fg=DARK_FG,
+            font=self._live_log_font,
+            spacing1=2,
+            spacing3=1,
+            insertbackground=DARK_FG,
+            selectbackground=DARK_SELECT_BG,
+            selectforeground=DARK_SELECT_FG,
+            highlightbackground=DARK_BORDER,
+            highlightcolor=DARK_ACCENT,
+            relief="flat",
+            bd=0,
+        )
+        self.chart_legend_scroll = ttk.Scrollbar(chart_legend_body, orient="vertical", command=self.chart_legend_text.yview)
+        self.chart_legend_text.configure(yscrollcommand=self.chart_legend_scroll.set)
+        self.chart_legend_text.pack(side="left", fill="both", expand=True)
+        self.chart_legend_scroll.pack(side="right", fill="y")
+        self.chart_legend_scroll.pack_forget()
+        try:
+            self.chart_legend_text.tag_configure("legend_head", foreground=DARK_ACCENT2, font=(self._live_log_font.cget("family"), int(self._live_log_font.cget("size")), "bold"))
+            self.chart_legend_text.tag_configure("legend_label", foreground="#A9B7C6")
+            self.chart_legend_text.tag_configure("legend_value", foreground=DARK_FG)
+        except Exception:
+            pass
+        self.chart_legend_text.configure(state="disabled")
 
 
 
@@ -2325,6 +3019,7 @@ class PowerTraderHub(tk.Tk):
         # Shows the current LONG/SHORT level (0..7) for every coin at once.
         neural_box = ttk.LabelFrame(top_controls, text="Neural Levels (0–7)")
         neural_box.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.neural_box = neural_box
 
         legend = ttk.Frame(neural_box)
         legend.pack(fill="x", padx=6, pady=(4, 0))
@@ -2443,7 +3138,7 @@ class PowerTraderHub(tk.Tk):
 
         # Half-size fixed-width font for live logs (Runner/Trader/Trainers)
         _base = tkfont.nametofont("TkFixedFont")
-        _half = max(6, int(round(abs(int(_base.cget("size"))) / 2.0)))
+        _half = max(8, int(round(abs(int(_base.cget("size"))) * 0.82)))
         self._live_log_font = _base.copy()
         self._live_log_font.configure(size=_half)
 
@@ -2462,6 +3157,10 @@ class PowerTraderHub(tk.Tk):
             font=self._live_log_font,
             bg=DARK_PANEL,
             fg=DARK_FG,
+            padx=8,
+            pady=6,
+            spacing1=1,
+            spacing3=1,
             insertbackground=DARK_FG,
             selectbackground=DARK_SELECT_BG,
             selectforeground=DARK_SELECT_FG,
@@ -2473,6 +3172,13 @@ class PowerTraderHub(tk.Tk):
         self.runner_text.configure(yscrollcommand=runner_scroll.set)
         self.runner_text.pack(side="left", fill="both", expand=True)
         runner_scroll.pack(side="right", fill="y")
+        try:
+            self.runner_text.tag_configure("log_ts", foreground="#8FA5B8")
+            self.runner_text.tag_configure("log_warn", foreground="#FFCC66")
+            self.runner_text.tag_configure("log_err", foreground="#FF6B57")
+            self.runner_text.tag_configure("log_launch", foreground=DARK_ACCENT2)
+        except Exception:
+            pass
 
         # Trader tab
         trader_tab = ttk.Frame(self.logs_nb)
@@ -2484,6 +3190,10 @@ class PowerTraderHub(tk.Tk):
             font=self._live_log_font,
             bg=DARK_PANEL,
             fg=DARK_FG,
+            padx=8,
+            pady=6,
+            spacing1=1,
+            spacing3=1,
             insertbackground=DARK_FG,
             selectbackground=DARK_SELECT_BG,
             selectforeground=DARK_SELECT_FG,
@@ -2495,12 +3205,65 @@ class PowerTraderHub(tk.Tk):
         self.trader_text.configure(yscrollcommand=trader_scroll.set)
         self.trader_text.pack(side="left", fill="both", expand=True)
         trader_scroll.pack(side="right", fill="y")
+        try:
+            self.trader_text.tag_configure("log_ts", foreground="#8FA5B8")
+            self.trader_text.tag_configure("log_warn", foreground="#FFCC66")
+            self.trader_text.tag_configure("log_err", foreground="#FF6B57")
+            self.trader_text.tag_configure("log_launch", foreground=DARK_ACCENT2)
+        except Exception:
+            pass
 
-        # Trainers tab (multi-coin)
-        trainer_tab = ttk.Frame(self.logs_nb)
-        self.logs_nb.add(trainer_tab, text="Trainers")
+        # Training tab (statuses + trainer controls/logs)
+        training_tab = ttk.Frame(self.logs_nb)
+        self.logs_nb.add(training_tab, text="Training")
 
-        top_bar = ttk.Frame(trainer_tab)
+        train_status_wrap = ttk.LabelFrame(training_tab, text="Training Status")
+        train_status_wrap.pack(fill="x", padx=6, pady=(6, 0))
+
+        train_row = ttk.Frame(train_status_wrap)
+        train_row.pack(fill="x", pady=(0, 6))
+
+        self.train_coin_var = tk.StringVar(value=(self.coins[0] if self.coins else ""))
+        ttk.Label(train_row, text="Train coin:").pack(side="left")
+        self.train_coin_combo = ttk.Combobox(
+            train_row,
+            textvariable=self.train_coin_var,
+            values=self.coins,
+            width=8,
+            state="readonly",
+        )
+        self.train_coin_combo.pack(side="left", padx=(6, 0))
+
+        train_buttons_row = ttk.Frame(train_status_wrap)
+        train_buttons_row.pack(fill="x", pady=(0, 6))
+        ttk.Button(train_buttons_row, text="Train Selected", width=BTN_W, command=self.train_selected_coin).pack(side="left")
+        ttk.Button(train_buttons_row, text="Train All", width=BTN_W, command=self.train_all_coins).pack(side="left", padx=(6, 0))
+
+        self.lbl_training_overview = ttk.Label(train_status_wrap, text="Training: N/A")
+        self.lbl_training_overview.pack(anchor="w", pady=(0, 2))
+
+        self.lbl_training_progress = ttk.Label(train_status_wrap, text="Progress: 0% (0 / 0)")
+        self.lbl_training_progress.pack(anchor="w", pady=(0, 2))
+
+        self.lbl_flow_hint = ttk.Label(train_status_wrap, text="Flow: Train → Start Trades")
+        self.lbl_flow_hint.pack(anchor="w", pady=(0, 6))
+
+        self.training_list = tk.Listbox(
+            train_status_wrap,
+            height=5,
+            bg=DARK_PANEL,
+            fg=DARK_FG,
+            selectbackground=DARK_SELECT_BG,
+            selectforeground=DARK_SELECT_FG,
+            highlightbackground=DARK_BORDER,
+            highlightcolor=DARK_ACCENT,
+            activestyle="none",
+        )
+        self.training_list.pack(fill="x", pady=(0, 6))
+
+        ttk.Separator(training_tab, orient="horizontal").pack(fill="x", padx=6, pady=(0, 6))
+
+        top_bar = ttk.Frame(training_tab)
         top_bar.pack(fill="x", padx=6, pady=6)
 
         self.trainer_coin_var = tk.StringVar(value=(self.coins[0] if self.coins else "BTC"))
@@ -2520,13 +3283,36 @@ class PowerTraderHub(tk.Tk):
         self.trainer_status_lbl = ttk.Label(top_bar, text="(no trainers running)")
         self.trainer_status_lbl.pack(side="left", padx=(12, 0))
 
+        def _sync_train_coin(*_):
+            try:
+                self.trainer_coin_var.set(self.train_coin_var.get())
+            except Exception:
+                pass
+
+        def _sync_trainer_coin(*_):
+            try:
+                self.train_coin_var.set(self.trainer_coin_var.get())
+            except Exception:
+                pass
+
+        self.train_coin_combo.bind("<<ComboboxSelected>>", _sync_train_coin)
+        self.trainer_coin_combo.bind("<<ComboboxSelected>>", _sync_trainer_coin)
+        _sync_train_coin()
+
+        trainer_log_box = ttk.LabelFrame(training_tab, text="Trainer Log")
+        trainer_log_box.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
         self.trainer_text = tk.Text(
-            trainer_tab,
+            trainer_log_box,
             height=8,
             wrap="none",
             font=self._live_log_font,
             bg=DARK_PANEL,
             fg=DARK_FG,
+            padx=8,
+            pady=6,
+            spacing1=1,
+            spacing3=1,
             insertbackground=DARK_FG,
             selectbackground=DARK_SELECT_BG,
             selectforeground=DARK_SELECT_FG,
@@ -2534,10 +3320,17 @@ class PowerTraderHub(tk.Tk):
             highlightcolor=DARK_ACCENT,
         )
 
-        trainer_scroll = ttk.Scrollbar(trainer_tab, orient="vertical", command=self.trainer_text.yview)
+        trainer_scroll = ttk.Scrollbar(trainer_log_box, orient="vertical", command=self.trainer_text.yview)
         self.trainer_text.configure(yscrollcommand=trainer_scroll.set)
         self.trainer_text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=(0, 6))
         trainer_scroll.pack(side="right", fill="y", padx=(0, 6), pady=(0, 6))
+        try:
+            self.trainer_text.tag_configure("log_ts", foreground="#8FA5B8")
+            self.trainer_text.tag_configure("log_warn", foreground="#FFCC66")
+            self.trainer_text.tag_configure("log_err", foreground="#FF6B57")
+            self.trainer_text.tag_configure("log_launch", foreground=DARK_ACCENT2)
+        except Exception:
+            pass
 
 
         # Add left panes (no trades/history on the left anymore)
@@ -2593,10 +3386,49 @@ class PowerTraderHub(tk.Tk):
         charts_frame = ttk.LabelFrame(right_split, text="Charts (Neural lines overlaid)")
         self._charts_frame = charts_frame
 
-        # Multi-row "tabs" (WrapFrame)
-        self.chart_tabs_bar = WrapFrame(charts_frame)
-        # Keep left padding, remove right padding so tabs can reach the edge
-        self.chart_tabs_bar.pack(fill="x", padx=(6, 0), pady=(6, 0))
+        charts_top_bar = ttk.Frame(charts_frame)
+        charts_top_bar.pack(fill="x", padx=6, pady=(6, 0))
+
+        ttk.Label(charts_top_bar, text="Chart:").pack(side="left")
+        self.chart_search_var = tk.StringVar(value="ACCOUNT")
+        self.chart_search_combo = ttk.Combobox(
+            charts_top_bar,
+            textvariable=self.chart_search_var,
+            values=["ACCOUNT"] + list(self.coins),
+            width=18,
+            state="readonly",
+        )
+        self.chart_search_combo.pack(side="left", padx=(6, 12))
+
+        def _activate_chart_search(_e=None):
+            try:
+                target = (self.chart_search_var.get() or "").strip().upper()
+                options = ["ACCOUNT"] + list(self.coins)
+                self.chart_search_combo["values"] = options
+                if target in options:
+                    self._show_chart_page(target)
+                elif options:
+                    self._show_chart_page(options[0])
+            except Exception:
+                pass
+
+        self.chart_search_combo.bind("<<ComboboxSelected>>", _activate_chart_search)
+        self.chart_search_combo.bind("<Return>", _activate_chart_search)
+
+        def _open_tradingview() -> None:
+            try:
+                import webbrowser
+                sym = str(getattr(self, "_current_chart_page", "ACCOUNT") or "ACCOUNT").upper().strip()
+                if sym == "ACCOUNT" or sym not in (self.coins or []):
+                    sym = (self.coins[0] if self.coins else "BTC")
+                webbrowser.open(f"https://www.tradingview.com/chart/?symbol=KUCOIN:{sym}USDT")
+            except Exception:
+                pass
+
+        ttk.Button(charts_top_bar, text="Open TradingView", style="Accent.TButton", command=_open_tradingview).pack(side="right")
+
+        # Navigation is now handled by the dropdown only; keep a hidden placeholder for rebuild logic.
+        self.chart_tabs_bar = ttk.Frame(charts_frame)
 
         # Page container (no ttk.Notebook, so there are NO native tabs to show)
         self.chart_pages_container = ttk.Frame(charts_frame)
@@ -2620,6 +3452,18 @@ class PowerTraderHub(tk.Tk):
             f = self.chart_pages.get(name)
             if f is not None:
                 f.pack(fill="both", expand=True)
+            try:
+                self.chart_search_var.set(name)
+            except Exception:
+                pass
+            try:
+                self._refresh_chart_legend_panel()
+            except Exception:
+                pass
+            try:
+                self._refresh_neural_overview_visibility()
+            except Exception:
+                pass
 
             # style selected tab
             for txt, b in self._chart_tab_buttons.items():
@@ -2653,6 +3497,7 @@ class PowerTraderHub(tk.Tk):
                                 trail_line = pos.get("trail_line", None)
                                 dca_line_price = pos.get("dca_line_price", None)
                                 avg_cost_basis = pos.get("avg_cost_basis", None)
+                                qty = pos.get("quantity", None)
 
                                 chart.refresh(
                                     self.coin_folders,
@@ -2661,6 +3506,7 @@ class PowerTraderHub(tk.Tk):
                                     trail_line=trail_line,
                                     dca_line_price=dca_line_price,
                                     avg_cost_basis=avg_cost_basis,
+                                    quantity=qty,
                                 )
 
                             except Exception:
@@ -2677,15 +3523,6 @@ class PowerTraderHub(tk.Tk):
         acct_page = ttk.Frame(self.chart_pages_container)
         self.chart_pages["ACCOUNT"] = acct_page
 
-        acct_btn = ttk.Button(
-            self.chart_tabs_bar,
-            text="ACCOUNT",
-            style="ChartTab.TButton",
-            command=lambda: self._show_chart_page("ACCOUNT"),
-        )
-        self.chart_tabs_bar.add(acct_btn, padx=(0, 6), pady=(0, 6))
-        self._chart_tab_buttons["ACCOUNT"] = acct_btn
-
         self.account_chart = AccountValueChart(
             acct_page,
             self.account_value_history_path,
@@ -2698,15 +3535,6 @@ class PowerTraderHub(tk.Tk):
         for coin in self.coins:
             page = ttk.Frame(self.chart_pages_container)
             self.chart_pages[coin] = page
-
-            btn = ttk.Button(
-                self.chart_tabs_bar,
-                text=coin,
-                style="ChartTab.TButton",
-                command=lambda c=coin: self._show_chart_page(c),
-            )
-            self.chart_tabs_bar.add(btn, padx=(0, 6), pady=(0, 6))
-            self._chart_tab_buttons[coin] = btn
 
             chart = CandleChart(page, self.fetcher, coin, self._settings_getter, self.trade_history_path)
             chart.pack(fill="both", expand=True)
@@ -2734,10 +3562,23 @@ class PowerTraderHub(tk.Tk):
         # Current trades (top)
         trades_frame = ttk.LabelFrame(right_bottom_split, text="Current Trades")
 
+        self.lbl_selected_coin_summary = tk.Label(
+            trades_frame,
+            text="Selected: ACCOUNT",
+            bg=DARK_PANEL2,
+            fg=DARK_ACCENT2,
+            anchor="w",
+            padx=8,
+            pady=4,
+        )
+        self.lbl_selected_coin_summary.pack(fill="x", padx=6, pady=(4, 0))
+
         cols = (
             "coin",
             "qty",
             "value",          # <-- right after qty
+            "unrealized_usd",
+            "realized_usd",
             "avg_cost",
             "buy_price",
             "buy_pnl",
@@ -2753,85 +3594,64 @@ class PowerTraderHub(tk.Tk):
             "coin": "Coin",
             "qty": "Qty",
             "value": "Value",
+            "unrealized_usd": "Unrlzd $",
+            "realized_usd": "Rlz $",
             "avg_cost": "Avg Cost",
             "buy_price": "Ask Price",
             "buy_pnl": "DCA PnL",
             "sell_price": "Bid Price",
             "sell_pnl": "Sell PnL",
-            "dca_stages": "DCA Stage",
-            "dca_24h": "DCA 24h",
+            "dca_stages": "Stage",
+            "dca_24h": "24h DCA",
             "next_dca": "Next DCA",
             "trail_line": "Trail Line",
         }
 
         trades_table_wrap = ttk.Frame(trades_frame)
         trades_table_wrap.pack(fill="both", expand=True, padx=6, pady=6)
+        self.trades_cols = cols
+        self.trades_header_labels = dict(header_labels)
+        self.trades_numeric_cols = {
+            "qty", "value", "unrealized_usd", "realized_usd", "avg_cost",
+            "buy_price", "buy_pnl", "sell_price", "sell_pnl", "next_dca", "trail_line",
+        }
+        self.trades_center_cols = {"coin", "dca_stages", "dca_24h"}
+        self._trades_base_widths = {
+            "coin": 76,
+            "qty": 102,
+            "value": 104,
+            "unrealized_usd": 118,
+            "realized_usd": 104,
+            "avg_cost": 112,
+            "buy_price": 112,
+            "buy_pnl": 88,
+            "sell_price": 112,
+            "sell_pnl": 88,
+            "dca_stages": 82,
+            "dca_24h": 86,
+            "next_dca": 138,
+            "trail_line": 112,
+        }
+        self._trades_table_rows = []
+        self._trades_header_height = 28
+        self._trades_row_height = 28
 
-        self.trades_tree = ttk.Treeview(
+        self.trades_canvas = tk.Canvas(
             trades_table_wrap,
-            columns=cols,
-            show="headings",
-            height=10
+            bg=DARK_PANEL,
+            highlightthickness=1,
+            highlightbackground=DARK_BORDER,
+            bd=0,
         )
-        for c in cols:
-            self.trades_tree.heading(c, text=header_labels.get(c, c))
-            self.trades_tree.column(c, width=110, anchor="center", stretch=True)
+        ysb = ttk.Scrollbar(trades_table_wrap, orient="vertical", command=self.trades_canvas.yview)
+        xsb = ttk.Scrollbar(trades_table_wrap, orient="horizontal", command=self.trades_canvas.xview)
+        self.trades_canvas.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
 
-        # Reasonable starting widths (they will be dynamically scaled on resize)
-        self.trades_tree.column("coin", width=70)
-        self.trades_tree.column("qty", width=95)
-        self.trades_tree.column("value", width=110)
-        self.trades_tree.column("next_dca", width=160)
-        self.trades_tree.column("dca_stages", width=90)
-        self.trades_tree.column("dca_24h", width=80)
-
-        ysb = ttk.Scrollbar(trades_table_wrap, orient="vertical", command=self.trades_tree.yview)
-        xsb = ttk.Scrollbar(trades_table_wrap, orient="horizontal", command=self.trades_tree.xview)
-        self.trades_tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
-
-        self.trades_tree.pack(side="top", fill="both", expand=True)
+        self.trades_canvas.pack(side="top", fill="both", expand=True)
         xsb.pack(side="bottom", fill="x")
         ysb.pack(side="right", fill="y")
 
-        def _resize_trades_columns(*_):
-            # Scale the initial column widths proportionally so the table always fits the current window.
-            try:
-                total_w = int(self.trades_tree.winfo_width())
-            except Exception:
-                return
-            if total_w <= 1:
-                return
-
-            try:
-                sb_w = int(ysb.winfo_width() or 0)
-            except Exception:
-                sb_w = 0
-
-            avail = max(200, total_w - sb_w - 8)
-
-            base = {
-                "coin": 70,
-                "qty": 95,
-                "value": 110,
-                "avg_cost": 110,
-                "buy_price": 110,
-                "buy_pnl": 110,
-                "sell_price": 110,
-                "sell_pnl": 110,
-                "dca_stages": 90,
-                "dca_24h": 80,
-                "next_dca": 160,
-                "trail_line": 110,
-            }
-            base_total = sum(base.get(c, 110) for c in cols) or 1
-            scale = avail / base_total
-
-            for c in cols:
-                w = int(base.get(c, 110) * scale)
-                self.trades_tree.column(c, width=max(60, min(420, w)))
-
-        self.trades_tree.bind("<Configure>", lambda e: self.after_idle(_resize_trades_columns))
-        self.after_idle(_resize_trades_columns)
+        self.trades_canvas.bind("<Configure>", lambda e: self.after_idle(self._draw_trades_table))
 
 
         # Trade history (bottom)
@@ -2843,6 +3663,7 @@ class PowerTraderHub(tk.Tk):
         self.hist_list = tk.Listbox(
             hist_wrap,
             height=10,
+            font=self._live_log_font,
             bg=DARK_PANEL,
             fg=DARK_FG,
             selectbackground=DARK_SELECT_BG,
@@ -2897,7 +3718,7 @@ class PowerTraderHub(tk.Tk):
 
                 min_top = 360
                 min_bottom = 220
-                desired_top = 410  # ~matches screenshot chart pane height
+                desired_top = 455  # favor more height for the active chart
                 target = max(min_top, min(total - min_bottom, desired_top))
 
                 right_split.sashpos(0, int(target))
@@ -2921,7 +3742,7 @@ class PowerTraderHub(tk.Tk):
 
                 min_top = 140
                 min_bottom = 120
-                desired_top = 280  # more space for Current Trades (like screenshot)
+                desired_top = 240  # give the chart more room by default
                 target = max(min_top, min(total - min_bottom, desired_top))
 
                 right_bottom_split.sashpos(0, int(target))
@@ -2940,12 +3761,745 @@ class PowerTraderHub(tk.Tk):
             self._schedule_paned_clamp(getattr(self, "_pw_right_bottom_split", None)),
         ))
 
+        self._build_parallel_market_placeholder(
+            self.stocks_market_tab,
+            market_key="stocks",
+            market_name="Stocks",
+            broker_name="Alpaca",
+            subtitle="Alpaca-backed stock AI (paper/live later)",
+            notes=(
+                "Status: UI scaffold ready\n"
+                "Broker: Alpaca (paper-first)\n"
+                "Focus: small equity trades, profit target, trailing exits\n"
+                "Next: account auth, market hours, stock scanner, paper executor"
+            ),
+        )
+        self._build_parallel_market_placeholder(
+            self.forex_market_tab,
+            market_key="forex",
+            market_name="Forex",
+            broker_name="OANDA",
+            subtitle="OANDA-backed forex AI (practice/live later)",
+            notes=(
+                "Status: UI scaffold ready\n"
+                "Broker: OANDA (practice-first)\n"
+                "Focus: short-horizon FX trades, profit target, trailing exits\n"
+                "Next: account auth, pair universe, pricing feed, practice executor"
+            ),
+        )
+
 
         # status bar
         self.status = ttk.Label(self, text="Ready", anchor="w")
         self.status.pack(fill="x", side="bottom")
 
 
+
+    def _build_parallel_market_placeholder(
+        self,
+        parent: ttk.Frame,
+        market_key: str,
+        market_name: str,
+        broker_name: str,
+        subtitle: str,
+        notes: str,
+    ) -> None:
+        outer = ttk.Panedwindow(parent, orient="horizontal")
+        outer.pack(fill="both", expand=True, padx=8, pady=8)
+
+        left = ttk.Frame(outer)
+        right = ttk.Frame(outer)
+        outer.add(left, weight=1)
+        outer.add(right, weight=2)
+
+        left_split = ttk.Panedwindow(left, orient="vertical")
+        left_split.pack(fill="both", expand=True)
+        right_split = ttk.Panedwindow(right, orient="vertical")
+        right_split.pack(fill="both", expand=True)
+
+        dashboard = ttk.LabelFrame(left_split, text=f"{market_name} Dashboard")
+
+        system_box = ttk.LabelFrame(dashboard, text="System")
+        system_box.pack(fill="x", padx=6, pady=(6, 6))
+        ai_var = tk.StringVar(value=f"{market_name} AI: not configured")
+        trader_var = tk.StringVar(value=f"{market_name} Trader: not configured")
+        state_var = tk.StringVar(value="Trade State: NOT STARTED")
+        endpoint_var = tk.StringVar(value=f"Broker: {broker_name} | endpoint not set")
+        ttk.Label(system_box, textvariable=ai_var).pack(anchor="w", padx=6, pady=(4, 2))
+        ttk.Label(system_box, textvariable=trader_var).pack(anchor="w", padx=6, pady=(0, 2))
+        ttk.Label(system_box, textvariable=state_var).pack(anchor="w", padx=6, pady=(0, 2))
+        ttk.Label(system_box, textvariable=endpoint_var, foreground=DARK_MUTED).pack(anchor="w", padx=6, pady=(0, 4))
+        test_btn = ttk.Button(
+            system_box,
+            text=f"Test {broker_name} Connection",
+            command=lambda mk=market_key: self._run_market_connection_test(mk),
+        )
+        test_btn.pack(anchor="w", padx=6, pady=(0, 6))
+        trader_step_btn = None
+        trader_step_market_key = ""
+        trader_step_name = ""
+        trader_step_cmd = None
+        if market_key == "stocks":
+            trader_step_market_key = "stocks"
+            trader_step_name = "Stocks"
+            trader_step_cmd = lambda: self._run_stock_trader_step(force=True)
+        if market_key == "forex":
+            trader_step_market_key = "forex"
+            trader_step_name = "Forex"
+            trader_step_cmd = lambda: self._run_forex_trader_step(force=True)
+        if trader_step_cmd is not None:
+            trader_step_btn = ttk.Button(system_box, text=f"Run {trader_step_name} Trader Step", command=trader_step_cmd)
+            trader_step_btn.pack(anchor="w", padx=6, pady=(0, 6))
+
+        portfolio_box = ttk.LabelFrame(dashboard, text="Portfolio")
+        portfolio_box.pack(fill="x", padx=6, pady=(0, 6))
+        metric_grid = ttk.Frame(portfolio_box)
+        metric_grid.pack(fill="x", padx=6, pady=6)
+        metric_grid.columnconfigure(1, weight=1)
+        portfolio_vars = {
+            "buying_power": tk.StringVar(value="Pending account link"),
+            "open_positions": tk.StringVar(value="0"),
+            "realized_pnl": tk.StringVar(value="N/A"),
+            "mode": tk.StringVar(value="Paper first"),
+        }
+        for idx, (label, key) in enumerate((
+            ("Buying Power", "buying_power"),
+            ("Open Positions", "open_positions"),
+            ("Realized PnL", "realized_pnl"),
+            ("Mode", "mode"),
+        )):
+            ttk.Label(metric_grid, text=label).grid(row=idx, column=0, sticky="w", padx=(0, 10), pady=2)
+            ttk.Label(metric_grid, textvariable=portfolio_vars[key]).grid(row=idx, column=1, sticky="e", pady=2)
+
+        notes_box = ttk.LabelFrame(dashboard, text="Market Notes")
+        notes_box.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        notes_text = tk.Text(
+            notes_box,
+            height=8,
+            wrap="word",
+            font=self._live_log_font,
+            bg=DARK_PANEL,
+            fg=DARK_FG,
+            padx=8,
+            pady=6,
+            spacing1=2,
+            spacing3=1,
+            relief="flat",
+            bd=0,
+            highlightbackground=DARK_BORDER,
+            highlightcolor=DARK_ACCENT,
+        )
+        notes_text.pack(fill="both", expand=True, padx=6, pady=6)
+        notes_text.insert("1.0", notes)
+        notes_text.configure(state="disabled")
+
+        left_split.add(dashboard, weight=1)
+
+        charts_frame = ttk.LabelFrame(right_split, text=f"{market_name} Charts")
+        charts_top = ttk.Frame(charts_frame)
+        charts_top.pack(fill="x", padx=6, pady=(6, 0))
+        ttk.Label(charts_top, text=f"{market_name} View:").pack(side="left")
+        selector = ttk.Combobox(
+            charts_top,
+            values=["Overview", "Scanner", "Leaders", "Positions"],
+            state="readonly",
+            width=18,
+        )
+        selector.set("Overview")
+        selector.pack(side="left", padx=(6, 12))
+        ttk.Label(charts_top, text=subtitle, foreground=DARK_MUTED).pack(side="left")
+        run_btn = ttk.Button(
+            charts_top,
+            text="Run Scan",
+            command=lambda mk=market_key: self._run_market_thinker_scan(mk, force=True),
+        )
+        run_btn.pack(side="right")
+
+        center = ttk.Frame(charts_frame)
+        center.pack(fill="both", expand=True, padx=6, pady=6)
+        center.columnconfigure(0, weight=1)
+        center.rowconfigure(0, weight=1)
+        placeholder = tk.Canvas(
+            center,
+            bg=DARK_PANEL2,
+            highlightthickness=1,
+            highlightbackground=DARK_BORDER,
+            bd=0,
+        )
+        placeholder.grid(row=0, column=0, sticky="nsew")
+        placeholder.create_text(
+            24,
+            24,
+            anchor="nw",
+            text=(
+                f"{market_name} tab scaffold\n\n"
+                "This market is not wired into a live engine yet.\n"
+                "The layout is ready for:\n"
+                "• status + account summary\n"
+                "• symbol/pair charts\n"
+                "• current positions\n"
+                "• trade history\n"
+                "• logs / training"
+            ),
+            fill=DARK_FG,
+            font=(self._live_log_font.cget("family"), max(9, int(self._live_log_font.cget("size")) + 1)),
+        )
+        selector.bind(
+            "<<ComboboxSelected>>",
+            lambda _e, mk=market_key: self._refresh_parallel_market_panels(),
+        )
+
+        lower = ttk.Panedwindow(right_split, orient="vertical")
+        positions_box = ttk.LabelFrame(lower, text=f"{market_name} Positions")
+        positions_text = tk.Text(
+            positions_box,
+            height=6,
+            wrap="none",
+            font=self._live_log_font,
+            bg=DARK_PANEL,
+            fg=DARK_FG,
+            padx=8,
+            pady=6,
+            spacing1=1,
+            spacing3=1,
+            relief="flat",
+            bd=0,
+            highlightbackground=DARK_BORDER,
+            highlightcolor=DARK_ACCENT,
+        )
+        positions_scroll = ttk.Scrollbar(positions_box, orient="vertical", command=positions_text.yview)
+        positions_text.configure(yscrollcommand=positions_scroll.set)
+        positions_text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        positions_scroll.pack(side="right", fill="y", padx=(0, 6), pady=6)
+        positions_text.insert(
+            "1.0",
+            "No market connection yet. Positions will appear here once the AI is linked.\n",
+        )
+        positions_text.configure(state="disabled")
+
+        history_box = ttk.LabelFrame(lower, text=f"{market_name} Logs")
+        log_text = tk.Text(
+            history_box,
+            height=8,
+            wrap="none",
+            font=self._live_log_font,
+            bg=DARK_PANEL,
+            fg=DARK_FG,
+            padx=8,
+            pady=6,
+            spacing1=1,
+            spacing3=1,
+            relief="flat",
+            bd=0,
+            highlightbackground=DARK_BORDER,
+            highlightcolor=DARK_ACCENT,
+        )
+        log_scroll = ttk.Scrollbar(history_box, orient="vertical", command=log_text.yview)
+        log_text.configure(yscrollcommand=log_scroll.set)
+        log_text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        log_scroll.pack(side="right", fill="y", padx=(0, 6), pady=6)
+        log_text.insert(
+            "1.0",
+            (
+                f"[{market_name.upper()}] UI scaffold initialized\n"
+                f"[{market_name.upper()}] Waiting for broker credentials and engine wiring\n"
+            ),
+        )
+        log_text.configure(state="disabled")
+
+        self.market_panels[market_key] = {
+            "market_name": market_name,
+            "broker_name": broker_name,
+            "status_path": self.market_status_paths.get(market_key, ""),
+            "ai_var": ai_var,
+            "trader_var": trader_var,
+            "state_var": state_var,
+            "endpoint_var": endpoint_var,
+            "portfolio_vars": portfolio_vars,
+            "notes_text": notes_text,
+            "log_text": log_text,
+            "positions_text": positions_text,
+            "test_btn": test_btn,
+            "trader_step_btn": trader_step_btn,
+            "trader_step_market_key": trader_step_market_key,
+            "run_btn": run_btn,
+            "selector": selector,
+            "chart_canvas": placeholder,
+            "last_log_sig": None,
+        }
+
+        right_split.add(charts_frame, weight=3)
+        right_split.add(lower, weight=2)
+        lower.add(positions_box, weight=1)
+        lower.add(history_box, weight=1)
+
+    def _mask_secret(self, value: str, keep: int = 4) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return "not set"
+        if len(raw) <= keep:
+            return "*" * len(raw)
+        return ("*" * max(4, len(raw) - keep)) + raw[-keep:]
+
+    def _set_market_notes(self, market_key: str, text: str) -> None:
+        panel = self.market_panels.get(market_key, {})
+        widget = panel.get("notes_text")
+        if not widget:
+            return
+        try:
+            widget.configure(state="normal")
+            widget.delete("1.0", "end")
+            widget.insert("1.0", str(text or "").strip() + "\n")
+            widget.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _append_market_log(self, market_key: str, line: str) -> None:
+        panel = self.market_panels.get(market_key, {})
+        widget = panel.get("log_text")
+        if not widget:
+            return
+        try:
+            widget.configure(state="normal")
+            widget.insert("end", str(line or "").rstrip() + "\n")
+            widget.see("end")
+            widget.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _set_market_positions(self, market_key: str, lines: List[str]) -> None:
+        panel = self.market_panels.get(market_key, {})
+        widget = panel.get("positions_text")
+        if not widget:
+            return
+        payload = list(lines or [])
+        if not payload:
+            payload = ["No open positions."]
+        try:
+            widget.configure(state="normal")
+            widget.delete("1.0", "end")
+            widget.insert("1.0", "\n".join(str(x) for x in payload) + "\n")
+            widget.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _make_alpaca_client(self) -> AlpacaBrokerClient:
+        return AlpacaBrokerClient(
+            api_key_id=str(self.settings.get("alpaca_api_key_id", "") or ""),
+            secret_key=str(self.settings.get("alpaca_secret_key", "") or ""),
+            base_url=str(self.settings.get("alpaca_base_url", DEFAULT_SETTINGS.get("alpaca_base_url", "")) or ""),
+            data_url=str(self.settings.get("alpaca_data_url", DEFAULT_SETTINGS.get("alpaca_data_url", "")) or ""),
+        )
+
+    def _make_oanda_client(self) -> OandaBrokerClient:
+        return OandaBrokerClient(
+            account_id=str(self.settings.get("oanda_account_id", "") or ""),
+            api_token=str(self.settings.get("oanda_api_token", "") or ""),
+            rest_url=str(self.settings.get("oanda_rest_url", DEFAULT_SETTINGS.get("oanda_rest_url", "")) or ""),
+        )
+
+    def _read_market_thinker_status(self, market_key: str) -> Dict[str, Any]:
+        path = self.market_thinker_paths.get(market_key, "")
+        data = _safe_read_json(path) if path else None
+        return data if isinstance(data, dict) else {}
+
+    def _write_market_thinker_status(self, market_key: str, payload: Dict[str, Any]) -> None:
+        path = self.market_thinker_paths.get(market_key, "")
+        if not path:
+            return
+        try:
+            _safe_write_json(path, payload)
+        except Exception:
+            pass
+
+    def _render_market_canvas(self, market_key: str, thinker_data: Dict[str, Any]) -> None:
+        panel = self.market_panels.get(market_key, {})
+        canvas = panel.get("chart_canvas")
+        selector = panel.get("selector")
+        if not canvas:
+            return
+        try:
+            width = max(320, int(canvas.winfo_width() or 0))
+            height = max(220, int(canvas.winfo_height() or 0))
+        except Exception:
+            width = 720
+            height = 320
+        try:
+            canvas.delete("all")
+            canvas.create_rectangle(0, 0, width, height, fill=DARK_PANEL2, outline=DARK_BORDER)
+        except Exception:
+            return
+
+        view = str(selector.get() if selector else "Overview").strip() or "Overview"
+        leaders = list(thinker_data.get("leaders", []) or [])
+        top_pick = thinker_data.get("top_pick") or (leaders[0] if leaders else None)
+        updated_at = thinker_data.get("updated_at")
+        updated_txt = ""
+        try:
+            if updated_at:
+                updated_txt = time.strftime("%H:%M:%S", time.localtime(float(updated_at)))
+        except Exception:
+            updated_txt = ""
+
+        if view == "Overview":
+            title = f"{panel.get('market_name', market_key.title())} Thinker Overview"
+            body_lines = []
+            if top_pick:
+                ident = top_pick.get("pair") or top_pick.get("symbol") or "N/A"
+                side = str(top_pick.get("side", "watch") or "watch").upper()
+                score = top_pick.get("score", "N/A")
+                confidence = str(top_pick.get("confidence", "N/A") or "N/A")
+                body_lines.append(f"Top pick: {ident} | {side} | score {score} | {confidence}")
+                body_lines.append(str(top_pick.get("reason", "") or "").strip())
+            else:
+                body_lines.append("No ranked candidates yet.")
+            if updated_txt:
+                body_lines.append(f"Last scan: {updated_txt}")
+        elif view == "Leaders":
+            title = "Top Leaders"
+            body_lines = []
+            if not leaders:
+                body_lines.append("No leaders available.")
+            for idx, row in enumerate(leaders[:5], start=1):
+                ident = row.get("pair") or row.get("symbol") or "N/A"
+                side = str(row.get("side", "watch") or "watch").upper()
+                body_lines.append(f"{idx}. {ident} | {side} | score {row.get('score', 'N/A')}")
+                body_lines.append(f"   {row.get('reason', '')}")
+        elif view == "Scanner":
+            title = "Scanner"
+            all_scores = list(thinker_data.get("all_scores", leaders) or [])
+            body_lines = []
+            if not all_scores:
+                body_lines.append("Scanner waiting for data.")
+            for idx, row in enumerate(all_scores[:8], start=1):
+                ident = row.get("pair") or row.get("symbol") or "N/A"
+                body_lines.append(
+                    f"{idx}. {ident} | {str(row.get('side', 'watch')).upper()} | score {row.get('score', 'N/A')} | {row.get('confidence', 'N/A')}"
+                )
+        else:
+            title = "Positions-Aware View"
+            body_lines = ["Use the Positions panel below for linked broker positions."]
+            if top_pick:
+                ident = top_pick.get("pair") or top_pick.get("symbol") or "N/A"
+                body_lines.append(f"Current strongest candidate: {ident}")
+
+        try:
+            canvas.create_text(
+                18,
+                16,
+                anchor="nw",
+                text=title,
+                fill=DARK_ACCENT,
+                font=(self._live_log_font.cget("family"), max(10, int(self._live_log_font.cget("size")) + 3), "bold"),
+            )
+            body = "\n".join(str(x) for x in body_lines)
+            canvas.create_text(
+                18,
+                48,
+                anchor="nw",
+                text=body,
+                fill=DARK_FG,
+                width=max(260, width - 40),
+                font=(self._live_log_font.cget("family"), max(9, int(self._live_log_font.cget("size")) + 1)),
+            )
+        except Exception:
+            pass
+
+    def _market_settings_snapshot(self, market_key: str) -> Dict[str, Any]:
+        if market_key == "stocks":
+            return {
+                "broker": "Alpaca",
+                "configured": bool(str(self.settings.get("alpaca_api_key_id", "")).strip() and str(self.settings.get("alpaca_secret_key", "")).strip()),
+                "mode": ("Paper" if bool(self.settings.get("alpaca_paper_mode", True)) else "Live"),
+                "endpoint": str(self.settings.get("alpaca_base_url", DEFAULT_SETTINGS.get("alpaca_base_url", "")) or "").strip(),
+                "detail": f"API Key {self._mask_secret(self.settings.get('alpaca_api_key_id', ''))}",
+            }
+        return {
+            "broker": "OANDA",
+            "configured": bool(str(self.settings.get("oanda_account_id", "")).strip() and str(self.settings.get("oanda_api_token", "")).strip()),
+            "mode": ("Practice" if bool(self.settings.get("oanda_practice_mode", True)) else "Live"),
+            "endpoint": str(self.settings.get("oanda_rest_url", DEFAULT_SETTINGS.get("oanda_rest_url", "")) or "").strip(),
+            "detail": f"Account {str(self.settings.get('oanda_account_id', '') or '').strip() or 'not set'} | Token {self._mask_secret(self.settings.get('oanda_api_token', ''))}",
+        }
+
+    def _refresh_parallel_market_panels(self) -> None:
+        for market_key, panel in self.market_panels.items():
+            snap = self._market_settings_snapshot(market_key)
+            configured = bool(snap.get("configured"))
+            mode_txt = str(snap.get("mode", "") or "")
+            endpoint = str(snap.get("endpoint", "") or "").strip()
+            broker = str(snap.get("broker", market_key.title()) or market_key.title())
+            state_txt = "Configured" if configured else "Credentials missing"
+
+            status_path = str(panel.get("status_path", "") or "")
+            status_data = _safe_read_json(status_path) if status_path else None
+            if not isinstance(status_data, dict):
+                status_data = {}
+            trader_status_path = self.market_trader_paths.get(market_key, "")
+            trader_data = _safe_read_json(trader_status_path) if trader_status_path else None
+            if not isinstance(trader_data, dict):
+                trader_data = {}
+            thinker_data = self._read_market_thinker_status(market_key)
+
+            ai_state = str(thinker_data.get("ai_state", status_data.get("ai_state", state_txt)) or state_txt)
+            trader_state = str(trader_data.get("trader_state", status_data.get("trader_state", "Idle")) or "Idle")
+            msg = str(trader_data.get("msg", "") or thinker_data.get("msg", "") or status_data.get("msg", "") or "").strip()
+            panel["ai_var"].set(f"{panel['market_name']} AI: {ai_state}")
+            panel["trader_var"].set(f"{panel['market_name']} Trader: {trader_state}")
+            state_line = f"Trade State: {str(thinker_data.get('state', status_data.get('state', state_txt)) or state_txt)}"
+            if msg:
+                state_line += f" | {msg}"
+            panel["state_var"].set(state_line)
+            panel["endpoint_var"].set(f"Broker: {broker} | {mode_txt} | {endpoint or 'endpoint not set'}")
+
+            pvars = panel.get("portfolio_vars", {})
+            if isinstance(pvars, dict):
+                pvars["buying_power"].set(str(status_data.get("buying_power", "Pending account link") or "Pending account link"))
+                pvars["open_positions"].set(str(status_data.get("open_positions", "0") or "0"))
+                pvars["realized_pnl"].set(str(status_data.get("realized_pnl", "N/A") or "N/A"))
+                pvars["mode"].set(mode_txt or "Paper first")
+            self._set_market_positions(market_key, list(status_data.get("positions_preview", []) or []))
+
+            extra_note = str(thinker_data.get("pdt_note", "") or status_data.get("pdt_note", "") or "").strip()
+
+            self._set_market_notes(
+                market_key,
+                "".join(
+                    [
+                        f"Status: {'ready to connect' if configured else 'credentials required'}\n",
+                        f"Broker: {broker}\n",
+                        f"Mode: {mode_txt}\n",
+                        f"{snap.get('detail', '')}\n",
+                        f"Endpoint: {endpoint or 'not set'}\n",
+                        (f"{extra_note}\n" if extra_note else ""),
+                        (f"Thinker: {ai_state}\n" if ai_state else ""),
+                        "These tabs are broker scaffolds for the upcoming market-specific AI engines.",
+                    ]
+                ),
+            )
+            self._render_market_canvas(market_key, thinker_data)
+
+            log_sig = (
+                configured,
+                mode_txt,
+                endpoint,
+                str(snap.get("detail", "")),
+                str(thinker_data.get("state", "")),
+                str(thinker_data.get("msg", "")),
+                str(trader_data.get("state", "")),
+                str(trader_data.get("msg", "")),
+                str(status_data.get("state", "")),
+                str(status_data.get("msg", "")),
+            )
+            if panel.get("last_log_sig") != log_sig:
+                panel["last_log_sig"] = log_sig
+                self._append_market_log(
+                    market_key,
+                    f"[{broker.upper()}] {state_txt} | mode={mode_txt} | endpoint={endpoint or 'not set'}",
+                )
+
+            try:
+                busy = bool(self._market_test_busy.get(market_key, False))
+                panel["test_btn"].configure(state=("disabled" if busy else "normal"))
+            except Exception:
+                pass
+            try:
+                scan_busy = bool(self._market_thinker_busy.get(market_key, False))
+                panel["run_btn"].configure(state=("disabled" if scan_busy else "normal"))
+            except Exception:
+                pass
+            try:
+                step_btn = panel.get("trader_step_btn")
+                if step_btn is not None:
+                    step_market = str(panel.get("trader_step_market_key", "") or "")
+                    step_btn.configure(state=("disabled" if self._market_trader_busy.get(step_market, False) else "normal"))
+            except Exception:
+                pass
+
+    def _run_market_connection_test(self, market_key: str) -> None:
+        if self._market_test_busy.get(market_key):
+            return
+        self._market_test_busy[market_key] = True
+        self._append_market_log(market_key, "[TEST] Starting broker connectivity check...")
+        self._refresh_parallel_market_panels()
+
+        def _worker() -> None:
+            if market_key == "stocks":
+                ok, msg = self._make_alpaca_client().test_connection()
+            else:
+                ok, msg = self._make_oanda_client().test_connection()
+
+            def _finish() -> None:
+                self._market_test_busy[market_key] = False
+                broker = self.market_panels.get(market_key, {}).get("broker_name", market_key.upper())
+                prefix = "[OK]" if ok else "[FAIL]"
+                self._append_market_log(market_key, f"{prefix} {broker} test: {msg}")
+                self._refresh_parallel_market_panels()
+
+            try:
+                self.after(0, _finish)
+            except Exception:
+                self._market_test_busy[market_key] = False
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _write_market_status(self, market_key: str, payload: Dict[str, Any]) -> None:
+        path = self.market_status_paths.get(market_key, "")
+        if not path:
+            return
+        try:
+            _safe_write_json(path, payload)
+        except Exception:
+            pass
+
+    def _schedule_market_snapshot_refresh(self, market_key: str, every_s: float = 15.0) -> None:
+        if self._market_refresh_busy.get(market_key, False):
+            return
+        last_ts = float(self._last_market_refresh_ts.get(market_key, 0.0) or 0.0)
+        if (time.time() - last_ts) < float(every_s):
+            return
+        self._market_refresh_busy[market_key] = True
+
+        def _worker() -> None:
+            if market_key == "stocks":
+                snap = self._make_alpaca_client().fetch_snapshot()
+            else:
+                snap = self._make_oanda_client().fetch_snapshot()
+            snap["ts"] = int(time.time())
+            self._write_market_status(market_key, snap)
+
+            def _finish() -> None:
+                self._last_market_refresh_ts[market_key] = time.time()
+                self._market_refresh_busy[market_key] = False
+                self._refresh_parallel_market_panels()
+
+            try:
+                self.after(0, _finish)
+            except Exception:
+                self._last_market_refresh_ts[market_key] = time.time()
+                self._market_refresh_busy[market_key] = False
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _run_market_thinker_scan(self, market_key: str, force: bool = False, min_interval_s: Optional[float] = None) -> None:
+        if self._market_thinker_busy.get(market_key, False):
+            return
+        last_ts = float(self._last_market_thinker_ts.get(market_key, 0.0) or 0.0)
+        if min_interval_s is None:
+            min_interval_s = (45.0 if market_key == "forex" else 60.0)
+        if (not force) and ((time.time() - last_ts) < float(min_interval_s)):
+            return
+        self._market_thinker_busy[market_key] = True
+        self._append_market_log(market_key, "[THINKER] Starting scan...")
+        self._refresh_parallel_market_panels()
+
+        def _worker() -> None:
+            if market_key == "stocks":
+                payload = run_stock_scan(self.settings, self.hub_dir)
+            else:
+                payload = run_forex_scan(self.settings, self.hub_dir)
+            payload["ts"] = int(time.time())
+            self._write_market_thinker_status(market_key, payload)
+
+            def _finish() -> None:
+                self._last_market_thinker_ts[market_key] = time.time()
+                self._market_thinker_busy[market_key] = False
+                state = str(payload.get("state", "READY") or "READY")
+                msg = str(payload.get("msg", "") or "").strip()
+                self._append_market_log(market_key, f"[THINKER] {state} | {msg}")
+                self._refresh_parallel_market_panels()
+
+            try:
+                self.after(0, _finish)
+            except Exception:
+                self._last_market_thinker_ts[market_key] = time.time()
+                self._market_thinker_busy[market_key] = False
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _schedule_market_thinker_scan(self, market_key: str, every_s: float) -> None:
+        self._run_market_thinker_scan(market_key, force=False, min_interval_s=every_s)
+
+    def _write_market_trader_status(self, market_key: str, payload: Dict[str, Any]) -> None:
+        path = self.market_trader_paths.get(market_key, "")
+        if not path:
+            return
+        try:
+            _safe_write_json(path, payload)
+        except Exception:
+            pass
+
+    def _run_stock_trader_step(self, force: bool = False, min_interval_s: float = 18.0) -> None:
+        market_key = "stocks"
+        if self._market_trader_busy.get(market_key, False):
+            return
+        last_ts = float(self._last_market_trader_ts.get(market_key, 0.0) or 0.0)
+        if (not force) and ((time.time() - last_ts) < float(min_interval_s)):
+            return
+        self._market_trader_busy[market_key] = True
+        self._append_market_log(market_key, "[TRADER] Running stocks trader step...")
+        self._refresh_parallel_market_panels()
+
+        def _worker() -> None:
+            payload = run_stock_trader_step(self.settings, self.hub_dir)
+            payload["ts"] = int(time.time())
+            self._write_market_trader_status(market_key, payload)
+            actions = list(payload.get("actions", []) or [])
+
+            def _finish() -> None:
+                self._last_market_trader_ts[market_key] = time.time()
+                self._market_trader_busy[market_key] = False
+                self._append_market_log(
+                    market_key,
+                    f"[TRADER] {str(payload.get('state', 'READY'))} | {str(payload.get('msg', '') or '').strip()}",
+                )
+                for line in actions[-3:]:
+                    self._append_market_log(market_key, f"[TRADER] {line}")
+                self._refresh_parallel_market_panels()
+
+            try:
+                self.after(0, _finish)
+            except Exception:
+                self._last_market_trader_ts[market_key] = time.time()
+                self._market_trader_busy[market_key] = False
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _run_forex_trader_step(self, force: bool = False, min_interval_s: float = 12.0) -> None:
+        market_key = "forex"
+        if self._market_trader_busy.get(market_key, False):
+            return
+        last_ts = float(self._last_market_trader_ts.get(market_key, 0.0) or 0.0)
+        if (not force) and ((time.time() - last_ts) < float(min_interval_s)):
+            return
+        self._market_trader_busy[market_key] = True
+        self._append_market_log(market_key, "[TRADER] Running forex trader step...")
+        self._refresh_parallel_market_panels()
+
+        def _worker() -> None:
+            payload = run_forex_trader_step(self.settings, self.hub_dir)
+            payload["ts"] = int(time.time())
+            self._write_market_trader_status(market_key, payload)
+            actions = list(payload.get("actions", []) or [])
+
+            def _finish() -> None:
+                self._last_market_trader_ts[market_key] = time.time()
+                self._market_trader_busy[market_key] = False
+                self._append_market_log(
+                    market_key,
+                    f"[TRADER] {str(payload.get('state', 'READY'))} | {str(payload.get('msg', '') or '').strip()}",
+                )
+                for line in actions[-3:]:
+                    self._append_market_log(market_key, f"[TRADER] {line}")
+                self._refresh_parallel_market_panels()
+
+            try:
+                self.after(0, _finish)
+            except Exception:
+                self._last_market_trader_ts[market_key] = time.time()
+                self._market_trader_busy[market_key] = False
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ---- panedwindow anti-collapse helpers ----
 
@@ -3107,35 +4661,136 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
 
-    def start_neural(self) -> None:
-        # Reset runner-ready gate file (prevents stale "ready" from a prior run)
+    @staticmethod
+    def _pid_is_alive(pid: Optional[int]) -> bool:
         try:
-            with open(self.runner_ready_path, "w", encoding="utf-8") as f:
-                json.dump({"timestamp": time.time(), "ready": False, "stage": "starting"}, f)
+            if pid is None or int(pid) <= 0:
+                return False
+            os.kill(int(pid), 0)
+            return True
+        except OSError:
+            return False
+
+    def _read_runner_pid(self) -> Optional[int]:
+        try:
+            if not os.path.isfile(self.runner_pid_path):
+                return None
+            with open(self.runner_pid_path, "r", encoding="utf-8") as f:
+                raw = (f.read() or "").strip()
+            pid = int(raw)
+            return pid if pid > 0 else None
+        except Exception:
+            return None
+
+    def _runner_is_running(self) -> bool:
+        return self._pid_is_alive(self._read_runner_pid())
+
+    def _read_runner_status(self) -> Dict[str, Any]:
+        data = _safe_read_json(self.trader_status_path)
+        if isinstance(data, dict):
+            return data
+        return {"state": "STOPPED", "ts": None}
+
+    def _launch_runner_detached(self) -> bool:
+        if self._runner_is_running():
+            return True
+        try:
+            if os.path.exists(self.stop_flag_path):
+                os.remove(self.stop_flag_path)
+        except OSError:
+            pass
+
+        if not os.path.isfile(self.proc_runner.path):
+            messagebox.showerror("Missing script", f"Cannot find: {self.proc_runner.path}")
+            return False
+
+        runner_log_path = os.path.join(self.runner_logs_dir, "runner_ui_launch.log")
+        log_f = None
+        try:
+            log_f = open(runner_log_path, "a", encoding="utf-8")
+            env = os.environ.copy()
+            env["POWERTRADER_HUB_DIR"] = self.hub_dir
+            subprocess.Popen(
+                [sys.executable, "-u", self.proc_runner.path],
+                cwd=self.project_dir,
+                env=env,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                text=True,
+            )
+            try:
+                self.runner_log_q.put("[RUNNER] Started background supervisor\n")
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            messagebox.showerror("Failed to start", f"Trade supervisor failed to start:\n{e}")
+            return False
+        finally:
+            if log_f is not None:
+                try:
+                    log_f.close()
+                except Exception:
+                    pass
+
+    def _request_runner_stop(self, wait_s: float = 5.0) -> None:
+        try:
+            with open(self.stop_flag_path, "w", encoding="utf-8") as f:
+                f.write(str(int(time.time())))
         except Exception:
             pass
 
-        self._start_process(self.proc_neural, log_q=self.runner_log_q, prefix="[RUNNER] ")
+        deadline = time.time() + max(0.0, float(wait_s))
+        while time.time() < deadline:
+            st = self._read_runner_status()
+            state = str(st.get("state", "")).upper().strip()
+            if state == "STOPPED" or not self._runner_is_running():
+                return
+            time.sleep(0.2)
+
+        pid = self._read_runner_pid()
+        if not self._pid_is_alive(pid):
+            return
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+            self.runner_log_q.put(f"[RUNNER] Sent SIGTERM to supervisor pid={pid}\n")
+        except Exception:
+            return
+
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if not self._pid_is_alive(pid):
+                return
+            time.sleep(0.2)
+
+        try:
+            os.kill(int(pid), signal.SIGKILL)
+            self.runner_log_q.put(f"[RUNNER] Sent SIGKILL to supervisor pid={pid}\n")
+        except Exception:
+            pass
+
+    def start_neural(self) -> None:
+        self.start_all_scripts()
 
 
     def start_trader(self) -> None:
-        self._start_process(self.proc_trader, log_q=self.trader_log_q, prefix="[TRADER] ")
+        self.start_all_scripts()
 
 
     def stop_neural(self) -> None:
-        self._stop_process(self.proc_neural)
+        self.stop_all_scripts()
 
 
 
     def stop_trader(self) -> None:
-        self._stop_process(self.proc_trader)
+        self.stop_all_scripts()
 
     def toggle_all_scripts(self) -> None:
-        neural_running = bool(self.proc_neural.proc and self.proc_neural.proc.poll() is None)
-        trader_running = bool(self.proc_trader.proc and self.proc_trader.proc.poll() is None)
+        runner_running = self._runner_is_running()
 
         # If anything is running (or we're waiting on runner readiness), toggle means "stop"
-        if neural_running or trader_running or bool(getattr(self, "_auto_start_trader_pending", False)):
+        if runner_running or bool(getattr(self, "_auto_start_trader_pending", False)):
             self.stop_all_scripts()
             return
 
@@ -3143,59 +4798,34 @@ class PowerTraderHub(tk.Tk):
         self.start_all_scripts()
 
     def _read_runner_ready(self) -> Dict[str, Any]:
-        try:
-            if os.path.isfile(self.runner_ready_path):
-                with open(self.runner_ready_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    return data
-        except Exception:
-            pass
+        data = _safe_read_json(self.runner_ready_path)
+        if isinstance(data, dict):
+            return data
         return {"ready": False}
 
     def _poll_runner_ready_then_start_trader(self) -> None:
-        # Cancelled or already started
-        if not bool(getattr(self, "_auto_start_trader_pending", False)):
-            return
-
-        # If runner died, stop waiting
-        if not (self.proc_neural.proc and self.proc_neural.proc.poll() is None):
-            self._auto_start_trader_pending = False
-            return
-
-        st = self._read_runner_ready()
-        if bool(st.get("ready", False)):
-            self._auto_start_trader_pending = False
-
-            # Start trader if not already running
-            if not (self.proc_trader.proc and self.proc_trader.proc.poll() is None):
-                self.start_trader()
-            return
-
-        # Not ready yet — keep polling
-        try:
-            self.after(250, self._poll_runner_ready_then_start_trader)
-        except Exception:
-            pass
+        self._auto_start_trader_pending = False
 
     def start_all_scripts(self) -> None:
-        # Enforce flow: Train → Neural → (wait for runner READY) → Trader
+        if self._runner_is_running():
+            self._auto_start_trader_pending = False
+            try:
+                self.status.config(text="Trade supervisor already running")
+            except Exception:
+                pass
+            return
+
+        # Enforce flow: training must be current before starting background trading.
         all_trained = all(self._coin_is_trained(c) for c in self.coins) if self.coins else False
         if not all_trained:
             messagebox.showwarning(
                 "Training required",
-                "All coins must be trained before starting Neural Runner.\n\nUse Train All first."
+                "All coins must be trained before starting trades.\n\nUse Train All first."
             )
             return
 
-        self._auto_start_trader_pending = True
-        self.start_neural()
-
-        # Wait for runner to signal readiness before starting trader
-        try:
-            self.after(250, self._poll_runner_ready_then_start_trader)
-        except Exception:
-            pass
+        self._auto_start_trader_pending = False
+        self._launch_runner_detached()
 
 
     def _coin_is_trained(self, coin: str) -> bool:
@@ -3417,16 +5047,12 @@ class PowerTraderHub(tk.Tk):
 
 
     def stop_all_scripts(self) -> None:
-        # Cancel any pending "wait for runner then start trader"
         self._auto_start_trader_pending = False
-
-        self.stop_neural()
-        self.stop_trader()
+        self._request_runner_stop(wait_s=5.0)
 
         # Also reset the runner-ready gate file (best-effort)
         try:
-            with open(self.runner_ready_path, "w", encoding="utf-8") as f:
-                json.dump({"timestamp": time.time(), "ready": False, "stage": "stopped"}, f)
+            _safe_write_json(self.runner_ready_path, {"timestamp": time.time(), "ready": False, "stage": "stopped"})
         except Exception:
             pass
 
@@ -3453,6 +5079,7 @@ class PowerTraderHub(tk.Tk):
             trail_line = pos.get("trail_line", None)
             dca_line_price = pos.get("dca_line_price", None)
             avg_cost_basis = pos.get("avg_cost_basis", None)
+            qty = pos.get("quantity", None)
 
             chart.refresh(
                 self.coin_folders,
@@ -3461,6 +5088,7 @@ class PowerTraderHub(tk.Tk):
                 trail_line=trail_line,
                 dca_line_price=dca_line_price,
                 avg_cost_basis=avg_cost_basis,
+                quantity=qty,
             )
 
             # Keep the periodic refresh behavior consistent (prevents an immediate full refresh right after this).
@@ -3491,23 +5119,135 @@ class PowerTraderHub(tk.Tk):
                     txt.delete("1.0", f"{current - max_lines}.0")
             except Exception:
                 pass
+            self._style_log_text_widget(txt)
             txt.see("end")
 
-    def _tick(self) -> None:
-        # process labels
-        neural_running = bool(self.proc_neural.proc and self.proc_neural.proc.poll() is None)
-        trader_running = bool(self.proc_trader.proc and self.proc_trader.proc.poll() is None)
+    def _style_log_text_widget(self, txt: tk.Text) -> None:
+        try:
+            for tag in ("log_ts", "log_warn", "log_err", "log_launch"):
+                txt.tag_remove(tag, "1.0", "end")
+            end_line = int(txt.index("end-1c").split(".")[0])
+            for idx in range(1, end_line + 1):
+                line = txt.get(f"{idx}.0", f"{idx}.end")
+                if not line:
+                    continue
+                if len(line) >= 19 and line[4] == "-" and line[7] == "-":
+                    txt.tag_add("log_ts", f"{idx}.0", f"{idx}.19")
+                lower = line.lower()
+                if "[launch]" in lower:
+                    txt.tag_add("log_launch", f"{idx}.0", f"{idx}.end")
+                elif ("error" in lower) or ("failed" in lower):
+                    txt.tag_add("log_err", f"{idx}.0", f"{idx}.end")
+                elif ("restart" in lower) or ("exit code" in lower) or ("warning" in lower):
+                    txt.tag_add("log_warn", f"{idx}.0", f"{idx}.end")
+        except Exception:
+            pass
 
-        self.lbl_neural.config(text=f"Neural: {'running' if neural_running else 'stopped'}")
-        self.lbl_trader.config(text=f"Trader: {'running' if trader_running else 'stopped'}")
+    def _refresh_log_file_to_text(
+        self,
+        path: str,
+        txt: tk.Text,
+        cache_key: str,
+        max_lines: int = 500,
+        prefix_path: Optional[str] = None,
+    ) -> None:
+        try:
+            parts = []
+            mtimes = []
+            for fp in [p for p in (prefix_path, path) if p]:
+                try:
+                    mtime = os.path.getmtime(fp)
+                    mtimes.append((fp, mtime))
+                except Exception:
+                    continue
+
+            sig = tuple(mtimes)
+            if getattr(self, cache_key, object()) == sig:
+                return
+            setattr(self, cache_key, sig)
+
+            for fp, _ in mtimes:
+                try:
+                    with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = f.read().splitlines()
+                    if prefix_path and fp == prefix_path and lines:
+                        lines = [f"[launch] {ln}" for ln in lines]
+                    parts.extend(lines[-max_lines:])
+                except Exception:
+                    continue
+
+            txt.configure(state="normal")
+            txt.delete("1.0", "end")
+            if parts:
+                txt.insert("1.0", "\n".join(parts[-max_lines:]) + "\n")
+            else:
+                name = os.path.basename(path)
+                txt.insert("1.0", f"(waiting for {name} output)")
+            txt.configure(state="normal")
+            self._style_log_text_widget(txt)
+            txt.see("end")
+        except Exception:
+            pass
+
+    def _tick(self) -> None:
+        fetcher_changed = False
+        try:
+            if hasattr(self, "fetcher") and self.fetcher:
+                fetcher_changed = bool(self.fetcher.drain_results())
+        except Exception:
+            fetcher_changed = False
+        try:
+            self._schedule_market_snapshot_refresh("stocks", every_s=20.0)
+            self._schedule_market_snapshot_refresh("forex", every_s=10.0)
+        except Exception:
+            pass
+        try:
+            self._schedule_market_thinker_scan("stocks", every_s=75.0)
+            self._schedule_market_thinker_scan("forex", every_s=45.0)
+        except Exception:
+            pass
+        try:
+            self._run_stock_trader_step(force=False, min_interval_s=18.0)
+        except Exception:
+            pass
+        try:
+            self._run_forex_trader_step(force=False, min_interval_s=12.0)
+        except Exception:
+            pass
+        try:
+            self._refresh_parallel_market_panels()
+        except Exception:
+            pass
+
+        runtime = self._read_runner_status()
+        runtime_state = str(runtime.get("state", "STOPPED") or "STOPPED").upper().strip()
+        thinker_pid = runtime.get("thinker_pid", None)
+        trader_pid = runtime.get("trader_pid", None)
+        restarts = runtime.get("restarts", {}) or {}
+        neural_running = bool(thinker_pid)
+        trader_running = bool(trader_pid)
+
+        neural_txt = f"Neural: {runtime_state if neural_running else 'STOPPED'}"
+        trader_txt = f"Trader: {runtime_state if trader_running else 'STOPPED'}"
+        if thinker_pid:
+            neural_txt += f" (pid {thinker_pid})"
+        if trader_pid:
+            trader_txt += f" (pid {trader_pid})"
+        try:
+            neural_txt += f" | restarts {int(restarts.get('thinker', 0) or 0)}"
+            trader_txt += f" | restarts {int(restarts.get('trader', 0) or 0)}"
+        except Exception:
+            pass
+        self.lbl_neural.config(text=neural_txt)
+        self.lbl_trader.config(text=trader_txt)
 
         # Start All is now a toggle (Start/Stop)
         try:
             if hasattr(self, "btn_toggle_all") and self.btn_toggle_all:
                 if neural_running or trader_running or bool(getattr(self, "_auto_start_trader_pending", False)):
-                    self.btn_toggle_all.config(text="Stop All")
+                    self.btn_toggle_all.config(text="Stop Trades")
                 else:
-                    self.btn_toggle_all.config(text="Start All")
+                    self.btn_toggle_all.config(text="Start Trades")
         except Exception:
             pass
 
@@ -3530,31 +5270,80 @@ class PowerTraderHub(tk.Tk):
         try:
             training_running = [c for c, s in status_map.items() if s == "TRAINING"]
             not_trained = [c for c, s in status_map.items() if s == "NOT TRAINED"]
+            done_tokens = ("DONE", "COMPLETE", "COMPLETED", "FINISHED", "READY", "TRAINED")
 
             if training_running:
                 self.lbl_training_overview.config(text=f"Training: RUNNING ({', '.join(training_running)})")
             elif not_trained:
                 self.lbl_training_overview.config(text=f"Training: REQUIRED ({len(not_trained)} not trained)")
             else:
-                self.lbl_training_overview.config(text="Training: READY (all trained)")
+                self.lbl_training_overview.config(text="Training: Idle (all trained)")
 
             # show each coin status (ONLY redraw the list if it actually changed)
             sig = tuple((c, status_map.get(c, "N/A")) for c in self.coins)
-            if getattr(self, "_last_training_sig", None) != sig:
-                self._last_training_sig = sig
-                self.training_list.delete(0, "end")
-                for c, st in sig:
-                    self.training_list.insert("end", f"{c}: {st}")
+            display_lines = []
+            for c, st in sig:
+                line_txt = f"{c}: {st}"
+                if str(st).upper() == "TRAINING":
+                    try:
+                        folder = self.coin_folders.get(c, "")
+                        status_path = os.path.join(folder, "trainer_status.json") if folder else ""
+                        st_info = _safe_read_json(status_path) if status_path else None
+                        pct_val = None
+                        if isinstance(st_info, dict) and ("pct" in st_info):
+                            try:
+                                pct_val = max(0, min(100, int(float(st_info.get("pct", 0)))))
+                            except Exception:
+                                pct_val = None
+                        if pct_val is not None:
+                            line_txt = f"{c}: TRAINING {pct_val}%"
+                    except Exception:
+                        pass
+                display_lines.append(line_txt)
 
-            # show gating hint (Start All handles the runner->ready->trader sequence)
-            if not all_trained:
-                self.lbl_flow_hint.config(text="Flow: Train All required → then Start All")
-            elif self._auto_start_trader_pending:
-                self.lbl_flow_hint.config(text="Flow: Starting runner → waiting for ready → trader will auto-start")
-            elif neural_running or trader_running:
-                self.lbl_flow_hint.config(text="Flow: Running (use the button to stop)")
+            display_sig = tuple(display_lines)
+            if getattr(self, "_last_training_sig", None) != display_sig:
+                self._last_training_sig = display_sig
+                self.training_list.delete(0, "end")
+                for line_txt in display_lines:
+                    self.training_list.insert("end", line_txt)
+
+            try:
+                training_lines = [str(self.training_list.get(i) or "").strip() for i in range(self.training_list.size())]
+            except Exception:
+                training_lines = []
+            total_training = len(training_lines) if training_lines else len(sig)
+            completed_training = 0
+            if training_lines:
+                for ln in training_lines:
+                    up_ln = ln.upper()
+                    if any(tok in up_ln for tok in done_tokens):
+                        completed_training += 1
             else:
-                self.lbl_flow_hint.config(text="Flow: Start All")
+                for _, st in sig:
+                    up_st = str(st or "").upper()
+                    if any(tok in up_st for tok in done_tokens):
+                        completed_training += 1
+            if total_training < 0:
+                total_training = 0
+            if completed_training < 0:
+                completed_training = 0
+            if completed_training > total_training:
+                completed_training = total_training
+            progress_pct = int(round((100.0 * completed_training / total_training), 0)) if total_training > 0 else 0
+            self.lbl_training_progress.config(
+                text=f"Progress: {progress_pct}% ({completed_training} / {total_training})"
+            )
+
+            # show gating hint for the detached trade supervisor
+            if not all_trained:
+                self.lbl_flow_hint.config(text="Flow: Train All required → then Start Trades")
+            elif self._auto_start_trader_pending:
+                self.lbl_flow_hint.config(text="Flow: Starting supervisor")
+            elif neural_running or trader_running:
+                self.lbl_flow_hint.config(text="Flow: Training idle | Trades running")
+            else:
+                self.lbl_flow_hint.config(text="Flow: No training running")
         except Exception:
             pass
 
@@ -3573,7 +5362,7 @@ class PowerTraderHub(tk.Tk):
 
         # charts (throttle)
         now = time.time()
-        if (now - self._last_chart_refresh) >= float(self.settings.get("chart_refresh_seconds", 10.0)):
+        if fetcher_changed or (now - self._last_chart_refresh) >= float(self.settings.get("chart_refresh_seconds", 10.0)):
             # account value chart (internally mtime-cached already)
             try:
                 if self.account_chart:
@@ -3620,6 +5409,7 @@ class PowerTraderHub(tk.Tk):
                     trail_line = pos.get("trail_line", None)
                     dca_line_price = pos.get("dca_line_price", None)
                     avg_cost_basis = pos.get("avg_cost_basis", None)
+                    qty = pos.get("quantity", None)
 
                     try:
                         chart.refresh(
@@ -3629,7 +5419,12 @@ class PowerTraderHub(tk.Tk):
                             trail_line=trail_line,
                             dca_line_price=dca_line_price,
                             avg_cost_basis=avg_cost_basis,
+                            quantity=qty,
                         )
+                        try:
+                            self._refresh_chart_legend_panel()
+                        except Exception:
+                            pass
                     except Exception:
                         pass
 
@@ -3640,6 +5435,19 @@ class PowerTraderHub(tk.Tk):
         # drain logs into panes
         self._drain_queue_to_text(self.runner_log_q, self.runner_text)
         self._drain_queue_to_text(self.trader_log_q, self.trader_text)
+        self._refresh_log_file_to_text(
+            self.runner_log_path,
+            self.runner_text,
+            "_last_runner_log_sig",
+            max_lines=500,
+            prefix_path=self.runner_launch_log_path,
+        )
+        self._refresh_log_file_to_text(
+            self.trader_log_path,
+            self.trader_text,
+            "_last_trader_log_sig",
+            max_lines=500,
+        )
 
         # trainer logs: show selected trainer output
         try:
@@ -3653,70 +5461,338 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
 
+        self._refresh_chart_legend_panel()
+        self._refresh_neural_overview_visibility()
         self.status.config(text=f"{_now_str()} | hub_dir={self.hub_dir}")
         self.after(int(float(self.settings.get("ui_refresh_seconds", 1.0)) * 1000), self._tick)
 
 
 
+    def _refresh_chart_legend_panel(self) -> None:
+        widget = getattr(self, "chart_legend_text", None)
+        box = getattr(self, "chart_legend_box", None)
+        btn = getattr(self, "btn_chart_legend_toggle", None)
+        header = getattr(self, "chart_legend_header", None)
+        scroll = getattr(self, "chart_legend_scroll", None)
+        if widget is None or box is None:
+            return
+
+        try:
+            collapsed = bool(getattr(self, "chart_legend_collapsed").get())
+        except Exception:
+            collapsed = False
+
+        page = str(getattr(self, "_current_chart_page", "ACCOUNT") or "ACCOUNT").strip().upper()
+        if page == "ACCOUNT":
+            text = "Select a coin chart to view legend details."
+            try:
+                if header is not None and header.winfo_manager():
+                    header.pack_forget()
+            except Exception:
+                pass
+            try:
+                if box.winfo_manager():
+                    box.pack_forget()
+            except Exception:
+                pass
+        else:
+            chart = self.charts.get(page) if isinstance(getattr(self, "charts", None), dict) else None
+            text = str(getattr(chart, "_legend_panel_text", "") or "").strip()
+            if not text:
+                text = f"{page}: waiting for chart data..."
+            try:
+                if header is not None and (not header.winfo_manager()):
+                    header.pack(fill="x", padx=6, pady=(0, 0), before=box)
+            except Exception:
+                pass
+            try:
+                if collapsed:
+                    if box.winfo_manager():
+                        box.pack_forget()
+                elif not box.winfo_manager():
+                    box.pack(fill="x", padx=6, pady=(0, 6))
+            except Exception:
+                pass
+            try:
+                mode = str(getattr(chart, "_legend_mode", "clean") or "clean").strip().lower()
+                widget.configure(height=(11 if mode == "detailed" else 6))
+                needs_scroll = bool(getattr(chart, "_legend_needs_scroll", False))
+                if scroll is not None:
+                    if needs_scroll and (not collapsed):
+                        if not scroll.winfo_manager():
+                            scroll.pack(side="right", fill="y")
+                    elif scroll.winfo_manager():
+                        scroll.pack_forget()
+            except Exception:
+                pass
+        if page == "ACCOUNT":
+            try:
+                if scroll is not None and scroll.winfo_manager():
+                    scroll.pack_forget()
+            except Exception:
+                pass
+
+        try:
+            if btn is not None:
+                btn.configure(text=("Show" if (page != "ACCOUNT" and collapsed) else "Hide"))
+                btn.configure(state=("disabled" if page == "ACCOUNT" else "normal"))
+        except Exception:
+            pass
+
+        try:
+            widget.configure(state="normal")
+            widget.delete("1.0", "end")
+            for idx, line in enumerate(str(text).splitlines()):
+                tag = "legend_head" if idx == 0 else ("legend_label" if ":" in line else "legend_value")
+                widget.insert("end", line + ("\n" if idx < (len(str(text).splitlines()) - 1) else ""), (tag,))
+            widget.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _draw_trades_table(self) -> None:
+        canvas = getattr(self, "trades_canvas", None)
+        cols = getattr(self, "trades_cols", ())
+        rows = list(getattr(self, "_trades_table_rows", []) or [])
+        if canvas is None or not cols:
+            return
+
+        try:
+            view_w = max(200, int(canvas.winfo_width()))
+            view_h = max(80, int(canvas.winfo_height()))
+        except Exception:
+            return
+
+        base = dict(getattr(self, "_trades_base_widths", {}) or {})
+        total_base = sum(base.get(c, 100) for c in cols) or 1
+        usable_w = max(240, view_w - 4)
+        scale = max(0.65, float(usable_w) / float(total_base))
+        widths = {c: max(60, int(base.get(c, 100) * scale)) for c in cols}
+        total_w = sum(widths.values())
+        header_h = int(getattr(self, "_trades_header_height", 28) or 28)
+        row_h = int(getattr(self, "_trades_row_height", 28) or 28)
+        total_h = header_h + (len(rows) * row_h)
+
+        try:
+            canvas.delete("all")
+        except Exception:
+            return
+
+        canvas.configure(scrollregion=(0, 0, total_w, max(total_h, view_h)))
+
+        x = 0
+        group_break_after = {"value", "realized_usd", "sell_pnl", "dca_24h"}
+        for col in cols:
+            w = widths[col]
+            canvas.create_rectangle(x, 0, x + w, header_h, fill=DARK_BG2, outline=DARK_BORDER, width=1)
+            anchor = "center"
+            tx = x + (w / 2)
+            if col in getattr(self, "trades_numeric_cols", set()):
+                anchor = "e"
+                tx = x + w - 8
+            elif col in getattr(self, "trades_center_cols", set()):
+                anchor = "center"
+            canvas.create_text(
+                tx,
+                header_h / 2,
+                text=str(getattr(self, "trades_header_labels", {}).get(col, col)),
+                fill=DARK_ACCENT,
+                font=("TkDefaultFont", 10, "bold"),
+                anchor=anchor,
+            )
+            if col in group_break_after:
+                canvas.create_line(x + w, 0, x + w, total_h, fill=DARK_ACCENT2, width=1)
+            x += w
+
+        canvas.create_line(0, header_h, total_w, header_h, fill=DARK_ACCENT2, width=2)
+
+        for row_index, row in enumerate(rows):
+            y0 = header_h + (row_index * row_h)
+            y1 = y0 + row_h
+            row_bg = DARK_PANEL if (row_index % 2) == 0 else "#0C1827"
+            canvas.create_rectangle(0, y0, total_w, y1, fill=row_bg, outline=DARK_BORDER, width=1)
+
+            x = 0
+            for col in cols:
+                w = widths[col]
+                cell_val = str(row.get(col, ""))
+                fg = DARK_FG
+                if col in {"unrealized_usd", "realized_usd"}:
+                    try:
+                        num = float(str(cell_val).replace("$", "").replace(",", ""))
+                        fg = DARK_ACCENT if num > 0 else ("#FF6B57" if num < 0 else DARK_FG)
+                    except Exception:
+                        fg = DARK_FG
+                elif col == "sell_pnl":
+                    try:
+                        raw = str(cell_val).replace("%", "").replace(",", "")
+                        num = float(raw)
+                        fg = DARK_ACCENT if num > 0 else ("#FF6B57" if num < 0 else DARK_FG)
+                    except Exception:
+                        fg = DARK_FG
+                elif col == "coin":
+                    fg = DARK_ACCENT2
+
+                anchor = "w"
+                tx = x + 8
+                if col in getattr(self, "trades_numeric_cols", set()):
+                    anchor = "e"
+                    tx = x + w - 8
+                elif col in getattr(self, "trades_center_cols", set()):
+                    anchor = "center"
+                    tx = x + (w / 2)
+
+                canvas.create_text(
+                    tx,
+                    y0 + (row_h / 2),
+                    text=cell_val,
+                    fill=fg,
+                    font=("TkDefaultFont", 10, "bold" if col in {"coin", "value", "unrealized_usd", "realized_usd", "sell_pnl"} else "normal"),
+                    anchor=anchor,
+                )
+                if col in group_break_after:
+                    canvas.create_line(x + w, y0, x + w, y1, fill=DARK_BORDER, width=1)
+                x += w
+
+
+    def _refresh_neural_overview_visibility(self) -> None:
+        box = getattr(self, "neural_box", None)
+        if box is None:
+            return
+
+        current_page = str(getattr(self, "_current_chart_page", "ACCOUNT") or "ACCOUNT").strip().upper()
+        should_show = (current_page == "ACCOUNT")
+
+        try:
+            is_visible = bool(box.winfo_manager())
+        except Exception:
+            is_visible = True
+
+        try:
+            if should_show and (not is_visible):
+                box.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+            elif (not should_show) and is_visible:
+                box.pack_forget()
+        except Exception:
+            pass
+
+    def _set_system_status_colors(self, state_txt: str, heartbeat_stale: bool = False) -> None:
+        state = str(state_txt or "").upper().strip()
+        if state == "RUNNING":
+            fg = DARK_ACCENT
+        elif state == "STOPPING":
+            fg = "#FFCC66"
+        elif state == "ERROR":
+            fg = "#FF6B57"
+        else:
+            fg = DARK_FG
+        stale_fg = "#FFCC66" if heartbeat_stale else fg
+        try:
+            self.lbl_neural.config(foreground=fg)
+            self.lbl_trader.config(foreground=fg)
+            self.lbl_last_status.config(foreground=stale_fg)
+        except Exception:
+            pass
+
+
     def _refresh_trader_status(self) -> None:
         # mtime cache: rebuilding the whole tree every tick is expensive with many rows
         try:
-            mtime = os.path.getmtime(self.trader_status_path)
+            runtime_mtime = os.path.getmtime(self.trader_status_path)
         except Exception:
-            mtime = None
+            runtime_mtime = None
+        try:
+            detail_mtime = os.path.getmtime(self.trader_data_path)
+        except Exception:
+            detail_mtime = None
+
+        mtime = (runtime_mtime, detail_mtime)
 
         if getattr(self, "_last_trader_status_mtime", object()) == mtime:
             return
         self._last_trader_status_mtime = mtime
 
-        data = _safe_read_json(self.trader_status_path)
-        if not data:
-            self.lbl_last_status.config(text="Last status: N/A (no trader_status.json yet)")
+        runtime = _safe_read_json(self.trader_status_path)
+        detail = _safe_read_json(self.trader_data_path)
+        if not runtime and not detail:
+            self.lbl_last_status.config(text="Last status: N/A (no trader status yet)")
 
             # account summary (right-side status area)
             try:
-                self.lbl_acct_total_value.config(text="Total Account Value: N/A")
-                self.lbl_acct_holdings_value.config(text="Holdings Value: N/A")
-                self.lbl_acct_buying_power.config(text="Buying Power: N/A")
-                self.lbl_acct_percent_in_trade.config(text="Percent In Trade: N/A")
-
-                # DCA affordability
-                self.lbl_acct_dca_spread.config(text="DCA Levels (spread): N/A")
-                self.lbl_acct_dca_single.config(text="DCA Levels (single): N/A")
+                self.lbl_acct_total_value.config(text="N/A")
+                self.lbl_acct_holdings_value.config(text="N/A")
+                self.lbl_acct_buying_power.config(text="N/A")
+                self.lbl_acct_percent_in_trade.config(text="N/A")
+                self.lbl_acct_dca_spread.config(text="N/A")
+                self.lbl_acct_dca_single.config(text="N/A")
+                self.lbl_pnl.config(text="N/A")
+                self.lbl_selected_coin_summary.config(text="Selected: ACCOUNT")
             except Exception:
                 pass
 
             # clear tree (once; subsequent ticks are mtime-short-circuited)
-            for iid in self.trades_tree.get_children():
-                self.trades_tree.delete(iid)
+            self._trades_table_rows = []
+            self._draw_trades_table()
             return
 
+        runtime = runtime if isinstance(runtime, dict) else {}
+        detail = detail if isinstance(detail, dict) else {}
 
-
-        ts = data.get("timestamp")
+        ts = runtime.get("ts", detail.get("timestamp"))
+        status_note = str(runtime.get("msg", "") or detail.get("status_note", "") or "").strip()
+        state_txt = str(runtime.get("state", "") or "").upper().strip()
+        heartbeat_stale = False
         try:
             if isinstance(ts, (int, float)):
-                self.lbl_last_status.config(text=f"Last status: {time.strftime('%H:%M:%S', time.localtime(ts))}")
-            else:
-                self.lbl_last_status.config(text="Last status: (unknown timestamp)")
+                heartbeat_stale = (time.time() - float(ts)) > 6.0
         except Exception:
-            self.lbl_last_status.config(text="Last status: (timestamp parse error)")
+            heartbeat_stale = False
+        try:
+            if isinstance(ts, (int, float)):
+                base_txt = f"Trade State: {state_txt or 'UNKNOWN'} | Heartbeat: {time.strftime('%H:%M:%S', time.localtime(ts))}"
+                if heartbeat_stale:
+                    base_txt += " | STALE"
+                if status_note:
+                    base_txt += f" | {status_note}"
+                self.lbl_last_status.config(text=base_txt)
+            else:
+                self.lbl_last_status.config(
+                    text=(f"Trade State: {state_txt or 'UNKNOWN'} | Heartbeat: (unknown)" + (f" | {status_note}" if status_note else ""))
+                )
+        except Exception:
+            self.lbl_last_status.config(text=(f"Trade State: {state_txt or 'UNKNOWN'} | Heartbeat: (parse error)" + (f" | {status_note}" if status_note else "")))
+        self._set_system_status_colors(state_txt, heartbeat_stale)
+
+        if not detail:
+            try:
+                self.lbl_acct_total_value.config(text="N/A")
+                self.lbl_acct_holdings_value.config(text="N/A")
+                self.lbl_acct_buying_power.config(text="N/A")
+                self.lbl_acct_percent_in_trade.config(text="N/A")
+                self.lbl_acct_dca_spread.config(text="N/A")
+                self.lbl_acct_dca_single.config(text="N/A")
+                self.lbl_selected_coin_summary.config(text="Selected: ACCOUNT")
+            except Exception:
+                pass
+            self._last_positions = {}
+            self._trades_table_rows = []
+            self._draw_trades_table()
+            return
 
         # --- account summary (same info the trader prints above current trades) ---
-        acct = data.get("account", {}) or {}
+        acct = detail.get("account", {}) or {}
         try:
             total_val = float(acct.get("total_account_value", 0.0) or 0.0)
 
             self._last_total_account_value = total_val
 
             self.lbl_acct_total_value.config(
-                text=f"Total Account Value: {_fmt_money(acct.get('total_account_value', None))}"
+                text=_fmt_money(acct.get('total_account_value', None))
             )
             self.lbl_acct_holdings_value.config(
-                text=f"Holdings Value: {_fmt_money(acct.get('holdings_sell_value', None))}"
+                text=_fmt_money(acct.get('holdings_sell_value', None))
             )
             self.lbl_acct_buying_power.config(
-                text=f"Buying Power: {_fmt_money(acct.get('buying_power', None))}"
+                text=_fmt_money(acct.get('buying_power', None))
             )
 
             pit = acct.get("percent_in_trade", None)
@@ -3724,7 +5800,7 @@ class PowerTraderHub(tk.Tk):
                 pit_txt = f"{float(pit):.2f}%"
             except Exception:
                 pit_txt = "N/A"
-            self.lbl_acct_percent_in_trade.config(text=f"Percent In Trade: {pit_txt}")
+            self.lbl_acct_percent_in_trade.config(text=pit_txt)
 
 
             # -------------------------
@@ -3774,19 +5850,20 @@ class PowerTraderHub(tk.Tk):
 
 
             # Show labels + number (one line each)
-            self.lbl_acct_dca_spread.config(text=f"DCA Levels (spread): {spread_levels}")
-            self.lbl_acct_dca_single.config(text=f"DCA Levels (single): {single_levels}")
+            self.lbl_acct_dca_spread.config(text=str(spread_levels))
+            self.lbl_acct_dca_single.config(text=str(single_levels))
 
 
         except Exception:
             pass
 
 
-        positions = data.get("positions", {}) or {}
+        positions = detail.get("positions", {}) or {}
         self._last_positions = positions
 
         # --- precompute per-coin DCA count in rolling 24h (and after last SELL for that coin) ---
         dca_24h_by_coin: Dict[str, int] = {}
+        realized_by_coin: Dict[str, float] = {}
         try:
             now = time.time()
             window_floor = now - (24 * 3600)
@@ -3835,13 +5912,73 @@ class PowerTraderHub(tk.Tk):
                 start_ts = max(window_floor, float(last_sell_ts.get(base, 0.0)))
                 if tsf >= start_ts:
                     dca_24h_by_coin[base] = int(dca_24h_by_coin.get(base, 0)) + 1
+
+            for tr in trades:
+                sym = str(tr.get("symbol", "")).upper().strip()
+                base = sym.split("-")[0].strip() if sym else ""
+                if not base:
+                    continue
+                try:
+                    realized = float(tr.get("realized_profit_usd", 0.0) or 0.0)
+                except Exception:
+                    realized = 0.0
+                if abs(realized) > 0.0:
+                    realized_by_coin[base] = float(realized_by_coin.get(base, 0.0) or 0.0) + realized
         except Exception:
             dca_24h_by_coin = {}
+            realized_by_coin = {}
 
-        # rebuild tree (only when file changes)
-        for iid in self.trades_tree.get_children():
-            self.trades_tree.delete(iid)
+        # rebuild table rows (only when file changes)
+        table_rows = []
 
+        selected_coin = str(getattr(self, "_current_chart_page", "ACCOUNT") or "ACCOUNT").strip().upper()
+        selected_pos = positions.get(selected_coin, {}) if isinstance(positions, dict) else {}
+        if selected_coin == "ACCOUNT":
+            try:
+                self.lbl_selected_coin_summary.config(text="Selected: ACCOUNT")
+            except Exception:
+                pass
+        else:
+            try:
+                sel_qty = float(selected_pos.get("quantity", 0.0) or 0.0)
+            except Exception:
+                sel_qty = 0.0
+            try:
+                sel_realized = float(realized_by_coin.get(selected_coin, 0.0) or 0.0)
+            except Exception:
+                sel_realized = 0.0
+            try:
+                sel_avg = float(selected_pos.get("avg_cost_basis", 0.0) or 0.0)
+            except Exception:
+                sel_avg = 0.0
+            try:
+                sel_bid = float(selected_pos.get("current_sell_price", 0.0) or 0.0)
+            except Exception:
+                sel_bid = 0.0
+            sel_unrealized = 0.0
+            if sel_qty > 0.0 and sel_avg > 0.0 and sel_bid > 0.0:
+                sel_unrealized = (sel_qty * sel_bid) - (sel_qty * sel_avg)
+            try:
+                sel_stage = int(selected_pos.get("dca_triggered_stages", 0) or 0)
+            except Exception:
+                sel_stage = 0
+            try:
+                trail_active = (float(selected_pos.get("trail_line", 0.0) or 0.0) > 0.0)
+            except Exception:
+                trail_active = False
+            summary = (
+                f"Selected: {selected_coin} | Qty {sel_qty:.6f}".rstrip("0").rstrip(".")
+                + f" | Unrlzd {sel_unrealized:+.2f}"
+                + f" | Rlz {sel_realized:+.2f}"
+                + f" | Stage {sel_stage}"
+                + f" | Trail {'On' if trail_active else 'Off'}"
+            )
+            try:
+                self.lbl_selected_coin_summary.config(text=summary)
+            except Exception:
+                pass
+
+        visible_row_index = 0
         for sym, pos in positions.items():
             coin = sym
             qty = pos.get("quantity", 0.0)
@@ -3864,6 +6001,23 @@ class PowerTraderHub(tk.Tk):
 
             dca_stages = pos.get("dca_triggered_stages", 0)
             dca_24h = int(dca_24h_by_coin.get(str(coin).upper().strip(), 0))
+            realized_usd = float(realized_by_coin.get(str(coin).upper().strip(), 0.0) or 0.0)
+
+            try:
+                qtyf = float(qty or 0.0)
+            except Exception:
+                qtyf = 0.0
+            try:
+                avgf = float(avg_cost or 0.0)
+            except Exception:
+                avgf = 0.0
+            try:
+                sellf = float(sell_price or 0.0)
+            except Exception:
+                sellf = 0.0
+            unrealized_usd = 0.0
+            if qtyf > 0.0 and avgf > 0.0 and sellf > 0.0:
+                unrealized_usd = (qtyf * sellf) - (qtyf * avgf)
 
             # Display + heading reflect the current max DCA setting (hot-reload friendly)
             try:
@@ -3873,7 +6027,7 @@ class PowerTraderHub(tk.Tk):
             if max_dca_24h < 0:
                 max_dca_24h = 0
             try:
-                self.trades_tree.heading("dca_24h", text=f"DCA 24h (max {max_dca_24h})")
+                self.trades_header_labels["dca_24h"] = f"24h DCA ({max_dca_24h})"
             except Exception:
                 pass
             dca_24h_display = f"{dca_24h}/{max_dca_24h}"
@@ -3884,7 +6038,7 @@ class PowerTraderHub(tk.Tk):
                 pm0 = float(self.settings.get("pm_start_pct_no_dca", DEFAULT_SETTINGS.get("pm_start_pct_no_dca", 5.0)) or 5.0)
                 pm1 = float(self.settings.get("pm_start_pct_with_dca", DEFAULT_SETTINGS.get("pm_start_pct_with_dca", 2.5)) or 2.5)
                 tg = float(self.settings.get("trailing_gap_pct", DEFAULT_SETTINGS.get("trailing_gap_pct", 0.5)) or 0.5)
-                self.trades_tree.heading("trail_line", text=f"Trail Line (start {pm0:g}/{pm1:g}%, gap {tg:g}%)")
+                self.trades_header_labels["trail_line"] = f"Trail ({pm0:g}/{pm1:g}%)"
             except Exception:
                 pass
 
@@ -3893,24 +6047,26 @@ class PowerTraderHub(tk.Tk):
 
             trail_line = pos.get("trail_line", 0.0)
 
-            self.trades_tree.insert(
-                "",
-                "end",
-                values=(
-                    coin,
-                    f"{qty:.8f}".rstrip("0").rstrip("."),
-                    _fmt_money(value),       # position value (USD)
-                    _fmt_price(avg_cost),    # per-unit price (USD) -> dynamic decimals
-                    _fmt_price(buy_price),
-                    _fmt_pct(buy_pnl),
-                    _fmt_price(sell_price),
-                    _fmt_pct(sell_pnl),
-                    dca_stages,
-                    dca_24h_display,
-                    next_dca,
-                    _fmt_price(trail_line),  # trail line is a price level
-                ),
-            )
+            table_rows.append({
+                "coin": str(coin),
+                "qty": f"{qty:.8f}".rstrip("0").rstrip("."),
+                "value": _fmt_money(value),
+                "unrealized_usd": f"{unrealized_usd:+.2f}",
+                "realized_usd": f"{realized_usd:+.2f}",
+                "avg_cost": _fmt_price(avg_cost),
+                "buy_price": _fmt_price(buy_price),
+                "buy_pnl": _fmt_pct(buy_pnl),
+                "sell_price": _fmt_price(sell_price),
+                "sell_pnl": _fmt_pct(sell_pnl),
+                "dca_stages": str(dca_stages),
+                "dca_24h": dca_24h_display,
+                "next_dca": str(next_dca),
+                "trail_line": _fmt_price(trail_line),
+            })
+            visible_row_index += 1
+
+        self._trades_table_rows = table_rows
+        self._draw_trades_table()
 
 
 
@@ -3933,10 +6089,10 @@ class PowerTraderHub(tk.Tk):
 
         data = _safe_read_json(self.pnl_ledger_path)
         if not data:
-            self.lbl_pnl.config(text="Total realized: N/A")
+            self.lbl_pnl.config(text="N/A")
             return
         total = float(data.get("total_realized_profit_usd", 0.0))
-        self.lbl_pnl.config(text=f"Total realized: {_fmt_money(total)}")
+        self.lbl_pnl.config(text=_fmt_money(total))
 
 
     def _refresh_trade_history(self) -> None:
@@ -3953,6 +6109,10 @@ class PowerTraderHub(tk.Tk):
         if not os.path.isfile(self.trade_history_path):
             self.hist_list.delete(0, "end")
             self.hist_list.insert("end", "(no trade_history.jsonl yet)")
+            try:
+                self.hist_list.itemconfig(0, bg=DARK_PANEL2, fg=DARK_FG)
+            except Exception:
+                pass
             return
 
         # show last N lines
@@ -3964,6 +6124,7 @@ class PowerTraderHub(tk.Tk):
 
         lines = lines[-250:]  # cap for UI
         self.hist_list.delete(0, "end")
+        row_index = 0
         for line in reversed(lines):
             line = line.strip()
             if not line:
@@ -4012,8 +6173,23 @@ class PowerTraderHub(tk.Tk):
                         txt += f" | realized={pnl}"
 
                 self.hist_list.insert("end", txt)
+                hist_fg = DARK_FG
+                if side == "SELL":
+                    hist_fg = DARK_ACCENT
+                elif side == "BUY" and tag == "DCA":
+                    hist_fg = "#C58BFF"
+                elif side == "BUY":
+                    hist_fg = DARK_ACCENT2
             except Exception:
                 self.hist_list.insert("end", line)
+                hist_fg = DARK_FG
+            try:
+                idx = self.hist_list.size() - 1
+                bg = DARK_PANEL if (row_index % 2) == 0 else "#0C1827"
+                self.hist_list.itemconfig(idx, bg=bg, fg=hist_fg)
+            except Exception:
+                pass
+            row_index += 1
 
 
 
@@ -4049,6 +6225,8 @@ class PowerTraderHub(tk.Tk):
             if hasattr(self, "train_coin_var") and hasattr(self, "trainer_coin_var"):
                 if self.train_coin_var.get():
                     self.trainer_coin_var.set(self.train_coin_var.get())
+            if hasattr(self, "chart_search_combo") and self.chart_search_combo.winfo_exists():
+                self.chart_search_combo["values"] = ["ACCOUNT"] + list(self.coins)
         except Exception:
             pass
 
@@ -4290,12 +6468,17 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
 
-        # Recreate
-        self.chart_tabs_bar = WrapFrame(charts_frame)
-        self.chart_tabs_bar.pack(fill="x", padx=6, pady=(6, 0))
+        # Recreate (dropdown-only navigation; no visible button tab bar)
+        self.chart_tabs_bar = ttk.Frame(charts_frame)
 
         self.chart_pages_container = ttk.Frame(charts_frame)
         self.chart_pages_container.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        try:
+            if hasattr(self, "chart_search_combo") and self.chart_search_combo.winfo_exists():
+                self.chart_search_combo["values"] = ["ACCOUNT"] + list(self.coins)
+        except Exception:
+            pass
 
         self._chart_tab_buttons = {}
         self.chart_pages = {}
@@ -4311,6 +6494,18 @@ class PowerTraderHub(tk.Tk):
             f = self.chart_pages.get(name)
             if f is not None:
                 f.pack(fill="both", expand=True)
+            try:
+                self.chart_search_var.set(name)
+            except Exception:
+                pass
+            try:
+                self._refresh_chart_legend_panel()
+            except Exception:
+                pass
+            try:
+                self._refresh_neural_overview_visibility()
+            except Exception:
+                pass
 
             for txt, b in self._chart_tab_buttons.items():
                 try:
@@ -4324,15 +6519,6 @@ class PowerTraderHub(tk.Tk):
         acct_page = ttk.Frame(self.chart_pages_container)
         self.chart_pages["ACCOUNT"] = acct_page
 
-        acct_btn = ttk.Button(
-            self.chart_tabs_bar,
-            text="ACCOUNT",
-            style="ChartTab.TButton",
-            command=lambda: self._show_chart_page("ACCOUNT"),
-        )
-        self.chart_tabs_bar.add(acct_btn, padx=(0, 6), pady=(0, 6))
-        self._chart_tab_buttons["ACCOUNT"] = acct_btn
-
         self.account_chart = AccountValueChart(
             acct_page,
             self.account_value_history_path,
@@ -4345,15 +6531,6 @@ class PowerTraderHub(tk.Tk):
         for coin in self.coins:
             page = ttk.Frame(self.chart_pages_container)
             self.chart_pages[coin] = page
-
-            btn = ttk.Button(
-                self.chart_tabs_bar,
-                text=coin,
-                style="ChartTab.TButton",
-                command=lambda c=coin: self._show_chart_page(c),
-            )
-            self.chart_tabs_bar.add(btn, padx=(0, 6), pady=(0, 6))
-            self._chart_tab_buttons[coin] = btn
 
             chart = CandleChart(page, self.fetcher, coin, self._settings_getter, self.trade_history_path)
             chart.pack(fill="both", expand=True)
@@ -4462,13 +6639,14 @@ class PowerTraderHub(tk.Tk):
         frm.columnconfigure(1, weight=1)  # entries
         frm.columnconfigure(2, weight=0)  # browse buttons
 
-        def add_row(r: int, label: str, var: tk.Variable, browse: Optional[str] = None):
+        def add_row(r: int, label: str, var: tk.Variable, browse: Optional[str] = None, parent: Optional[ttk.Frame] = None):
             """
             browse: "dir" to attach a directory chooser, else None.
             """
-            ttk.Label(frm, text=label).grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
+            target = parent or frm
+            ttk.Label(target, text=label).grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
 
-            ent = ttk.Entry(frm, textvariable=var)
+            ent = ttk.Entry(target, textvariable=var)
             ent.grid(row=r, column=1, sticky="ew", pady=6)
 
             if browse == "dir":
@@ -4476,10 +6654,17 @@ class PowerTraderHub(tk.Tk):
                     picked = filedialog.askdirectory()
                     if picked:
                         var.set(picked)
-                ttk.Button(frm, text="Browse", command=do_browse).grid(row=r, column=2, sticky="e", padx=(10, 0), pady=6)
+                ttk.Button(target, text="Browse", command=do_browse).grid(row=r, column=2, sticky="e", padx=(10, 0), pady=6)
             else:
                 # keep column alignment consistent
-                ttk.Label(frm, text="").grid(row=r, column=2, sticky="e", padx=(10, 0), pady=6)
+                ttk.Label(target, text="").grid(row=r, column=2, sticky="e", padx=(10, 0), pady=6)
+
+        def add_secret_row(r: int, label: str, var: tk.Variable, parent: Optional[ttk.Frame] = None):
+            target = parent or frm
+            ttk.Label(target, text=label).grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
+            ent = ttk.Entry(target, textvariable=var, show="*")
+            ent.grid(row=r, column=1, sticky="ew", pady=6)
+            ttk.Label(target, text="").grid(row=r, column=2, sticky="e", padx=(10, 0), pady=6)
 
         main_dir_var = tk.StringVar(value=self.settings["main_neural_dir"])
         coins_var = tk.StringVar(value=",".join(self.settings["coins"]))
@@ -4496,6 +6681,31 @@ class PowerTraderHub(tk.Tk):
         pm_no_dca_var = tk.StringVar(value=str(self.settings.get("pm_start_pct_no_dca", DEFAULT_SETTINGS.get("pm_start_pct_no_dca", 5.0))))
         pm_with_dca_var = tk.StringVar(value=str(self.settings.get("pm_start_pct_with_dca", DEFAULT_SETTINGS.get("pm_start_pct_with_dca", 2.5))))
         trailing_gap_var = tk.StringVar(value=str(self.settings.get("trailing_gap_pct", DEFAULT_SETTINGS.get("trailing_gap_pct", 0.5))))
+        max_pos_per_coin_var = tk.StringVar(value=str(self.settings.get("max_position_usd_per_coin", DEFAULT_SETTINGS.get("max_position_usd_per_coin", 0.0))))
+        max_total_exposure_var = tk.StringVar(value=str(self.settings.get("max_total_exposure_pct", DEFAULT_SETTINGS.get("max_total_exposure_pct", 0.0))))
+        alpaca_key_var = tk.StringVar(value=str(self.settings.get("alpaca_api_key_id", DEFAULT_SETTINGS.get("alpaca_api_key_id", "")) or ""))
+        alpaca_secret_var = tk.StringVar(value=str(self.settings.get("alpaca_secret_key", DEFAULT_SETTINGS.get("alpaca_secret_key", "")) or ""))
+        alpaca_base_url_var = tk.StringVar(value=str(self.settings.get("alpaca_base_url", DEFAULT_SETTINGS.get("alpaca_base_url", "")) or ""))
+        alpaca_data_url_var = tk.StringVar(value=str(self.settings.get("alpaca_data_url", DEFAULT_SETTINGS.get("alpaca_data_url", "")) or ""))
+        alpaca_paper_var = tk.BooleanVar(value=bool(self.settings.get("alpaca_paper_mode", DEFAULT_SETTINGS.get("alpaca_paper_mode", True))))
+        stock_auto_trade_var = tk.BooleanVar(value=bool(self.settings.get("stock_auto_trade_enabled", DEFAULT_SETTINGS.get("stock_auto_trade_enabled", False))))
+        stock_notional_var = tk.StringVar(value=str(self.settings.get("stock_trade_notional_usd", DEFAULT_SETTINGS.get("stock_trade_notional_usd", 100.0))))
+        stock_max_pos_var = tk.StringVar(value=str(self.settings.get("stock_max_open_positions", DEFAULT_SETTINGS.get("stock_max_open_positions", 1))))
+        stock_score_threshold_var = tk.StringVar(value=str(self.settings.get("stock_score_threshold", DEFAULT_SETTINGS.get("stock_score_threshold", 0.2))))
+        stock_profit_target_var = tk.StringVar(value=str(self.settings.get("stock_profit_target_pct", DEFAULT_SETTINGS.get("stock_profit_target_pct", 0.35))))
+        stock_trailing_gap_var = tk.StringVar(value=str(self.settings.get("stock_trailing_gap_pct", DEFAULT_SETTINGS.get("stock_trailing_gap_pct", 0.2))))
+        stock_day_trades_var = tk.StringVar(value=str(self.settings.get("stock_max_day_trades", DEFAULT_SETTINGS.get("stock_max_day_trades", 3))))
+        oanda_account_var = tk.StringVar(value=str(self.settings.get("oanda_account_id", DEFAULT_SETTINGS.get("oanda_account_id", "")) or ""))
+        oanda_token_var = tk.StringVar(value=str(self.settings.get("oanda_api_token", DEFAULT_SETTINGS.get("oanda_api_token", "")) or ""))
+        oanda_rest_url_var = tk.StringVar(value=str(self.settings.get("oanda_rest_url", DEFAULT_SETTINGS.get("oanda_rest_url", "")) or ""))
+        oanda_stream_url_var = tk.StringVar(value=str(self.settings.get("oanda_stream_url", DEFAULT_SETTINGS.get("oanda_stream_url", "")) or ""))
+        oanda_practice_var = tk.BooleanVar(value=bool(self.settings.get("oanda_practice_mode", DEFAULT_SETTINGS.get("oanda_practice_mode", True))))
+        fx_auto_trade_var = tk.BooleanVar(value=bool(self.settings.get("forex_auto_trade_enabled", DEFAULT_SETTINGS.get("forex_auto_trade_enabled", False))))
+        fx_trade_units_var = tk.StringVar(value=str(self.settings.get("forex_trade_units", DEFAULT_SETTINGS.get("forex_trade_units", 1000))))
+        fx_max_pos_var = tk.StringVar(value=str(self.settings.get("forex_max_open_positions", DEFAULT_SETTINGS.get("forex_max_open_positions", 1))))
+        fx_score_threshold_var = tk.StringVar(value=str(self.settings.get("forex_score_threshold", DEFAULT_SETTINGS.get("forex_score_threshold", 0.2))))
+        fx_profit_target_var = tk.StringVar(value=str(self.settings.get("forex_profit_target_pct", DEFAULT_SETTINGS.get("forex_profit_target_pct", 0.25))))
+        fx_trailing_gap_var = tk.StringVar(value=str(self.settings.get("forex_trailing_gap_pct", DEFAULT_SETTINGS.get("forex_trailing_gap_pct", 0.15))))
 
         hub_dir_var = tk.StringVar(value=self.settings.get("hub_data_dir", ""))
 
@@ -4569,16 +6779,83 @@ class PowerTraderHub(tk.Tk):
         add_row(r, "Trailing PM start % (with DCA):", pm_with_dca_var); r += 1
         add_row(r, "Trailing gap % (behind peak):", trailing_gap_var); r += 1
 
-        add_row(r, "Hub data dir (optional):", hub_dir_var, browse="dir"); r += 1
+        advanced_wrap = ttk.Frame(frm)
+        advanced_wrap.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(8, 0)); r += 1
+        advanced_wrap.columnconfigure(0, weight=1)
 
+        advanced_visible_var = tk.BooleanVar(value=False)
+        advanced_frame = ttk.Frame(advanced_wrap)
+        advanced_frame.columnconfigure(0, weight=0)
+        advanced_frame.columnconfigure(1, weight=1)
+        advanced_frame.columnconfigure(2, weight=0)
 
+        def _toggle_advanced() -> None:
+            try:
+                if advanced_visible_var.get():
+                    advanced_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+                    advanced_btn.config(text="Hide Advanced")
+                else:
+                    advanced_frame.grid_remove()
+                    advanced_btn.config(text="Advanced")
+                _update_settings_scrollbars()
+            except Exception:
+                pass
 
+        advanced_btn = ttk.Button(advanced_wrap, text="Advanced", command=lambda: (
+            advanced_visible_var.set(not advanced_visible_var.get()),
+            _toggle_advanced(),
+        ))
+        advanced_btn.grid(row=0, column=0, sticky="w")
 
-        ttk.Separator(frm, orient="horizontal").grid(row=r, column=0, columnspan=3, sticky="ew", pady=10); r += 1
+        ar = 0
+        add_row(ar, "Max position USD / coin (0=off):", max_pos_per_coin_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Max total exposure % (0=off):", max_total_exposure_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Hub data dir (optional):", hub_dir_var, browse="dir", parent=advanced_frame); ar += 1
 
-        add_row(r, "pt_thinker.py path:", neural_script_var); r += 1
-        add_row(r, "pt_trainer.py path:", trainer_script_var); r += 1
-        add_row(r, "pt_trader.py path:", trader_script_var); r += 1
+        ttk.Separator(advanced_frame, orient="horizontal").grid(row=ar, column=0, columnspan=3, sticky="ew", pady=10); ar += 1
+
+        add_row(ar, "pt_thinker.py path:", neural_script_var, parent=advanced_frame); ar += 1
+        add_row(ar, "pt_trainer.py path:", trainer_script_var, parent=advanced_frame); ar += 1
+        add_row(ar, "pt_trader.py path:", trader_script_var, parent=advanced_frame); ar += 1
+
+        ttk.Separator(advanced_frame, orient="horizontal").grid(row=ar, column=0, columnspan=3, sticky="ew", pady=10); ar += 1
+
+        ttk.Label(advanced_frame, text="Alpaca API:").grid(row=ar, column=0, sticky="w", padx=(0, 10), pady=6)
+        alpaca_mode_chk = ttk.Checkbutton(advanced_frame, text="Paper mode", variable=alpaca_paper_var)
+        alpaca_mode_chk.grid(row=ar, column=1, sticky="w", pady=6)
+        ttk.Label(advanced_frame, text="").grid(row=ar, column=2, sticky="e", padx=(10, 0), pady=6); ar += 1
+        add_secret_row(ar, "Alpaca API key ID:", alpaca_key_var, parent=advanced_frame); ar += 1
+        add_secret_row(ar, "Alpaca secret key:", alpaca_secret_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Alpaca base URL:", alpaca_base_url_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Alpaca data URL:", alpaca_data_url_var, parent=advanced_frame); ar += 1
+        ttk.Label(advanced_frame, text="Stocks AI trader:").grid(row=ar, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Checkbutton(advanced_frame, text="Enable auto-trade (paper-safe)", variable=stock_auto_trade_var).grid(row=ar, column=1, sticky="w", pady=6)
+        ttk.Label(advanced_frame, text="").grid(row=ar, column=2, sticky="e", padx=(10, 0), pady=6); ar += 1
+        add_row(ar, "Stock order notional USD:", stock_notional_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock max open positions:", stock_max_pos_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock score threshold:", stock_score_threshold_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock profit target %:", stock_profit_target_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock trailing gap %:", stock_trailing_gap_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock max day trades / day:", stock_day_trades_var, parent=advanced_frame); ar += 1
+
+        ttk.Separator(advanced_frame, orient="horizontal").grid(row=ar, column=0, columnspan=3, sticky="ew", pady=10); ar += 1
+
+        ttk.Label(advanced_frame, text="OANDA API:").grid(row=ar, column=0, sticky="w", padx=(0, 10), pady=6)
+        oanda_mode_chk = ttk.Checkbutton(advanced_frame, text="Practice mode", variable=oanda_practice_var)
+        oanda_mode_chk.grid(row=ar, column=1, sticky="w", pady=6)
+        ttk.Label(advanced_frame, text="").grid(row=ar, column=2, sticky="e", padx=(10, 0), pady=6); ar += 1
+        add_row(ar, "OANDA account ID:", oanda_account_var, parent=advanced_frame); ar += 1
+        add_secret_row(ar, "OANDA API token:", oanda_token_var, parent=advanced_frame); ar += 1
+        add_row(ar, "OANDA REST URL:", oanda_rest_url_var, parent=advanced_frame); ar += 1
+        add_row(ar, "OANDA stream URL:", oanda_stream_url_var, parent=advanced_frame); ar += 1
+        ttk.Label(advanced_frame, text="Forex AI trader:").grid(row=ar, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Checkbutton(advanced_frame, text="Enable auto-trade (practice only)", variable=fx_auto_trade_var).grid(row=ar, column=1, sticky="w", pady=6)
+        ttk.Label(advanced_frame, text="").grid(row=ar, column=2, sticky="e", padx=(10, 0), pady=6); ar += 1
+        add_row(ar, "Forex trade units:", fx_trade_units_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex max open positions:", fx_max_pos_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex score threshold:", fx_score_threshold_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex profit target %:", fx_profit_target_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex trailing gap %:", fx_trailing_gap_var, parent=advanced_frame); ar += 1
 
         # --- Robinhood API setup (writes r_key.txt + r_secret.txt used by pt_trader.py) ---
         def _api_paths() -> Tuple[str, str]:
@@ -5159,10 +7436,10 @@ class PowerTraderHub(tk.Tk):
             ttk.Button(save_btns, text="Save", command=do_save).pack(side="left")
             ttk.Button(save_btns, text="Close", command=wiz.destroy).pack(side="left", padx=8)
 
-        ttk.Label(frm, text="Robinhood API:").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Label(advanced_frame, text="Robinhood API:").grid(row=ar, column=0, sticky="w", padx=(0, 10), pady=6)
 
-        api_row = ttk.Frame(frm)
-        api_row.grid(row=r, column=1, columnspan=2, sticky="ew", pady=6)
+        api_row = ttk.Frame(advanced_frame)
+        api_row.grid(row=ar, column=1, columnspan=2, sticky="ew", pady=6)
         api_row.columnconfigure(0, weight=1)
 
         ttk.Label(api_row, textvariable=api_status_var).grid(row=0, column=0, sticky="w")
@@ -5170,20 +7447,18 @@ class PowerTraderHub(tk.Tk):
         ttk.Button(api_row, text="Open Folder", command=_open_api_folder).grid(row=0, column=2, sticky="e", padx=(8, 0))
         ttk.Button(api_row, text="Clear", command=_clear_api_files).grid(row=0, column=3, sticky="e", padx=(8, 0))
 
-        r += 1
+        ar += 1
 
         _refresh_api_status()
 
+        ttk.Separator(advanced_frame, orient="horizontal").grid(row=ar, column=0, columnspan=3, sticky="ew", pady=10); ar += 1
 
-        ttk.Separator(frm, orient="horizontal").grid(row=r, column=0, columnspan=3, sticky="ew", pady=10); r += 1
+        add_row(ar, "UI refresh seconds:", ui_refresh_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Chart refresh seconds:", chart_refresh_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Candles limit:", candles_limit_var, parent=advanced_frame); ar += 1
 
-
-        add_row(r, "UI refresh seconds:", ui_refresh_var); r += 1
-        add_row(r, "Chart refresh seconds:", chart_refresh_var); r += 1
-        add_row(r, "Candles limit:", candles_limit_var); r += 1
-
-        chk = ttk.Checkbutton(frm, text="Auto start scripts on GUI launch", variable=auto_start_var)
-        chk.grid(row=r, column=0, columnspan=3, sticky="w", pady=(10, 0)); r += 1
+        chk = ttk.Checkbutton(advanced_frame, text="Auto start scripts on GUI launch", variable=auto_start_var)
+        chk.grid(row=ar, column=0, columnspan=3, sticky="w", pady=(10, 0)); ar += 1
 
         btns = ttk.Frame(frm)
         btns.grid(row=r, column=0, columnspan=3, sticky="ew", pady=14)
@@ -5256,12 +7531,66 @@ class PowerTraderHub(tk.Tk):
                     tg = 0.0
                 self.settings["trailing_gap_pct"] = tg
 
+                try:
+                    mpc = float((max_pos_per_coin_var.get() or "").strip().replace("$", "") or 0.0)
+                except Exception:
+                    mpc = float(self.settings.get("max_position_usd_per_coin", DEFAULT_SETTINGS.get("max_position_usd_per_coin", 0.0)) or 0.0)
+                if mpc < 0.0:
+                    mpc = 0.0
+                self.settings["max_position_usd_per_coin"] = mpc
+
+                try:
+                    mte = float((max_total_exposure_var.get() or "").strip().replace("%", "") or 0.0)
+                except Exception:
+                    mte = float(self.settings.get("max_total_exposure_pct", DEFAULT_SETTINGS.get("max_total_exposure_pct", 0.0)) or 0.0)
+                if mte < 0.0:
+                    mte = 0.0
+                self.settings["max_total_exposure_pct"] = mte
+
 
 
                 self.settings["hub_data_dir"] = hub_dir_var.get().strip()
-
-
-
+                self.settings["alpaca_api_key_id"] = alpaca_key_var.get().strip()
+                self.settings["alpaca_secret_key"] = alpaca_secret_var.get().strip()
+                self.settings["alpaca_base_url"] = alpaca_base_url_var.get().strip() or str(DEFAULT_SETTINGS.get("alpaca_base_url", ""))
+                self.settings["alpaca_data_url"] = alpaca_data_url_var.get().strip() or str(DEFAULT_SETTINGS.get("alpaca_data_url", ""))
+                self.settings["alpaca_paper_mode"] = bool(alpaca_paper_var.get())
+                self.settings["stock_auto_trade_enabled"] = bool(stock_auto_trade_var.get())
+                try:
+                    self.settings["stock_trade_notional_usd"] = max(1.0, float((stock_notional_var.get() or "").strip().replace("$", "") or 100.0))
+                except Exception:
+                    self.settings["stock_trade_notional_usd"] = float(DEFAULT_SETTINGS.get("stock_trade_notional_usd", 100.0))
+                try:
+                    self.settings["stock_max_open_positions"] = max(1, int(float((stock_max_pos_var.get() or "").strip() or 1)))
+                except Exception:
+                    self.settings["stock_max_open_positions"] = int(DEFAULT_SETTINGS.get("stock_max_open_positions", 1))
+                try:
+                    self.settings["stock_score_threshold"] = max(0.0, float((stock_score_threshold_var.get() or "").strip() or 0.2))
+                except Exception:
+                    self.settings["stock_score_threshold"] = float(DEFAULT_SETTINGS.get("stock_score_threshold", 0.2))
+                try:
+                    self.settings["stock_profit_target_pct"] = max(0.0, float((stock_profit_target_var.get() or "").strip().replace("%", "") or 0.35))
+                except Exception:
+                    self.settings["stock_profit_target_pct"] = float(DEFAULT_SETTINGS.get("stock_profit_target_pct", 0.35))
+                try:
+                    self.settings["stock_trailing_gap_pct"] = max(0.0, float((stock_trailing_gap_var.get() or "").strip().replace("%", "") or 0.2))
+                except Exception:
+                    self.settings["stock_trailing_gap_pct"] = float(DEFAULT_SETTINGS.get("stock_trailing_gap_pct", 0.2))
+                try:
+                    self.settings["stock_max_day_trades"] = max(0, int(float((stock_day_trades_var.get() or "").strip() or 3)))
+                except Exception:
+                    self.settings["stock_max_day_trades"] = int(DEFAULT_SETTINGS.get("stock_max_day_trades", 3))
+                self.settings["oanda_account_id"] = oanda_account_var.get().strip()
+                self.settings["oanda_api_token"] = oanda_token_var.get().strip()
+                self.settings["oanda_rest_url"] = oanda_rest_url_var.get().strip() or str(DEFAULT_SETTINGS.get("oanda_rest_url", ""))
+                self.settings["oanda_stream_url"] = oanda_stream_url_var.get().strip() or str(DEFAULT_SETTINGS.get("oanda_stream_url", ""))
+                self.settings["oanda_practice_mode"] = bool(oanda_practice_var.get())
+                self.settings["forex_auto_trade_enabled"] = bool(fx_auto_trade_var.get())
+                self.settings["forex_trade_units"] = max(1, int(float((fx_trade_units_var.get() or "").strip() or 1000)))
+                self.settings["forex_max_open_positions"] = max(1, int(float((fx_max_pos_var.get() or "").strip() or 1)))
+                self.settings["forex_score_threshold"] = max(0.0, float((fx_score_threshold_var.get() or "").strip() or 0.2))
+                self.settings["forex_profit_target_pct"] = max(0.0, float((fx_profit_target_var.get() or "").strip().replace("%", "") or 0.25))
+                self.settings["forex_trailing_gap_pct"] = max(0.0, float((fx_trailing_gap_var.get() or "").strip().replace("%", "") or 0.15))
 
                 self.settings["script_neural_runner2"] = neural_script_var.get().strip()
                 self.settings["script_neural_trainer"] = trainer_script_var.get().strip()
@@ -5320,11 +7649,6 @@ class PowerTraderHub(tk.Tk):
     # ---- close ----
 
     def _on_close(self) -> None:
-        # Don’t force kill; just stop if running (you can change this later)
-        try:
-            self.stop_all_scripts()
-        except Exception:
-            pass
         self.destroy()
 
 

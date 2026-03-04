@@ -8,19 +8,20 @@ from typing import Any, Dict, Optional
 import requests
 from nacl.signing import SigningKey
 import os
+import glob
 import colorama
 from colorama import Fore, Style
 import traceback
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
+from path_utils import resolve_runtime_paths, resolve_settings_path, read_settings_file, log_once
 
 # -----------------------------
 # GUI HUB OUTPUTS
 # -----------------------------
-HUB_DATA_DIR = os.environ.get("POWERTRADER_HUB_DIR", os.path.join(os.path.dirname(__file__), "hub_data"))
-os.makedirs(HUB_DATA_DIR, exist_ok=True)
+BASE_DIR, _RESOLVED_SETTINGS_PATH, HUB_DATA_DIR, _BOOT_SETTINGS = resolve_runtime_paths(__file__, "pt_trader")
 
-TRADER_STATUS_PATH = os.path.join(HUB_DATA_DIR, "trader_status.json")
+TRADER_DETAIL_PATH = os.path.join(HUB_DATA_DIR, "trader_data.json")
 TRADE_HISTORY_PATH = os.path.join(HUB_DATA_DIR, "trade_history.jsonl")
 PNL_LEDGER_PATH = os.path.join(HUB_DATA_DIR, "pnl_ledger.json")
 ACCOUNT_VALUE_HISTORY_PATH = os.path.join(HUB_DATA_DIR, "account_value_history.jsonl")
@@ -33,13 +34,11 @@ colorama.init(autoreset=True)
 # -----------------------------
 # GUI SETTINGS (coins list + main_neural_dir)
 # -----------------------------
-_GUI_SETTINGS_PATH = os.environ.get("POWERTRADER_GUI_SETTINGS") or os.path.join(
-	os.path.dirname(os.path.abspath(__file__)),
-	"gui_settings.json"
-)
+_GUI_SETTINGS_PATH = _RESOLVED_SETTINGS_PATH
 
 _gui_settings_cache = {
 	"mtime": None,
+	"path": None,
 	"coins": ['BTC', 'ETH', 'XRP', 'BNB', 'DOGE'],  # fallback defaults
 	"main_neural_dir": None,
 	"trade_start_level": 3,
@@ -52,7 +51,35 @@ _gui_settings_cache = {
 	"pm_start_pct_no_dca": 5.0,
 	"pm_start_pct_with_dca": 2.5,
 	"trailing_gap_pct": 0.5,
+	"max_position_usd_per_coin": 0.0,
+	"max_total_exposure_pct": 0.0,
 }
+
+_SIGNAL_FILE_CACHE = {}  # path -> (mtime, int_value)
+ENABLE_SIGNAL_CACHE_STATS = False
+_SIGNAL_FILE_CACHE_STATS = {"hits": 0, "misses": 0}
+
+
+def _read_int_file_cached(path: str, default: int = 0) -> int:
+	try:
+		mtime = os.path.getmtime(path)
+	except Exception:
+		return int(default)
+	hit = _SIGNAL_FILE_CACHE.get(path)
+	if hit and hit[0] == mtime:
+		if ENABLE_SIGNAL_CACHE_STATS:
+			_SIGNAL_FILE_CACHE_STATS["hits"] += 1
+		return int(hit[1])
+	try:
+		with open(path, "r", encoding="utf-8") as f:
+			raw = f.read().strip()
+		val = int(float(raw))
+	except Exception:
+		val = int(default)
+	if ENABLE_SIGNAL_CACHE_STATS:
+		_SIGNAL_FILE_CACHE_STATS["misses"] += 1
+	_SIGNAL_FILE_CACHE[path] = (mtime, val)
+	return val
 
 
 
@@ -68,15 +95,15 @@ def _load_gui_settings() -> dict:
 	Caches by mtime so it is cheap to call frequently.
 	"""
 	try:
-		if not os.path.isfile(_GUI_SETTINGS_PATH):
+		settings_path = resolve_settings_path(BASE_DIR) or _GUI_SETTINGS_PATH or os.path.join(BASE_DIR, "gui_settings.json")
+		if not os.path.isfile(settings_path):
 			return dict(_gui_settings_cache)
 
-		mtime = os.path.getmtime(_GUI_SETTINGS_PATH)
-		if _gui_settings_cache["mtime"] == mtime:
+		mtime = os.path.getmtime(settings_path)
+		if _gui_settings_cache["mtime"] == mtime and _gui_settings_cache.get("path") == settings_path:
 			return dict(_gui_settings_cache)
 
-		with open(_GUI_SETTINGS_PATH, "r", encoding="utf-8") as f:
-			data = json.load(f) or {}
+		data = read_settings_file(settings_path, module_name="pt_trader") or {}
 
 		coins = data.get("coins", None)
 		if not isinstance(coins, list) or not coins:
@@ -162,8 +189,25 @@ def _load_gui_settings() -> dict:
 		if trailing_gap_pct < 0.0:
 			trailing_gap_pct = 0.0
 
+		max_position_usd_per_coin = data.get("max_position_usd_per_coin", _gui_settings_cache.get("max_position_usd_per_coin", 0.0))
+		try:
+			max_position_usd_per_coin = float(str(max_position_usd_per_coin).replace("%", "").strip())
+		except Exception:
+			max_position_usd_per_coin = float(_gui_settings_cache.get("max_position_usd_per_coin", 0.0))
+		if max_position_usd_per_coin < 0.0:
+			max_position_usd_per_coin = 0.0
+
+		max_total_exposure_pct = data.get("max_total_exposure_pct", _gui_settings_cache.get("max_total_exposure_pct", 0.0))
+		try:
+			max_total_exposure_pct = float(str(max_total_exposure_pct).replace("%", "").strip())
+		except Exception:
+			max_total_exposure_pct = float(_gui_settings_cache.get("max_total_exposure_pct", 0.0))
+		if max_total_exposure_pct < 0.0:
+			max_total_exposure_pct = 0.0
+
 
 		_gui_settings_cache["mtime"] = mtime
+		_gui_settings_cache["path"] = settings_path
 		_gui_settings_cache["coins"] = coins
 		_gui_settings_cache["main_neural_dir"] = main_neural_dir
 		_gui_settings_cache["trade_start_level"] = trade_start_level
@@ -175,6 +219,8 @@ def _load_gui_settings() -> dict:
 		_gui_settings_cache["pm_start_pct_no_dca"] = pm_start_pct_no_dca
 		_gui_settings_cache["pm_start_pct_with_dca"] = pm_start_pct_with_dca
 		_gui_settings_cache["trailing_gap_pct"] = trailing_gap_pct
+		_gui_settings_cache["max_position_usd_per_coin"] = max_position_usd_per_coin
+		_gui_settings_cache["max_total_exposure_pct"] = max_total_exposure_pct
 
 
 		return {
@@ -190,6 +236,8 @@ def _load_gui_settings() -> dict:
 			"pm_start_pct_no_dca": pm_start_pct_no_dca,
 			"pm_start_pct_with_dca": pm_start_pct_with_dca,
 			"trailing_gap_pct": trailing_gap_pct,
+			"max_position_usd_per_coin": max_position_usd_per_coin,
+			"max_total_exposure_pct": max_total_exposure_pct,
 		}
 
 
@@ -227,13 +275,15 @@ def _build_base_paths(main_dir_in: str, coins_in: list) -> dict:
 crypto_symbols = ['BTC', 'ETH', 'XRP', 'BNB', 'DOGE']
 
 # Default main_dir behavior if settings are missing
-main_dir = os.getcwd()
+main_dir = BASE_DIR
 base_paths = {"BTC": main_dir}
 TRADE_START_LEVEL = 3
 START_ALLOC_PCT = 0.005
 DCA_MULTIPLIER = 2.0
 DCA_LEVELS = [-2.5, -5.0, -10.0, -20.0, -30.0, -40.0, -50.0]
 MAX_DCA_BUYS_PER_24H = 2
+MAX_POSITION_USD_PER_COIN = 0.0
+MAX_TOTAL_EXPOSURE_PCT = 0.0
 
 # Trailing PM hot-reload globals (defaults match previous hardcoded behavior)
 TRAILING_GAP_PCT = 0.5
@@ -256,6 +306,7 @@ def _refresh_paths_and_symbols():
 	"""
 	global crypto_symbols, main_dir, base_paths
 	global TRADE_START_LEVEL, START_ALLOC_PCT, DCA_MULTIPLIER, DCA_LEVELS, MAX_DCA_BUYS_PER_24H
+	global MAX_POSITION_USD_PER_COIN, MAX_TOTAL_EXPOSURE_PCT
 	global TRAILING_GAP_PCT, PM_START_PCT_NO_DCA, PM_START_PCT_WITH_DCA
 	global _last_settings_mtime
 
@@ -306,10 +357,18 @@ def _refresh_paths_and_symbols():
 	if PM_START_PCT_WITH_DCA < 0.0:
 		PM_START_PCT_WITH_DCA = 0.0
 
+	MAX_POSITION_USD_PER_COIN = float(s.get("max_position_usd_per_coin", MAX_POSITION_USD_PER_COIN) or 0.0)
+	if MAX_POSITION_USD_PER_COIN < 0.0:
+		MAX_POSITION_USD_PER_COIN = 0.0
+
+	MAX_TOTAL_EXPOSURE_PCT = float(s.get("max_total_exposure_pct", MAX_TOTAL_EXPOSURE_PCT) or 0.0)
+	if MAX_TOTAL_EXPOSURE_PCT < 0.0:
+		MAX_TOTAL_EXPOSURE_PCT = 0.0
+
 
 	# Keep it safe if folder isn't real on this machine
 	if not os.path.isdir(mndir):
-		mndir = os.getcwd()
+		mndir = BASE_DIR
 
 	crypto_symbols = list(coins)
 	main_dir = mndir
@@ -399,6 +458,11 @@ class CryptoAPITrading:
         self._dca_buy_ts = {}         # { "BTC": [ts, ts, ...] } (DCA buys only)
         self._dca_last_sell_ts = {}   # { "BTC": ts_of_last_sell }
         self._seed_dca_window_from_history()
+        self._last_exit_ts = {}       # { "BTC": ts_of_last_successful_sell }
+        self.entry_cooldown_seconds = 30 * 60
+        self._last_account_value_history_write_ts = 0.0
+        self._rate_limited_log_ts = {}
+        self._status_note = ""
 
 
 
@@ -406,6 +470,44 @@ class CryptoAPITrading:
 
 
 
+
+    def _rotate_jsonl_if_needed(
+        self,
+        path: str,
+        max_bytes: int = 30 * 1024 * 1024,
+        keep_files: int = 10,
+        max_age_days: int = 30,
+    ) -> None:
+        if path not in (TRADE_HISTORY_PATH, ACCOUNT_VALUE_HISTORY_PATH):
+            return
+        try:
+            if (not os.path.isfile(path)) or os.path.getsize(path) <= int(max_bytes):
+                return
+            stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+            rotated = f"{path}.{stamp}.jsonl"
+            os.replace(path, rotated)
+            base_name = os.path.basename(path)
+            folder = os.path.dirname(path)
+            pattern = os.path.join(folder, f"{base_name}.*.jsonl")
+            rotated_files = sorted(glob.glob(pattern), reverse=True)
+            cutoff = time.time() - (float(max_age_days) * 86400.0)
+            for old_path in rotated_files[keep_files:]:
+                try:
+                    os.remove(old_path)
+                except OSError:
+                    pass
+            for old_path in rotated_files[:keep_files]:
+                try:
+                    if os.path.getmtime(old_path) < cutoff:
+                        os.remove(old_path)
+                except OSError:
+                    pass
+        except OSError as exc:
+            self._log_rate_limited(
+                f"jsonl_rotate_{path}",
+                f"[pt_trader._rotate_jsonl_if_needed] path={path} {type(exc).__name__}: {exc}",
+                every_s=60.0,
+            )
 
     def _atomic_write_json(self, path: str, data: dict) -> None:
         try:
@@ -413,15 +515,82 @@ class CryptoAPITrading:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
             os.replace(tmp, path)
-        except Exception:
-            pass
+        except (PermissionError, OSError, TypeError, ValueError) as exc:
+            self._log_rate_limited(
+                f"atomic_json_{path}",
+                f"[pt_trader._atomic_write_json] path={path} {type(exc).__name__}: {exc}",
+                every_s=60.0,
+            )
 
     def _append_jsonl(self, path: str, obj: dict) -> None:
         try:
+            self._rotate_jsonl_if_needed(path)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(obj) + "\n")
+        except (PermissionError, OSError, TypeError, ValueError) as exc:
+            self._log_rate_limited(
+                f"append_jsonl_{path}",
+                f"[pt_trader._append_jsonl] path={path} {type(exc).__name__}: {exc}",
+                every_s=60.0,
+            )
+
+    def _log_rate_limited(self, key: str, message: str, every_s: float = 15.0) -> None:
+        try:
+            now = time.time()
+            last = float(self._rate_limited_log_ts.get(key, 0.0) or 0.0)
+            if (now - last) < float(every_s):
+                return
+            self._rate_limited_log_ts[key] = now
+            print(message)
         except Exception:
             pass
+
+    def _set_status_note(self, note: str) -> None:
+        try:
+            self._status_note = str(note or "").strip()
+        except Exception:
+            self._status_note = ""
+
+    def _can_place_buy(
+        self,
+        base_symbol: str,
+        buy_amount_usd: float,
+        current_position_value_usd: float,
+        total_account_value: float,
+        holdings_sell_value: float,
+    ) -> bool:
+        base = str(base_symbol).upper().strip()
+        buy_amt = float(buy_amount_usd or 0.0)
+        cur_val = float(current_position_value_usd or 0.0)
+        acct_val = float(total_account_value or 0.0)
+        held_val = float(holdings_sell_value or 0.0)
+
+        if buy_amt <= 0.0:
+            return False
+
+        if float(MAX_POSITION_USD_PER_COIN or 0.0) > 0.0:
+            projected = cur_val + buy_amt
+            if projected > float(MAX_POSITION_USD_PER_COIN):
+                msg = (
+                    f"Buy blocked for {base}: projected position ${projected:.2f} exceeds "
+                    f"max_position_usd_per_coin ${float(MAX_POSITION_USD_PER_COIN):.2f}."
+                )
+                self._set_status_note(msg)
+                self._log_rate_limited(f"cap_pos_{base}", msg)
+                return False
+
+        if float(MAX_TOTAL_EXPOSURE_PCT or 0.0) > 0.0 and acct_val > 0.0:
+            projected_pct = ((held_val + buy_amt) / acct_val) * 100.0
+            if projected_pct > float(MAX_TOTAL_EXPOSURE_PCT):
+                msg = (
+                    f"Buy blocked for {base}: projected exposure {projected_pct:.2f}% exceeds "
+                    f"max_total_exposure_pct {float(MAX_TOTAL_EXPOSURE_PCT):.2f}%."
+                )
+                self._set_status_note(msg)
+                self._log_rate_limited(f"cap_exp_{base}", msg)
+                return False
+
+        return True
 
     def _load_pnl_ledger(self) -> dict:
         try:
@@ -777,7 +946,7 @@ class CryptoAPITrading:
 
 
     def _write_trader_status(self, status: dict) -> None:
-        self._atomic_write_json(TRADER_STATUS_PATH, status)
+        self._atomic_write_json(TRADER_DETAIL_PATH, status)
 
     @staticmethod
     def _get_current_timestamp() -> int:
@@ -821,8 +990,7 @@ class CryptoAPITrading:
         return s
 
 
-    @staticmethod
-    def _read_long_dca_signal(symbol: str) -> int:
+    def _read_long_dca_signal(self, symbol: str) -> int:
         """
         Reads long_dca_signal.txt from the per-coin folder (same folder rules as trader.py).
 
@@ -834,16 +1002,12 @@ class CryptoAPITrading:
         folder = base_paths.get(sym, main_dir if sym == "BTC" else os.path.join(main_dir, sym))
         path = os.path.join(folder, "long_dca_signal.txt")
         try:
-            with open(path, "r") as f:
-                raw = f.read().strip()
-            val = int(float(raw))
-            return val
+            return _read_int_file_cached(path, 0)
         except Exception:
             return 0
 
 
-    @staticmethod
-    def _read_short_dca_signal(symbol: str) -> int:
+    def _read_short_dca_signal(self, symbol: str) -> int:
         """
         Reads short_dca_signal.txt from the per-coin folder (same folder rules as trader.py).
 
@@ -855,10 +1019,7 @@ class CryptoAPITrading:
         folder = base_paths.get(sym, main_dir if sym == "BTC" else os.path.join(main_dir, sym))
         path = os.path.join(folder, "short_dca_signal.txt")
         try:
-            with open(path, "r") as f:
-                raw = f.read().strip()
-            val = int(float(raw))
-            return val
+            return _read_int_file_cached(path, 0)
         except Exception:
             return 0
 
@@ -1546,6 +1707,7 @@ class CryptoAPITrading:
 
     def manage_trades(self):
         trades_made = False  # Flag to track if any trade was made in this iteration
+        self._set_status_note("")
 
         # Hot-reload coins list + paths + trade params from GUI settings while running
         try:
@@ -1992,6 +2154,8 @@ class CryptoAPITrading:
                     )
 
                 elif dca_amount <= buying_power:
+                    if not self._can_place_buy(symbol, dca_amount, value, total_account_value, holdings_sell_value):
+                        continue
                     response = self.place_buy_order(
                         str(uuid.uuid4()),
                         "buy",
@@ -2092,6 +2256,30 @@ class CryptoAPITrading:
                 start_index += 1
                 continue
 
+            last_exit_ts = float(self._last_exit_ts.get(base_symbol, 0.0) or 0.0)
+            if last_exit_ts > 0.0 and (time.time() - last_exit_ts) < float(self.entry_cooldown_seconds):
+                start_index += 1
+                continue
+
+            px_buy = float(current_buy_prices.get(full_symbol, 0.0) or 0.0)
+            px_sell = float(current_sell_prices.get(full_symbol, 0.0) or 0.0)
+            if full_symbol not in valid_symbols or px_buy <= 0.0 or px_sell <= 0.0:
+                msg = f"Skipping {base_symbol}: missing bid/ask price for entry."
+                self._set_status_note(msg)
+                self._log_rate_limited(f"missing_price_{base_symbol}", msg)
+                start_index += 1
+                continue
+
+            folder = base_paths.get(base_symbol, main_dir if base_symbol == "BTC" else os.path.join(main_dir, base_symbol))
+            long_path = os.path.join(folder, "long_dca_signal.txt")
+            short_path = os.path.join(folder, "short_dca_signal.txt")
+            if (not os.path.isfile(long_path)) or (not os.path.isfile(short_path)):
+                msg = f"Skipping {base_symbol}: missing signal file(s)."
+                self._set_status_note(msg)
+                self._log_rate_limited(f"missing_signal_{base_symbol}", msg)
+                start_index += 1
+                continue
+
             # Neural signals are used as a "permission to start" gate.
             buy_count = self._read_long_dca_signal(base_symbol)
             sell_count = self._read_short_dca_signal(base_symbol)
@@ -2100,6 +2288,10 @@ class CryptoAPITrading:
 
             # Default behavior: long must be >= start_level and short must be 0
             if not (buy_count >= start_level and sell_count == 0):
+                start_index += 1
+                continue
+
+            if not self._can_place_buy(base_symbol, allocation_in_usd, 0.0, total_account_value, holdings_sell_value):
                 start_index += 1
                 continue
 
@@ -2154,6 +2346,7 @@ class CryptoAPITrading:
         try:
             status = {
                 "timestamp": time.time(),
+                "status_note": getattr(self, "_status_note", ""),
                 "account": {
                     "total_account_value": total_account_value,
                     "buying_power": buying_power,
@@ -2167,10 +2360,13 @@ class CryptoAPITrading:
                 },
                 "positions": positions,
             }
-            self._append_jsonl(
-                ACCOUNT_VALUE_HISTORY_PATH,
-                {"ts": status["timestamp"], "total_account_value": total_account_value},
-            )
+            now_ts = float(status["timestamp"])
+            if (now_ts - float(getattr(self, "_last_account_value_history_write_ts", 0.0) or 0.0)) >= 15.0:
+                self._append_jsonl(
+                    ACCOUNT_VALUE_HISTORY_PATH,
+                    {"ts": status["timestamp"], "total_account_value": total_account_value},
+                )
+                self._last_account_value_history_write_ts = now_ts
             self._write_trader_status(status)
         except Exception:
             pass
