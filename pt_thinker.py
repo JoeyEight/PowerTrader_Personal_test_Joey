@@ -17,6 +17,7 @@ import psutil
 import logging
 import json
 import uuid
+from path_utils import resolve_runtime_paths, resolve_settings_path, read_settings_file, log_once
 
 from nacl.signing import SigningKey
 
@@ -149,13 +150,11 @@ last_minute = 0
 # -----------------------------
 # GUI SETTINGS (coins list)
 # -----------------------------
-_GUI_SETTINGS_PATH = os.environ.get("POWERTRADER_GUI_SETTINGS") or os.path.join(
-	os.path.dirname(os.path.abspath(__file__)),
-	"gui_settings.json"
-)
+BASE_DIR, _GUI_SETTINGS_PATH, HUB_DIR, _BOOT_SETTINGS = resolve_runtime_paths(__file__, "pt_thinker")
 
 _gui_settings_cache = {
 	"mtime": None,
+	"path": None,
 	"coins": ['BTC', 'ETH', 'XRP', 'BNB', 'DOGE'],  # fallback defaults
 }
 
@@ -165,15 +164,15 @@ def _load_gui_coins() -> list:
 	Caches by mtime so it is cheap to call frequently.
 	"""
 	try:
-		if not os.path.isfile(_GUI_SETTINGS_PATH):
+		settings_path = resolve_settings_path(BASE_DIR) or _GUI_SETTINGS_PATH or os.path.join(BASE_DIR, "gui_settings.json")
+		if not os.path.isfile(settings_path):
 			return list(_gui_settings_cache["coins"])
 
-		mtime = os.path.getmtime(_GUI_SETTINGS_PATH)
-		if _gui_settings_cache["mtime"] == mtime:
+		mtime = os.path.getmtime(settings_path)
+		if _gui_settings_cache["mtime"] == mtime and _gui_settings_cache.get("path") == settings_path:
 			return list(_gui_settings_cache["coins"])
 
-		with open(_GUI_SETTINGS_PATH, "r", encoding="utf-8") as f:
-			data = json.load(f) or {}
+		data = read_settings_file(settings_path, module_name="pt_thinker") or {}
 
 		coins = data.get("coins", None)
 		if not isinstance(coins, list) or not coins:
@@ -184,6 +183,7 @@ def _load_gui_coins() -> list:
 			coins = list(_gui_settings_cache["coins"])
 
 		_gui_settings_cache["mtime"] = mtime
+		_gui_settings_cache["path"] = settings_path
 		_gui_settings_cache["coins"] = coins
 		return list(coins)
 	except Exception:
@@ -192,8 +192,6 @@ def _load_gui_coins() -> list:
 # Initial coin list (will be kept live via _sync_coins_from_settings())
 COIN_SYMBOLS = _load_gui_coins()
 CURRENT_COINS = list(COIN_SYMBOLS)
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def coin_folder(sym: str) -> str:
 	sym = sym.upper()
@@ -232,12 +230,6 @@ def _coin_is_trained(sym: str) -> bool:
 
 # --- GUI HUB "runner ready" gate file (read by gui_hub.py Start All toggle) ---
 
-HUB_DIR = os.environ.get("POWERTRADER_HUB_DIR") or os.path.join(BASE_DIR, "hub_data")
-try:
-	os.makedirs(HUB_DIR, exist_ok=True)
-except Exception:
-	pass
-
 RUNNER_READY_PATH = os.path.join(HUB_DIR, "runner_ready.json")
 
 def _atomic_write_json(path: str, data: dict) -> None:
@@ -246,8 +238,11 @@ def _atomic_write_json(path: str, data: dict) -> None:
 		with open(tmp, "w", encoding="utf-8") as f:
 			json.dump(data, f, indent=2)
 		os.replace(tmp, path)
-	except Exception:
-		pass
+	except (PermissionError, OSError, TypeError, ValueError) as exc:
+		log_once(
+			f"pt_thinker:_atomic_write_json:{path}:{type(exc).__name__}",
+			f"[pt_thinker._atomic_write_json] path={path} {type(exc).__name__}: {exc}",
+		)
 
 def _write_runner_ready(ready: bool, stage: str, ready_coins=None, total_coins: int = 0) -> None:
 	obj = {

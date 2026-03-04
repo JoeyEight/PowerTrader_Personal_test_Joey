@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.powertrader.runner</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/joeydelestre/PowerTrader_AI/pt_runner.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/joeydelestre/PowerTrader_AI</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>POWERTRADER_GUI_SETTINGS</key>
+    <string>/Users/joeydelestre/PowerTrader_AI/gui_settings.json</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/joeydelestre/PowerTrader_AI/hub_data/logs/launchd_runner.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/joeydelestre/PowerTrader_AI/hub_data/logs/launchd_runner.err.log</string>
+</dict>
+</plist>

@@ -104,6 +104,7 @@ upordown5 = []
 import json
 import uuid
 import os
+from path_utils import resolve_runtime_paths, resolve_settings_path, read_settings_file, log_once
 
 # ---- speed knobs ----
 VERBOSE = False  # set True if you want the old high-volume prints
@@ -114,6 +115,11 @@ def vprint(*args, **kwargs):
 # Cache memory/weights in RAM (avoid re-reading and re-writing every loop)
 _memory_cache = {}  # tf_choice -> dict(memory_list, weight_list, high_weight_list, low_weight_list, dirty)
 _last_threshold_written = {}  # tf_choice -> float
+BASE_DIR, _GUI_SETTINGS_PATH, HUB_DATA_DIR, _BOOT_SETTINGS = resolve_runtime_paths(__file__, "pt_trainer")
+TRAINER_STATUS_PATH = os.path.join(BASE_DIR, "trainer_status.json")
+TRAINER_STATUS_TMP_PATH = TRAINER_STATUS_PATH + ".tmp"
+TRAINER_LAST_START_PATH = os.path.join(BASE_DIR, "trainer_last_start_time.txt")
+TRAINER_LAST_TRAINING_PATH = os.path.join(BASE_DIR, "trainer_last_training_time.txt")
 
 def _read_text(path):
 	with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -219,6 +225,271 @@ def PrintException():
 	linecache.checkcache(filename)
 	line = linecache.getline(filename, lineno, f.f_globals)
 	print('EXCEPTION IN (LINE {} "{}"): {}'.format(lineno, line.strip(), exc_obj))
+
+def _load_history_cache_settings():
+	cache_enabled = True
+	retention_days = 365
+	try:
+		settings_path = resolve_settings_path(BASE_DIR) or _GUI_SETTINGS_PATH or os.path.join(BASE_DIR, "gui_settings.json")
+		if os.path.isfile(settings_path):
+			data = read_settings_file(settings_path, module_name="pt_trainer")
+			cache_enabled = bool(data.get("history_cache_enabled", True))
+			try:
+				retention_days = int(float(data.get("history_retention_days", 365) or 365))
+			except Exception:
+				retention_days = 365
+	except Exception:
+		cache_enabled = True
+		retention_days = 365
+	if retention_days <= 0:
+		retention_days = 365
+	cache_root = os.path.join(HUB_DATA_DIR, "history_cache")
+	return cache_root, cache_enabled, retention_days
+
+def _normalize_history_row(row):
+	try:
+		if isinstance(row, (list, tuple)):
+			out = list(row)
+		else:
+			return None
+		if len(out) < 5:
+			return None
+		ts = int(float(out[0]))
+		if ts < 1000000000000:
+			ts *= 1000
+		out[0] = ts
+		return out
+	except Exception:
+		return None
+
+def _merge_dedupe_by_ts(old_rows, new_rows):
+	by_ts = {}
+	for src in (old_rows or []):
+		row = _normalize_history_row(src)
+		if row is not None:
+			by_ts[int(row[0])] = row
+	for src in (new_rows or []):
+		row = _normalize_history_row(src)
+		if row is not None:
+			by_ts[int(row[0])] = row
+	rows = [by_ts[k] for k in sorted(by_ts.keys())]
+	return rows
+
+def _purge_old(rows, min_ts_ms):
+	out = []
+	for src in (rows or []):
+		row = _normalize_history_row(src)
+		if row is None:
+			continue
+		if int(row[0]) >= int(min_ts_ms):
+			out.append(row)
+	return out
+
+def _history_rows_sorted_unique(rows):
+	last_ts = None
+	for src in (rows or []):
+		row = _normalize_history_row(src)
+		if row is None:
+			return False
+		cur_ts = int(row[0])
+		if last_ts is not None and cur_ts <= last_ts:
+			return False
+		last_ts = cur_ts
+	return True
+
+def _history_cache_file(coin_symbol, timeframe):
+	cache_root, _, _ = _load_history_cache_settings()
+	base_coin = str(coin_symbol).split("-")[0].strip().upper()
+	tf = str(timeframe).replace("/", "_").replace(" ", "_")
+	return os.path.join(cache_root, base_coin, f"{tf}.json")
+
+def _history_cache_file_legacy(coin_symbol, timeframe):
+	cache_root, _, _ = _load_history_cache_settings()
+	base_coin = str(coin_symbol).split("-")[0].strip().upper()
+	tf = str(timeframe).replace("/", "_").replace(" ", "_")
+	return os.path.join(cache_root, f"{base_coin}_{tf}.json")
+
+def _load_cached_history(coin_symbol, timeframe):
+	paths = [_history_cache_file(coin_symbol, timeframe), _history_cache_file_legacy(coin_symbol, timeframe)]
+	for path in paths:
+		try:
+			if not os.path.isfile(path):
+				continue
+			with open(path, "r", encoding="utf-8", errors="ignore") as f:
+				data = json.load(f)
+			if not isinstance(data, list):
+				return []
+			return _merge_dedupe_by_ts([], data)
+		except (FileNotFoundError, json.JSONDecodeError):
+			return []
+		except Exception:
+			return []
+	return []
+
+def _save_cached_history(coin_symbol, timeframe, rows):
+	path = _history_cache_file(coin_symbol, timeframe)
+	cache_dir = os.path.dirname(path)
+	os.makedirs(cache_dir, exist_ok=True)
+	tmp_path = path + ".tmp"
+	with open(tmp_path, "w", encoding="utf-8") as f:
+		json.dump(rows, f)
+	os.replace(tmp_path, path)
+
+def _fetch_kucoin_candles_range(coin_symbol, timeframe, timeframe_minutes, start_ts_ms, end_ts_ms, progress_cb=None, progress_min=1, progress_max=30):
+	interval_s = max(60, int(float(timeframe_minutes) * 60))
+	start_s = int(int(start_ts_ms) / 1000)
+	end_s = int(int(end_ts_ms) / 1000)
+	if end_s < start_s:
+		return []
+	out = []
+	cursor_end = end_s
+	backoff_s = 1.5
+	total_expected = max(1, int(((end_s - start_s) / float(interval_s))) + 1)
+	while True:
+		cursor_start = max(start_s, int(cursor_end - (1500 * interval_s)))
+		try:
+			history = market.get_kline(coin_symbol, timeframe, startAt=cursor_start, endAt=cursor_end)
+			backoff_s = 1.5
+		except Exception:
+			PrintException()
+			time.sleep(backoff_s)
+			backoff_s = min(backoff_s * 2.0, 8.0)
+			if backoff_s >= 8.0:
+				break
+			continue
+		normalized = []
+		if isinstance(history, list):
+			for row in history:
+				norm = _normalize_history_row(row)
+				if norm is not None:
+					normalized.append(norm)
+		if normalized:
+			out = _merge_dedupe_by_ts(out, normalized)
+			if progress_cb:
+				try:
+					loaded_ratio = min(1.0, float(len(out)) / float(total_expected))
+					pct_now = int(round(float(progress_min) + ((float(progress_max) - float(progress_min)) * loaded_ratio)))
+					progress_cb(pct_now, "history", f"{timeframe} {len(out)}/{total_expected}")
+				except Exception:
+					pass
+		if cursor_start <= start_s:
+			break
+		if not normalized:
+			break
+		cursor_end = cursor_start - interval_s
+		time.sleep(0.15)
+	return out
+
+def _legacy_download_history(coin_symbol, timeframe, timeframe_minutes, last_start_time=0.0):
+	history_list = []
+	list_len_local = 0
+	start_time_local = int(time.time())
+	end_time_local = int(start_time_local - ((1500 * timeframe_minutes) * 60))
+	while True:
+		time.sleep(.5)
+		try:
+			history = market.get_kline(coin_symbol, timeframe, startAt=end_time_local, endAt=start_time_local)
+		except Exception:
+			PrintException()
+			time.sleep(3.5)
+			continue
+		current_change = 0
+		if isinstance(history, list):
+			for row in history:
+				norm = _normalize_history_row(row)
+				if norm is not None:
+					history_list.append(norm)
+			current_change = len(history_list) - list_len_local
+		print('gathering history')
+		try:
+			print('\n\n\n\n')
+			print(current_change)
+			if current_change < 1000:
+				break
+		except Exception:
+			PrintException()
+		list_len_local = len(history_list)
+		start_time_local = end_time_local
+		end_time_local = int(start_time_local - ((1500 * timeframe_minutes) * 60))
+		print(last_start_time)
+		print(start_time_local)
+		print(end_time_local)
+		print('\n')
+		if start_time_local <= last_start_time:
+			break
+	return history_list
+
+def _load_training_history_with_cache(coin_symbol, timeframe, timeframe_minutes, last_start_time=0.0):
+	cache_root, cache_enabled, retention_days = _load_history_cache_settings()
+	now_ms = int(time.time() * 1000)
+	min_ts_ms = int(now_ms - (int(retention_days) * 86400 * 1000))
+	interval_ms = max(60000, int(float(timeframe_minutes) * 60 * 1000))
+	loaded_rows = []
+	loaded_count = 0
+	purged_count = 0
+	fetched_rows = []
+	if not cache_enabled:
+		_write_trainer_status(state="TRAINING", pct=1, phase="history", detail=f"{timeframe} full download", cache_ok=False)
+		rows = _legacy_download_history(coin_symbol, timeframe, timeframe_minutes, last_start_time)
+		rows = _merge_dedupe_by_ts([], rows)
+		_write_trainer_status(state="TRAINING", pct=30, phase="history", detail=f"{timeframe} ready", cache_ok=False)
+		print(f"CACHE {coin_symbol.split('-')[0]} {timeframe} loaded=0 fetched={len(rows)} purged=0 final={len(rows)}")
+		return rows
+	try:
+		loaded_rows = _load_cached_history(coin_symbol, timeframe)
+		loaded_count = len(loaded_rows)
+		filtered_rows = _purge_old(loaded_rows, min_ts_ms)
+		purged_count = max(0, loaded_count - len(filtered_rows))
+		loaded_rows = filtered_rows
+		if loaded_rows:
+			cache_min_ts = int(loaded_rows[0][0])
+			cache_max_ts = int(loaded_rows[-1][0])
+			if cache_min_ts > (min_ts_ms + interval_ms):
+				head_end = max(min_ts_ms, cache_min_ts - interval_ms)
+				head_rows = _fetch_kucoin_candles_range(
+					coin_symbol, timeframe, timeframe_minutes, min_ts_ms, head_end,
+					progress_cb=_write_trainer_status, progress_min=1, progress_max=20
+				)
+				fetched_rows = _merge_dedupe_by_ts(fetched_rows, head_rows)
+			if cache_max_ts < (now_ms - interval_ms):
+				tail_start = cache_max_ts + interval_ms
+				tail_rows = _fetch_kucoin_candles_range(
+					coin_symbol, timeframe, timeframe_minutes, tail_start, now_ms,
+					progress_cb=_write_trainer_status, progress_min=20, progress_max=30
+				)
+				fetched_rows = _merge_dedupe_by_ts(fetched_rows, tail_rows)
+		else:
+			fetched_rows = _fetch_kucoin_candles_range(
+				coin_symbol, timeframe, timeframe_minutes, min_ts_ms, now_ms,
+				progress_cb=_write_trainer_status, progress_min=1, progress_max=30
+			)
+		final_rows = _merge_dedupe_by_ts(loaded_rows, fetched_rows)
+		final_rows = _purge_old(final_rows, min_ts_ms)
+		if not _history_rows_sorted_unique(final_rows):
+			final_rows = _merge_dedupe_by_ts([], final_rows)
+		_save_cached_history(coin_symbol, timeframe, final_rows)
+		_write_trainer_status(state="TRAINING", pct=30, phase="history", detail=f"{timeframe} ready", cache_ok=True)
+		print(
+			f"CACHE {coin_symbol.split('-')[0]} {timeframe} loaded={loaded_count} "
+			f"fetched={len(fetched_rows)} purged={purged_count} final={len(final_rows)}"
+		)
+		return final_rows
+	except Exception as exc:
+		PrintException()
+		print(f"CACHE_FALLBACK coin={coin_symbol.split('-')[0]} tf={timeframe} reason={type(exc).__name__}: {exc}")
+		_write_trainer_status(
+			state="TRAINING",
+			pct=1,
+			phase="history",
+			detail=f"{timeframe} fallback {type(exc).__name__}",
+			cache_ok=False,
+		)
+		rows = _legacy_download_history(coin_symbol, timeframe, timeframe_minutes, last_start_time)
+		rows = _merge_dedupe_by_ts([], rows)
+		_write_trainer_status(state="TRAINING", pct=30, phase="history", detail=f"{timeframe} ready", cache_ok=False)
+		print(f"CACHE {coin_symbol.split('-')[0]} {timeframe} loaded=0 fetched={len(rows)} purged=0 final={len(rows)}")
+		return rows
+
 how_far_to_look_back = 100000
 number_of_candles = [2]
 number_of_candles_index = 0
@@ -258,19 +529,61 @@ restart_processing = "yes"
 
 # GUI reads this status file to know if this coin is TRAINING or FINISHED
 _trainer_started_at = int(time.time())
-try:
-	with open("trainer_status.json", "w", encoding="utf-8") as f:
-		json.dump(
-			{
-				"coin": _arg_coin,
-				"state": "TRAINING",
-				"started_at": _trainer_started_at,
-				"timestamp": _trainer_started_at,
-			},
-			f,
+_trainer_last_status_write = {"ts": 0.0, "state": None, "pct": None, "phase": None, "detail": None, "cache_ok": None}
+
+def _write_trainer_status(state="TRAINING", pct=None, phase="", detail="", finished_at=None, force=False, cache_ok=None):
+	try:
+		now_ts = int(time.time())
+		pct_out = None
+		if pct is not None:
+			try:
+				pct_out = max(0, min(100, int(float(pct))))
+			except Exception:
+				pct_out = None
+		phase_out = str(phase or "").strip()
+		detail_out = str(detail or "").strip()
+		last = _trainer_last_status_write
+		unchanged = (
+			(last.get("state") == state) and
+			(last.get("pct") == pct_out) and
+			(last.get("phase") == phase_out) and
+			(last.get("detail") == detail_out) and
+			(last.get("cache_ok") == cache_ok)
 		)
-except Exception:
-	pass
+		if (not force) and unchanged and ((time.time() - float(last.get("ts", 0.0) or 0.0)) < 2.0):
+			return
+		payload = {
+			"coin": _arg_coin,
+			"state": str(state or "TRAINING"),
+			"started_at": _trainer_started_at,
+			"timestamp": now_ts,
+		}
+		if pct_out is not None:
+			payload["pct"] = pct_out
+		if phase_out:
+			payload["phase"] = phase_out
+		if detail_out:
+			payload["detail"] = detail_out
+		if cache_ok is not None:
+			payload["cache_ok"] = bool(cache_ok)
+		if finished_at is not None:
+			payload["finished_at"] = int(finished_at)
+		with open(TRAINER_STATUS_TMP_PATH, "w", encoding="utf-8") as f:
+			json.dump(payload, f)
+		os.replace(TRAINER_STATUS_TMP_PATH, TRAINER_STATUS_PATH)
+		_trainer_last_status_write["ts"] = time.time()
+		_trainer_last_status_write["state"] = state
+		_trainer_last_status_write["pct"] = pct_out
+		_trainer_last_status_write["phase"] = phase_out
+		_trainer_last_status_write["detail"] = detail_out
+		_trainer_last_status_write["cache_ok"] = cache_ok
+	except (PermissionError, OSError, TypeError, ValueError) as exc:
+		log_once(
+			f"pt_trainer:_write_trainer_status:{type(exc).__name__}",
+			f"[pt_trainer._write_trainer_status] path={TRAINER_STATUS_PATH} {type(exc).__name__}: {exc}",
+		)
+
+_write_trainer_status(state="TRAINING", pct=0, phase="starting", force=True, cache_ok=True)
 
 
 the_big_index = 0
@@ -397,58 +710,20 @@ while True:
 	start_time_yes = start_time
 	if 'n' in restart_processing.lower():
 		try:
-			file = open('trainer_last_start_time.txt','r')
+			file = open(TRAINER_LAST_START_PATH,'r')
 			last_start_time = int(file.read())
 			file.close()
 		except:
 			last_start_time = 0.0
 	else:
 		last_start_time = 0.0
-	end_time = int(start_time-((1500*timeframe_minutes)*60))
-	perc_comp = format((len(history_list2)/how_far_to_look_back)*100,'.2f')
-	last_perc_comp = perc_comp+'kjfjakjdakd'
-	while True:
-		time.sleep(.5)
-		try:
-			history = str(market.get_kline(coin_choice,timeframe,startAt=end_time,endAt=start_time)).replace(']]','], ').replace('[[','[').split('], [')
-		except Exception as e:
-			PrintException()
-			time.sleep(3.5)
-			continue
-		index = 0
-		while True:
-			history_list.append(history[index])
-			index += 1
-			if index >= len(history):
-				break
-			else:
-				continue
-		perc_comp = format((len(history_list)/how_far_to_look_back)*100,'.2f')
-		print('gathering history')
-		current_change = len(history_list)-list_len	
-		try:
-			print('\n\n\n\n')
-			print(current_change)
-			if current_change < 1000:
-				break
-			else:
-				pass
-		except:
-			PrintException()
-			pass
-		len_avg.append(current_change)
-		list_len = len(history_list)
-		last_perc_comp = perc_comp
-		start_time = end_time
-		end_time = int(start_time-((1500*timeframe_minutes)*60))
-		print(last_start_time)
-		print(start_time)
-		print(end_time)
-		print('\n')
-		if start_time <= last_start_time:
-			break
-		else:
-			continue
+	try:
+		history_rows = _load_training_history_with_cache(coin_choice, timeframe, timeframe_minutes, last_start_time)
+	except Exception:
+		PrintException()
+		history_rows = _legacy_download_history(coin_choice, timeframe, timeframe_minutes, last_start_time)
+	history_list = list(reversed(history_rows))
+	_write_trainer_status(state="TRAINING", pct=35, phase="prep", detail=f"{timeframe} parse")
 	if timeframe == '1day' or timeframe == '1week':
 		if restarted_yet == 0:
 			index = int(len(history_list)/2)
@@ -504,6 +779,7 @@ while True:
 	history_list2 = []
 	perfect_threshold = 1.0
 	loop_i = 0  # counts inner training iterations (used to throttle disk IO)
+	_write_trainer_status(state="TRAINING", pct=50, phase="fit", detail=f"{timeframe} start")
 	if restarted_yet < 2:
 		price_list_length = 10
 	else:
@@ -511,6 +787,8 @@ while True:
 	while True:
 		while True:
 			loop_i += 1
+			if loop_i == 25:
+				_write_trainer_status(state="TRAINING", pct=70, phase="fit", detail=f"{timeframe} mid")
 			matched_patterns_count = 0
 			list_of_ys = []
 			list_of_ys_count = 0
@@ -617,32 +895,20 @@ while True:
 			if should_stop_training(loop_i):
 				exited = 'yes'
 				print('finished processing')
-				file = open('trainer_last_start_time.txt','w+')
+				file = open(TRAINER_LAST_START_PATH,'w+')
 				file.write(str(start_time_yes))
 				file.close()
 
 				# Mark training finished for the GUI
 				try:
 					_trainer_finished_at = int(time.time())
-					file = open('trainer_last_training_time.txt','w+')
+					file = open(TRAINER_LAST_TRAINING_PATH,'w+')
 					file.write(str(_trainer_finished_at))
 					file.close()
 				except:
 					pass
-				try:
-					with open("trainer_status.json", "w", encoding="utf-8") as f:
-						json.dump(
-							{
-								"coin": _arg_coin,
-								"state": "FINISHED",
-								"started_at": _trainer_started_at,
-								"finished_at": _trainer_finished_at,
-								"timestamp": _trainer_finished_at,
-							},
-							f,
-						)
-				except Exception:
-					pass
+				_write_trainer_status(state="TRAINING", pct=90, phase="saving", detail=f"{timeframe} final", force=True)
+				_write_trainer_status(state="FINISHED", pct=100, phase="finished", finished_at=_trainer_finished_at, force=True)
 
 				# Flush any cached memory/weights before we spin
 				flush_memory(tf_choice, force=True)
@@ -753,7 +1019,7 @@ while True:
 					if len(number_of_candles) == 1:
 						print("Finished processing all timeframes (number_of_candles has only one entry). Exiting.")
 						try:
-							file = open('trainer_last_start_time.txt','w+')
+							file = open(TRAINER_LAST_START_PATH,'w+')
 							file.write(str(start_time_yes))
 							file.close()
 						except:
@@ -762,25 +1028,13 @@ while True:
 						# Mark training finished for the GUI
 						try:
 							_trainer_finished_at = int(time.time())
-							file = open('trainer_last_training_time.txt','w+')
+							file = open(TRAINER_LAST_TRAINING_PATH,'w+')
 							file.write(str(_trainer_finished_at))
 							file.close()
 						except:
 							pass
-						try:
-							with open("trainer_status.json", "w", encoding="utf-8") as f:
-								json.dump(
-									{
-										"coin": _arg_coin,
-										"state": "FINISHED",
-										"started_at": _trainer_started_at,
-										"finished_at": _trainer_finished_at,
-										"timestamp": _trainer_finished_at,
-									},
-									f,
-								)
-						except Exception:
-							pass
+						_write_trainer_status(state="TRAINING", pct=90, phase="saving", detail=f"{timeframe} final", force=True)
+						_write_trainer_status(state="FINISHED", pct=100, phase="finished", finished_at=_trainer_finished_at, force=True)
 
 						sys.exit(0)
 					else:
@@ -1384,7 +1638,7 @@ while True:
 											if len(number_of_candles) == 1:
 												print("Finished processing all timeframes (number_of_candles has only one entry). Exiting.")
 												try:
-													file = open('trainer_last_start_time.txt','w+')
+													file = open(TRAINER_LAST_START_PATH,'w+')
 													file.write(str(start_time_yes))
 													file.close()
 												except:
@@ -1393,25 +1647,13 @@ while True:
 												# Mark training finished for the GUI
 												try:
 													_trainer_finished_at = int(time.time())
-													file = open('trainer_last_training_time.txt','w+')
+													file = open(TRAINER_LAST_TRAINING_PATH,'w+')
 													file.write(str(_trainer_finished_at))
 													file.close()
 												except:
 													pass
-												try:
-													with open("trainer_status.json", "w", encoding="utf-8") as f:
-														json.dump(
-															{
-																"coin": _arg_coin,
-																"state": "FINISHED",
-																"started_at": _trainer_started_at,
-																"finished_at": _trainer_finished_at,
-																"timestamp": _trainer_finished_at,
-															},
-															f,
-														)
-												except Exception:
-													pass
+												_write_trainer_status(state="TRAINING", pct=90, phase="saving", detail=f"{timeframe} final", force=True)
+												_write_trainer_status(state="FINISHED", pct=100, phase="finished", finished_at=_trainer_finished_at, force=True)
 
 												sys.exit(0)
 											else:
