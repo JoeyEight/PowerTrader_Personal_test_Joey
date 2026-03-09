@@ -7849,7 +7849,80 @@ class PowerTraderHub(tk.Tk):
 
         dashboard = ttk.LabelFrame(left_split, text=f"{market_name} Dashboard")
 
-        system_box = ttk.LabelFrame(dashboard, text="System")
+        # Scrollable left dashboard body for small-window usability.
+        market_dash_viewport = ttk.Frame(dashboard)
+        market_dash_viewport.pack(fill="both", expand=True, padx=0, pady=0)
+        market_dash_viewport.grid_rowconfigure(0, weight=1)
+        market_dash_viewport.grid_columnconfigure(0, weight=1)
+
+        market_dash_canvas = tk.Canvas(
+            market_dash_viewport,
+            bg=DARK_BG,
+            highlightthickness=0,
+            bd=0,
+        )
+        market_dash_scroll = ttk.Scrollbar(market_dash_viewport, orient="vertical", command=market_dash_canvas.yview)
+        market_dash_canvas.configure(yscrollcommand=market_dash_scroll.set)
+        market_dash_canvas.grid(row=0, column=0, sticky="nsew")
+        market_dash_scroll.grid(row=0, column=1, sticky="ns")
+        market_dash_scroll.grid_remove()
+
+        market_dash_body = ttk.Frame(market_dash_canvas)
+        _market_dash_body_id = market_dash_canvas.create_window((0, 0), window=market_dash_body, anchor="nw")
+
+        def _update_market_dashboard_scroll(_e=None) -> None:
+            try:
+                market_dash_canvas.configure(scrollregion=market_dash_canvas.bbox("all"))
+                sr = market_dash_canvas.bbox("all")
+                if not sr:
+                    market_dash_scroll.grid_remove()
+                    return
+                x0, y0, x1, y1 = sr
+                content_h = max(0, int(y1 - y0))
+                view_h = max(0, int(market_dash_canvas.winfo_height()))
+                if content_h > (view_h + 1):
+                    market_dash_scroll.grid()
+                else:
+                    market_dash_scroll.grid_remove()
+                    market_dash_canvas.yview_moveto(0)
+            except Exception:
+                pass
+
+        def _on_market_dashboard_canvas_configure(e) -> None:
+            try:
+                market_dash_canvas.itemconfigure(_market_dash_body_id, width=max(1, int(getattr(e, "width", 1))))
+            except Exception:
+                pass
+            _update_market_dashboard_scroll()
+
+        market_dash_canvas.bind("<Configure>", _on_market_dashboard_canvas_configure, add="+")
+        market_dash_body.bind("<Configure>", _update_market_dashboard_scroll, add="+")
+
+        def _market_dashboard_mousewheel_global(e) -> None:
+            try:
+                if not bool(market_dash_scroll.winfo_ismapped()):
+                    return
+                p = self.winfo_containing(self.winfo_pointerx(), self.winfo_pointery())
+                in_market_dashboard = False
+                while p is not None:
+                    if str(p) in {
+                        str(dashboard),
+                        str(market_dash_viewport),
+                        str(market_dash_canvas),
+                        str(market_dash_body),
+                    }:
+                        in_market_dashboard = True
+                        break
+                    p = getattr(p, "master", None)
+                if in_market_dashboard:
+                    market_dash_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            except Exception:
+                pass
+
+        self.bind_all("<MouseWheel>", _market_dashboard_mousewheel_global, add="+")
+        self.after_idle(_update_market_dashboard_scroll)
+
+        system_box = ttk.LabelFrame(market_dash_body, text="System")
         system_box.pack(fill="x", padx=6, pady=(6, 6))
         ai_var = tk.StringVar(value=f"{market_name} AI: not configured")
         trader_var = tk.StringVar(value=f"{market_name} Trader: not configured")
@@ -7894,7 +7967,7 @@ class PowerTraderHub(tk.Tk):
         )
         test_btn.pack(anchor="w", padx=6, pady=(0, 6))
 
-        action_box = ttk.LabelFrame(dashboard, text="Action Center")
+        action_box = ttk.LabelFrame(market_dash_body, text="Action Center")
         action_box.pack(fill="x", padx=6, pady=(0, 6))
         action_buttons = ttk.Frame(action_box)
         action_buttons.pack(fill="x", padx=6, pady=(6, 4))
@@ -7943,7 +8016,7 @@ class PowerTraderHub(tk.Tk):
         ttk.Checkbutton(action_auto_row, text="Auto scan", variable=auto_scan_var).pack(side="left")
         ttk.Checkbutton(action_auto_row, text="Auto trader step", variable=auto_step_var).pack(side="left", padx=(10, 0))
 
-        portfolio_box = ttk.LabelFrame(dashboard, text="Portfolio")
+        portfolio_box = ttk.LabelFrame(market_dash_body, text="Portfolio")
         portfolio_box.pack(fill="x", padx=6, pady=(0, 6))
         metric_grid = ttk.Frame(portfolio_box)
         metric_grid.pack(fill="x", padx=6, pady=6)
@@ -7965,7 +8038,7 @@ class PowerTraderHub(tk.Tk):
             ttk.Label(metric_grid, text=label).grid(row=idx, column=0, sticky="w", padx=(0, 10), pady=2)
             ttk.Label(metric_grid, textvariable=portfolio_vars[key]).grid(row=idx, column=1, sticky="e", pady=2)
 
-        notes_box = ttk.LabelFrame(dashboard, text="Market Notes")
+        notes_box = ttk.LabelFrame(market_dash_body, text="Market Notes")
         notes_box.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         notes_hdr = ttk.Frame(notes_box)
         notes_hdr.pack(fill="x", padx=6, pady=(6, 0))
