@@ -5,8 +5,15 @@ import os
 import random
 import signal
 import statistics
+import sys
+import threading
 import time
-from typing import Any, Dict
+from typing import Any, Callable, Dict
+
+if __package__ in (None, ""):
+    _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _ROOT not in sys.path:
+        sys.path.insert(0, _ROOT)
 
 from app.api_endpoint_validation import validate_alpaca_endpoints, validate_oanda_endpoints
 from app.confidence_calibration import build_confidence_calibration_payload
@@ -43,6 +50,7 @@ EXEC_GUARD_PATH = os.path.join(HUB_DATA_DIR, "broker_execution_guard.json")
 MARKET_LOOP_STATUS_PATH = os.path.join(HUB_DATA_DIR, "market_loop_status.json")
 INCIDENT_COOLDOWN_S = 120.0
 _LAST_INCIDENT_AT: Dict[str, float] = {}
+_IO_LOCK = threading.RLock()
 
 
 def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
@@ -68,138 +76,139 @@ def _p95(values: list[float]) -> float:
 
 
 def _update_sla_metrics(bucket: str, ok: bool, elapsed_ms: float, extra: Dict[str, Any] | None = None) -> None:
-    data = _safe_read_json(SLA_METRICS_PATH)
-    if not isinstance(data, dict):
-        data = {}
-    metrics = data.get("metrics", {})
-    if not isinstance(metrics, dict):
-        metrics = {}
-    row = metrics.get(bucket, {})
-    if not isinstance(row, dict):
-        row = {}
+    with _IO_LOCK:
+        data = _safe_read_json(SLA_METRICS_PATH)
+        if not isinstance(data, dict):
+            data = {}
+        metrics = data.get("metrics", {})
+        if not isinstance(metrics, dict):
+            metrics = {}
+        row = metrics.get(bucket, {})
+        if not isinstance(row, dict):
+            row = {}
 
-    count = int(row.get("count", 0) or 0) + 1
-    ok_count = int(row.get("ok_count", 0) or 0) + (1 if ok else 0)
-    err_count = int(row.get("err_count", 0) or 0) + (0 if ok else 1)
-    total_ms = float(row.get("total_ms", 0.0) or 0.0) + float(elapsed_ms)
+        count = int(row.get("count", 0) or 0) + 1
+        ok_count = int(row.get("ok_count", 0) or 0) + (1 if ok else 0)
+        err_count = int(row.get("err_count", 0) or 0) + (0 if ok else 1)
+        total_ms = float(row.get("total_ms", 0.0) or 0.0) + float(elapsed_ms)
 
-    recent = row.get("recent_ms", [])
-    if not isinstance(recent, list):
-        recent = []
-    recent = [float(x) for x in recent[-199:]] + [float(elapsed_ms)]
+        recent = row.get("recent_ms", [])
+        if not isinstance(recent, list):
+            recent = []
+        recent = [float(x) for x in recent[-199:]] + [float(elapsed_ms)]
 
-    out_row = {
-        "count": int(count),
-        "ok_count": int(ok_count),
-        "err_count": int(err_count),
-        "error_rate_pct": round((100.0 * float(err_count) / float(max(1, count))), 3),
-        "avg_ms": round(float(total_ms) / float(max(1, count)), 3),
-        "last_ms": round(float(elapsed_ms), 3),
-        "p95_ms": round(_p95(recent), 3),
-        "recent_ms": recent,
-        "updated_ts": int(time.time()),
-        "extra": dict(extra or {}),
-        "status": "ok" if ok else "error",
-    }
-    metrics[bucket] = out_row
-    payload = {"ts": int(time.time()), "metrics": metrics}
-    _atomic_write_json(SLA_METRICS_PATH, payload)
+        out_row = {
+            "count": int(count),
+            "ok_count": int(ok_count),
+            "err_count": int(err_count),
+            "error_rate_pct": round((100.0 * float(err_count) / float(max(1, count))), 3),
+            "avg_ms": round(float(total_ms) / float(max(1, count)), 3),
+            "last_ms": round(float(elapsed_ms), 3),
+            "p95_ms": round(_p95(recent), 3),
+            "recent_ms": recent,
+            "updated_ts": int(time.time()),
+            "extra": dict(extra or {}),
+            "status": "ok" if ok else "error",
+        }
+        metrics[bucket] = out_row
+        payload = {"ts": int(time.time()), "metrics": metrics}
+        _atomic_write_json(SLA_METRICS_PATH, payload)
 
 
 def _update_scan_reject_drift(market: str, reject_rate_pct: float, settings: Dict[str, Any], state: str) -> Dict[str, Any]:
-    now = int(time.time())
-    data = _safe_read_json(SCAN_DRIFT_PATH)
-    if not isinstance(data, dict):
-        data = {}
-    markets = data.get("markets", {})
-    if not isinstance(markets, dict):
-        markets = {}
-    row = markets.get(market, {})
-    if not isinstance(row, dict):
-        row = {}
-    history = row.get("history", [])
-    if not isinstance(history, list):
-        history = []
+    with _IO_LOCK:
+        now = int(time.time())
+        data = _safe_read_json(SCAN_DRIFT_PATH)
+        if not isinstance(data, dict):
+            data = {}
+        markets = data.get("markets", {})
+        if not isinstance(markets, dict):
+            markets = {}
+        row = markets.get(market, {})
+        if not isinstance(row, dict):
+            row = {}
+        history = row.get("history", [])
+        if not isinstance(history, list):
+            history = []
 
-    rr = max(0.0, min(100.0, float(reject_rate_pct or 0.0)))
-    history = [float(x) for x in history[-119:]]
-    history.append(rr)
+        rr = max(0.0, min(100.0, float(reject_rate_pct or 0.0)))
+        history = [float(x) for x in history[-119:]]
+        history.append(rr)
 
-    min_samples = max(3, int(float(settings.get("runtime_alert_reject_spike_min_samples", 6) or 6)))
-    min_rate = max(0.0, min(100.0, float(settings.get("runtime_alert_reject_spike_min_rate_pct", 25.0) or 25.0)))
-    delta_thr = max(0.0, min(100.0, float(settings.get("runtime_alert_reject_spike_delta_pct", 25.0) or 25.0)))
-    ratio_thr = max(1.0, float(settings.get("runtime_alert_reject_spike_ratio", 2.0) or 2.0))
+        min_samples = max(3, int(float(settings.get("runtime_alert_reject_spike_min_samples", 6) or 6)))
+        min_rate = max(0.0, min(100.0, float(settings.get("runtime_alert_reject_spike_min_rate_pct", 25.0) or 25.0)))
+        delta_thr = max(0.0, min(100.0, float(settings.get("runtime_alert_reject_spike_delta_pct", 25.0) or 25.0)))
+        ratio_thr = max(1.0, float(settings.get("runtime_alert_reject_spike_ratio", 2.0) or 2.0))
 
-    prev = history[:-1]
-    baseline = float(statistics.median(prev[-max(min_samples, 12):])) if len(prev) >= min_samples else 0.0
-    delta = rr - baseline
-    ratio = (rr / baseline) if baseline > 0.0 else (99.0 if rr > 0.0 else 1.0)
-    spike = bool(
-        str(state or "").upper() == "READY"
-        and len(prev) >= min_samples
-        and rr >= min_rate
-        and delta >= delta_thr
-        and ratio >= ratio_thr
-    )
+        prev = history[:-1]
+        baseline = float(statistics.median(prev[-max(min_samples, 12):])) if len(prev) >= min_samples else 0.0
+        delta = rr - baseline
+        ratio = (rr / baseline) if baseline > 0.0 else (99.0 if rr > 0.0 else 1.0)
+        spike = bool(
+            str(state or "").upper() == "READY"
+            and len(prev) >= min_samples
+            and rr >= min_rate
+            and delta >= delta_thr
+            and ratio >= ratio_thr
+        )
 
-    last_alert_ts = int(row.get("last_alert_ts", 0) or 0)
-    cooldown_s = 300
-    triggered = False
-    active = []
-    old_active = data.get("active", [])
-    if isinstance(old_active, list):
-        active = [a for a in old_active if isinstance(a, dict)]
+        last_alert_ts = int(row.get("last_alert_ts", 0) or 0)
+        cooldown_s = 300
+        triggered = False
+        active = []
+        old_active = data.get("active", [])
+        if isinstance(old_active, list):
+            active = [a for a in old_active if isinstance(a, dict)]
 
-    if spike and ((now - last_alert_ts) >= cooldown_s):
-        triggered = True
-        alert = {
+        if spike and ((now - last_alert_ts) >= cooldown_s):
+            triggered = True
+            alert = {
+                "ts": int(now),
+                "market": str(market),
+                "reject_rate_pct": round(rr, 3),
+                "baseline_pct": round(baseline, 3),
+                "delta_pct": round(delta, 3),
+                "ratio": round(ratio, 3),
+                "min_rate_pct": round(min_rate, 3),
+                "delta_threshold_pct": round(delta_thr, 3),
+                "ratio_threshold": round(ratio_thr, 3),
+            }
+            active = [a for a in active if str(a.get("market", "") or "").strip().lower() != str(market).lower()]
+            active.append(alert)
+            row["last_alert_ts"] = int(now)
+            _incident(
+                "warning",
+                "scanner_reject_spike",
+                f"{market} reject spike {rr:.1f}% (baseline {baseline:.1f}%, delta {delta:.1f}%)",
+                {"market": market, "reject_rate_pct": rr, "baseline_pct": baseline, "delta_pct": delta, "ratio": ratio},
+                cooldown_key=f"scanner_reject_spike:{market}",
+            )
+
+        cutoff = now - 1800
+        active = [a for a in active if int(a.get("ts", 0) or 0) >= cutoff]
+
+        row["history"] = history
+        row["updated_ts"] = int(now)
+        row["baseline_pct"] = round(baseline, 3)
+        row["last_reject_rate_pct"] = round(rr, 3)
+        row["last_delta_pct"] = round(delta, 3)
+        row["last_ratio"] = round(ratio, 3)
+        markets[market] = row
+        payload = {
             "ts": int(now),
+            "markets": markets,
+            "active": active,
+        }
+        _atomic_write_json(SCAN_DRIFT_PATH, payload)
+        return {
+            "triggered": bool(triggered),
             "market": str(market),
             "reject_rate_pct": round(rr, 3),
             "baseline_pct": round(baseline, 3),
             "delta_pct": round(delta, 3),
             "ratio": round(ratio, 3),
-            "min_rate_pct": round(min_rate, 3),
-            "delta_threshold_pct": round(delta_thr, 3),
-            "ratio_threshold": round(ratio_thr, 3),
+            "active_count": int(len(active)),
         }
-        active = [a for a in active if str(a.get("market", "") or "").strip().lower() != str(market).lower()]
-        active.append(alert)
-        row["last_alert_ts"] = int(now)
-        _incident(
-            "warning",
-            "scanner_reject_spike",
-            f"{market} reject spike {rr:.1f}% (baseline {baseline:.1f}%, delta {delta:.1f}%)",
-            {"market": market, "reject_rate_pct": rr, "baseline_pct": baseline, "delta_pct": delta, "ratio": ratio},
-            cooldown_key=f"scanner_reject_spike:{market}",
-        )
-
-    # Auto-clear stale active alerts after 30 minutes.
-    cutoff = now - 1800
-    active = [a for a in active if int(a.get("ts", 0) or 0) >= cutoff]
-
-    row["history"] = history
-    row["updated_ts"] = int(now)
-    row["baseline_pct"] = round(baseline, 3)
-    row["last_reject_rate_pct"] = round(rr, 3)
-    row["last_delta_pct"] = round(delta, 3)
-    row["last_ratio"] = round(ratio, 3)
-    markets[market] = row
-    payload = {
-        "ts": int(now),
-        "markets": markets,
-        "active": active,
-    }
-    _atomic_write_json(SCAN_DRIFT_PATH, payload)
-    return {
-        "triggered": bool(triggered),
-        "market": str(market),
-        "reject_rate_pct": round(rr, 3),
-        "baseline_pct": round(baseline, 3),
-        "delta_pct": round(delta, 3),
-        "ratio": round(ratio, 3),
-        "active_count": int(len(active)),
-    }
 
 
 def _update_scan_cadence_drift(
@@ -209,124 +218,126 @@ def _update_scan_cadence_drift(
     settings: Dict[str, Any],
     state: str,
 ) -> Dict[str, Any]:
-    now = int(now_ts or time.time())
-    expected = max(1.0, float(expected_interval_s or 1.0))
-    data = _safe_read_json(CADENCE_DRIFT_PATH)
-    if not isinstance(data, dict):
-        data = {}
-    markets = data.get("markets", {})
-    if not isinstance(markets, dict):
-        markets = {}
-    row = markets.get(market, {})
-    if not isinstance(row, dict):
-        row = {}
+    with _IO_LOCK:
+        now = int(now_ts or time.time())
+        expected = max(1.0, float(expected_interval_s or 1.0))
+        data = _safe_read_json(CADENCE_DRIFT_PATH)
+        if not isinstance(data, dict):
+            data = {}
+        markets = data.get("markets", {})
+        if not isinstance(markets, dict):
+            markets = {}
+        row = markets.get(market, {})
+        if not isinstance(row, dict):
+            row = {}
 
-    history = row.get("history_s", [])
-    if not isinstance(history, list):
-        history = []
-    history = [float(x) for x in history[-119:]]
+        history = row.get("history_s", [])
+        if not isinstance(history, list):
+            history = []
+        history = [float(x) for x in history[-119:]]
 
-    last_scan_ts = int(row.get("last_scan_ts", 0) or 0)
-    observed_s = float(now - last_scan_ts) if last_scan_ts > 0 else 0.0
-    late_pct = 0.0
-    if observed_s > 0.0:
-        late_pct = max(0.0, ((observed_s - expected) / expected) * 100.0)
+        last_scan_ts = int(row.get("last_scan_ts", 0) or 0)
+        observed_s = float(now - last_scan_ts) if last_scan_ts > 0 else 0.0
+        late_pct = 0.0
+        if observed_s > 0.0:
+            late_pct = max(0.0, ((observed_s - expected) / expected) * 100.0)
 
-    if observed_s > 0.0:
-        history.append(observed_s)
-    min_samples = max(2, int(float(settings.get("runtime_alert_cadence_min_samples", 3) or 3)))
-    warn_pct = max(10.0, float(settings.get("runtime_alert_cadence_late_warn_pct", 80.0) or 80.0))
-    crit_pct = max(warn_pct, float(settings.get("runtime_alert_cadence_late_crit_pct", 180.0) or 180.0))
-    cooldown_s = max(30, int(float(settings.get("runtime_alert_cadence_cooldown_s", 300) or 300)))
+        if observed_s > 0.0:
+            history.append(observed_s)
+        min_samples = max(2, int(float(settings.get("runtime_alert_cadence_min_samples", 3) or 3)))
+        warn_pct = max(10.0, float(settings.get("runtime_alert_cadence_late_warn_pct", 80.0) or 80.0))
+        crit_pct = max(warn_pct, float(settings.get("runtime_alert_cadence_late_crit_pct", 180.0) or 180.0))
+        cooldown_s = max(30, int(float(settings.get("runtime_alert_cadence_cooldown_s", 300) or 300)))
 
-    level = "ok"
-    if late_pct >= crit_pct:
-        level = "critical"
-    elif late_pct >= warn_pct:
-        level = "warning"
-    late = level in {"warning", "critical"}
+        level = "ok"
+        if late_pct >= crit_pct:
+            level = "critical"
+        elif late_pct >= warn_pct:
+            level = "warning"
+        late = level in {"warning", "critical"}
 
-    active = data.get("active", [])
-    if not isinstance(active, list):
-        active = []
-    active = [a for a in active if isinstance(a, dict)]
-    last_alert_ts = int(row.get("last_alert_ts", 0) or 0)
-    triggered = False
-    if late and str(state or "").upper() == "READY" and len(history) >= min_samples and (now - last_alert_ts) >= cooldown_s:
-        triggered = True
-        alert = {
-            "ts": int(now),
+        active = data.get("active", [])
+        if not isinstance(active, list):
+            active = []
+        active = [a for a in active if isinstance(a, dict)]
+        last_alert_ts = int(row.get("last_alert_ts", 0) or 0)
+        triggered = False
+        if late and str(state or "").upper() == "READY" and len(history) >= min_samples and (now - last_alert_ts) >= cooldown_s:
+            triggered = True
+            alert = {
+                "ts": int(now),
+                "market": str(market),
+                "level": str(level),
+                "observed_s": round(observed_s, 3),
+                "expected_s": round(expected, 3),
+                "late_pct": round(late_pct, 3),
+            }
+            active = [a for a in active if str(a.get("market", "") or "").strip().lower() != str(market).lower()]
+            active.append(alert)
+            row["last_alert_ts"] = int(now)
+            sev = "error" if level == "critical" else "warning"
+            _incident(
+                sev,
+                "scanner_cadence_drift",
+                f"{market} scan cadence drift: observed {observed_s:.1f}s vs expected {expected:.1f}s ({late_pct:.1f}% late)",
+                {"market": market, "level": level, "observed_s": observed_s, "expected_s": expected, "late_pct": late_pct},
+                cooldown_key=f"scanner_cadence_drift:{market}",
+            )
+        if not late:
+            active = [a for a in active if str(a.get("market", "") or "").strip().lower() != str(market).lower()]
+
+        cutoff = now - 7200
+        active = [a for a in active if int(a.get("ts", 0) or 0) >= cutoff]
+
+        row["updated_ts"] = int(now)
+        row["last_scan_ts"] = int(now)
+        row["expected_s"] = round(expected, 3)
+        row["observed_s"] = round(observed_s, 3)
+        row["late_pct"] = round(late_pct, 3)
+        row["level"] = str(level)
+        row["history_s"] = history
+        markets[str(market)] = row
+        payload = {"ts": int(now), "markets": markets, "active": active}
+        _atomic_write_json(CADENCE_DRIFT_PATH, payload)
+        return {
             "market": str(market),
-            "level": str(level),
             "observed_s": round(observed_s, 3),
             "expected_s": round(expected, 3),
             "late_pct": round(late_pct, 3),
+            "level": str(level),
+            "late": bool(late),
+            "triggered": bool(triggered),
+            "active_count": int(len(active)),
         }
-        active = [a for a in active if str(a.get("market", "") or "").strip().lower() != str(market).lower()]
-        active.append(alert)
-        row["last_alert_ts"] = int(now)
-        sev = "error" if level == "critical" else "warning"
-        _incident(
-            sev,
-            "scanner_cadence_drift",
-            f"{market} scan cadence drift: observed {observed_s:.1f}s vs expected {expected:.1f}s ({late_pct:.1f}% late)",
-            {"market": market, "level": level, "observed_s": observed_s, "expected_s": expected, "late_pct": late_pct},
-            cooldown_key=f"scanner_cadence_drift:{market}",
-        )
-    if not late:
-        active = [a for a in active if str(a.get("market", "") or "").strip().lower() != str(market).lower()]
-
-    cutoff = now - 7200
-    active = [a for a in active if int(a.get("ts", 0) or 0) >= cutoff]
-
-    row["updated_ts"] = int(now)
-    row["last_scan_ts"] = int(now)
-    row["expected_s"] = round(expected, 3)
-    row["observed_s"] = round(observed_s, 3)
-    row["late_pct"] = round(late_pct, 3)
-    row["level"] = str(level)
-    row["history_s"] = history
-    markets[str(market)] = row
-    payload = {"ts": int(now), "markets": markets, "active": active}
-    _atomic_write_json(CADENCE_DRIFT_PATH, payload)
-    return {
-        "market": str(market),
-        "observed_s": round(observed_s, 3),
-        "expected_s": round(expected, 3),
-        "late_pct": round(late_pct, 3),
-        "level": str(level),
-        "late": bool(late),
-        "triggered": bool(triggered),
-        "active_count": int(len(active)),
-    }
 
 
 def _incident(severity: str, event: str, msg: str, details: Dict[str, Any] | None = None, cooldown_key: str = "") -> None:
-    now = time.time()
-    key = str(cooldown_key or f"{event}:{msg[:80]}").strip() or event
-    last = float(_LAST_INCIDENT_AT.get(key, 0.0) or 0.0)
-    if (now - last) < INCIDENT_COOLDOWN_S:
-        return
-    _LAST_INCIDENT_AT[key] = now
-    append_jsonl(
-        INCIDENTS_PATH,
-        {
-            "ts": int(now),
-            "date": now_date_local(),
-            "severity": str(severity or "info").lower(),
-            "event": str(event or "markets_event"),
-            "msg": str(msg or "").strip(),
-            "details": dict(details or {}),
-        },
-    )
-    runtime_event(
-        RUNTIME_EVENTS_PATH,
-        component="markets",
-        event=str(event or "markets_event"),
-        level=str(severity or "info"),
-        msg=str(msg or ""),
-        details=dict(details or {}),
-    )
+    with _IO_LOCK:
+        now = time.time()
+        key = str(cooldown_key or f"{event}:{msg[:80]}").strip() or event
+        last = float(_LAST_INCIDENT_AT.get(key, 0.0) or 0.0)
+        if (now - last) < INCIDENT_COOLDOWN_S:
+            return
+        _LAST_INCIDENT_AT[key] = now
+        append_jsonl(
+            INCIDENTS_PATH,
+            {
+                "ts": int(now),
+                "date": now_date_local(),
+                "severity": str(severity or "info").lower(),
+                "event": str(event or "markets_event"),
+                "msg": str(msg or "").strip(),
+                "details": dict(details or {}),
+            },
+        )
+        runtime_event(
+            RUNTIME_EVENTS_PATH,
+            component="markets",
+            event=str(event or "markets_event"),
+            level=str(severity or "info"),
+            msg=str(msg or ""),
+            details=dict(details or {}),
+        )
 
 
 def _is_missing_value(v: Any) -> bool:
@@ -353,28 +364,29 @@ def _guard_save(data: Dict[str, Any]) -> None:
 
 
 def _record_guard_result(settings: Dict[str, Any], market: str, failed: bool, reason: str = "") -> Dict[str, Any]:
-    now = int(time.time())
-    try:
-        threshold = max(2, int(float(settings.get("broker_failure_disable_threshold", 4) or 4)))
-    except Exception:
-        threshold = 4
-    try:
-        cooldown_s = max(60, int(float(settings.get("broker_failure_disable_cooldown_s", 900) or 900)))
-    except Exception:
-        cooldown_s = 900
-    state = _guard_load()
-    before = market_guard_status(state, market, now)
-    state = update_market_guard(
-        state,
-        market=market,
-        failed=bool(failed),
-        now_ts=now,
-        threshold=threshold,
-        cooldown_s=cooldown_s,
-        reason=reason,
-    )
-    after = market_guard_status(state, market, now)
-    _guard_save(state)
+    with _IO_LOCK:
+        now = int(time.time())
+        try:
+            threshold = max(2, int(float(settings.get("broker_failure_disable_threshold", 4) or 4)))
+        except Exception:
+            threshold = 4
+        try:
+            cooldown_s = max(60, int(float(settings.get("broker_failure_disable_cooldown_s", 900) or 900)))
+        except Exception:
+            cooldown_s = 900
+        state = _guard_load()
+        before = market_guard_status(state, market, now)
+        state = update_market_guard(
+            state,
+            market=market,
+            failed=bool(failed),
+            now_ts=now,
+            threshold=threshold,
+            cooldown_s=cooldown_s,
+            reason=reason,
+        )
+        after = market_guard_status(state, market, now)
+        _guard_save(state)
     if (not before.get("active", False)) and bool(after.get("active", False)):
         _incident(
             "warning",
@@ -455,11 +467,190 @@ def _jittered_interval(base_s: float, jitter_pct: float) -> float:
     return max(1.0, base + random.uniform(-span, span))
 
 
+def _effective_market_cycle_interval(
+    configured_s: float,
+    elapsed_s: float,
+    settings: Dict[str, Any],
+    market: str = "",
+) -> float:
+    base = max(1.0, float(configured_s or 1.0))
+    elapsed = max(0.0, float(elapsed_s or 0.0))
+    try:
+        mult = max(1.0, min(3.0, float(settings.get("market_scan_overrun_interval_mult", 1.10) or 1.10)))
+    except Exception:
+        mult = 1.10
+    try:
+        min_pause_s = max(0.0, min(60.0, float(settings.get("market_scan_overrun_min_pause_s", 1.0) or 1.0)))
+    except Exception:
+        min_pause_s = 1.0
+    adaptive = max(base, elapsed * mult)
+    if elapsed > 0.0:
+        adaptive = max(adaptive, elapsed + min_pause_s)
+    return min(max(base, adaptive), 1800.0)
+
+
+def _ensure_loop_workers(loop_status: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    workers = loop_status.get("workers", {})
+    if not isinstance(workers, dict):
+        workers = {}
+    for key in ("snapshots", "stocks", "forex", "intelligence"):
+        row = workers.get(key, {})
+        if not isinstance(row, dict):
+            row = {}
+        row.setdefault("active", False)
+        row.setdefault("phase", "idle")
+        row.setdefault("phase_started_ts", 0)
+        row.setdefault("phase_detail", "")
+        row.setdefault("next_due_ts", 0)
+        row.setdefault("last_started_ts", 0)
+        row.setdefault("last_completed_ts", 0)
+        workers[key] = row
+    loop_status["workers"] = workers
+    return workers
+
+
+def _sync_loop_phase(loop_status: Dict[str, Any]) -> None:
+    workers = _ensure_loop_workers(loop_status)
+    active_workers: list[tuple[int, str, str, str]] = []
+    for key, row in workers.items():
+        if not isinstance(row, dict) or (not bool(row.get("active", False))):
+            continue
+        started = int(row.get("phase_started_ts", 0) or 0)
+        phase = str(row.get("phase", key) or key).strip() or key
+        detail = str(row.get("phase_detail", "") or "")
+        active_workers.append((started if started > 0 else sys.maxsize, key, phase, detail))
+    if active_workers:
+        active_workers.sort(key=lambda item: (item[0], item[1]))
+        started, _key, phase, detail = active_workers[0]
+        loop_status["phase"] = str(phase)
+        loop_status["phase_started_ts"] = int(started if started != sys.maxsize else time.time())
+        loop_status["phase_detail"] = str(detail)
+        return
+    loop_status["phase"] = "idle"
+    loop_status["phase_started_ts"] = 0
+    loop_status["phase_detail"] = ""
+
+
+def _activate_loop_worker(
+    loop_status: Dict[str, Any],
+    status_lock: threading.Lock,
+    worker_key: str,
+    now_ts: float | None = None,
+    *,
+    phase: str,
+    phase_detail: str = "",
+    next_due_ts: float | None = None,
+) -> None:
+    stamp = int(now_ts if now_ts is not None else time.time())
+    with status_lock:
+        workers = _ensure_loop_workers(loop_status)
+        row = workers.get(worker_key, {})
+        if not isinstance(row, dict):
+            row = {}
+        row["active"] = True
+        row["phase"] = str(phase or worker_key)
+        row["phase_started_ts"] = int(stamp)
+        row["phase_detail"] = str(phase_detail or "")
+        row["last_started_ts"] = int(stamp)
+        if next_due_ts is not None:
+            row["next_due_ts"] = int(next_due_ts)
+        workers[worker_key] = row
+        loop_status["workers"] = workers
+        _sync_loop_phase(loop_status)
+        loop_status["ts"] = int(stamp)
+        loop_status["heartbeat_ts"] = int(stamp)
+        payload = dict(loop_status)
+    _write_loop_status(payload)
+
+
+def _complete_loop_worker(
+    loop_status: Dict[str, Any],
+    status_lock: threading.Lock,
+    worker_key: str,
+    now_ts: float | None = None,
+    *,
+    next_due_ts: float | None = None,
+    phase: str = "",
+    cycle_key: str = "",
+    cycle_meta: Dict[str, Any] | None = None,
+    mark_scan_complete: bool = False,
+    mark_step_complete: bool = False,
+) -> None:
+    stamp = int(now_ts if now_ts is not None else time.time())
+    with status_lock:
+        workers = _ensure_loop_workers(loop_status)
+        row = workers.get(worker_key, {})
+        if not isinstance(row, dict):
+            row = {}
+        row["active"] = False
+        row["phase"] = "idle"
+        row["phase_detail"] = ""
+        row["last_completed_ts"] = int(stamp)
+        if next_due_ts is not None:
+            row["next_due_ts"] = int(next_due_ts)
+        workers[worker_key] = row
+        loop_status["workers"] = workers
+        if cycle_key:
+            loop_status[str(cycle_key)] = dict(cycle_meta or {})
+        if mark_scan_complete:
+            loop_status[f"{worker_key}_last_scan_ts"] = int(stamp)
+        if mark_step_complete:
+            loop_status[f"{worker_key}_last_step_ts"] = int(stamp)
+        if phase:
+            loop_status["last_phase"] = str(phase)
+            loop_status["last_phase_ts"] = int(stamp)
+        _sync_loop_phase(loop_status)
+        loop_status["ts"] = int(stamp)
+        loop_status["heartbeat_ts"] = int(stamp)
+        if next_due_ts is not None:
+            if worker_key == "snapshots":
+                loop_status["next_snapshot_ts"] = int(next_due_ts)
+            elif worker_key == "stocks":
+                loop_status["next_stocks_scan_ts"] = int(next_due_ts)
+            elif worker_key == "forex":
+                loop_status["next_forex_scan_ts"] = int(next_due_ts)
+            elif worker_key == "intelligence":
+                loop_status["next_intelligence_ts"] = int(next_due_ts)
+        payload = dict(loop_status)
+    _write_loop_status(payload)
+
+
 def _write_loop_status(payload: Dict[str, Any]) -> None:
     try:
         _atomic_write_json(MARKET_LOOP_STATUS_PATH, payload if isinstance(payload, dict) else {})
     except Exception:
         pass
+
+
+def _loop_status_payload(loop_status: Dict[str, Any], status_lock: threading.Lock, now_ts: float | None = None) -> Dict[str, Any]:
+    stamp = int(now_ts if now_ts is not None else time.time())
+    with status_lock:
+        payload = dict(loop_status)
+    payload["ts"] = int(stamp)
+    payload["heartbeat_ts"] = int(stamp)
+    return payload
+
+
+def _flush_loop_status(loop_status: Dict[str, Any], status_lock: threading.Lock, now_ts: float | None = None, **updates: Any) -> None:
+    stamp = int(now_ts if now_ts is not None else time.time())
+    with status_lock:
+        loop_status.update(dict(updates or {}))
+        loop_status["ts"] = int(stamp)
+        loop_status["heartbeat_ts"] = int(stamp)
+        payload = dict(loop_status)
+    _write_loop_status(payload)
+
+
+def _market_loop_heartbeat(
+    running: Dict[str, Any],
+    loop_status: Dict[str, Any],
+    status_lock: threading.Lock,
+    interval_s: float = 5.0,
+) -> None:
+    sleep_s = max(2.0, float(interval_s or 5.0))
+    while bool(running.get("ok", False)):
+        _write_loop_status(_loop_status_payload(loop_status, status_lock))
+        time.sleep(sleep_s)
 
 
 def _write_snapshots(settings: Dict[str, Any]) -> Dict[str, Any]:
@@ -632,7 +823,7 @@ def _write_snapshots(settings: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _run_stocks(settings: Dict[str, Any]) -> Dict[str, Any]:
+def _run_stocks(settings: Dict[str, Any], cadence_expected_s: float | None = None) -> Dict[str, Any]:
     stocks_dir = os.path.join(HUB_DATA_DIR, "stocks")
     os.makedirs(stocks_dir, exist_ok=True)
     thinker_status_path = os.path.join(stocks_dir, "stock_thinker_status.json")
@@ -667,10 +858,15 @@ def _run_stocks(settings: Dict[str, Any]) -> Dict[str, Any]:
             _update_sla_metrics("stocks_scan", ok=True, elapsed_ms=(time.perf_counter() - t0) * 1000.0, extra={"state": t_state})
         rs = thinker.get("reject_summary", {}) if isinstance(thinker.get("reject_summary", {}), dict) else {}
         _update_scan_reject_drift("stocks", float(rs.get("reject_rate_pct", 0.0) or 0.0), settings, t_state)
+        expected_cadence_s = float(
+            cadence_expected_s
+            if cadence_expected_s is not None
+            else (settings.get("market_bg_stocks_interval_s", 15.0) or 15.0)
+        )
         out["cadence"] = _update_scan_cadence_drift(
             "stocks",
             int(time.time()),
-            float(settings.get("market_bg_stocks_interval_s", 15.0) or 15.0),
+            expected_cadence_s,
             settings,
             t_state,
         )
@@ -688,10 +884,15 @@ def _run_stocks(settings: Dict[str, Any]) -> Dict[str, Any]:
             out["scan_fallback_cached"] = True
             rs = cached.get("reject_summary", {}) if isinstance(cached.get("reject_summary", {}), dict) else {}
             _update_scan_reject_drift("stocks", float(rs.get("reject_rate_pct", 0.0) or 0.0), settings, t_state)
+            expected_cadence_s = float(
+                cadence_expected_s
+                if cadence_expected_s is not None
+                else (settings.get("market_bg_stocks_interval_s", 15.0) or 15.0)
+            )
             out["cadence"] = _update_scan_cadence_drift(
                 "stocks",
                 int(time.time()),
-                float(settings.get("market_bg_stocks_interval_s", 15.0) or 15.0),
+                expected_cadence_s,
                 settings,
                 t_state,
             )
@@ -713,10 +914,15 @@ def _run_stocks(settings: Dict[str, Any]) -> Dict[str, Any]:
             out["scan_state"] = "ERROR"
             _incident("error", "stocks_thinker_failed", f"{type(exc).__name__}: {exc}", {"market": "stocks"}, cooldown_key="stocks_thinker_failed")
             _update_sla_metrics("stocks_scan", ok=False, elapsed_ms=0.0, extra={"error": f"{type(exc).__name__}: {exc}"})
+            expected_cadence_s = float(
+                cadence_expected_s
+                if cadence_expected_s is not None
+                else (settings.get("market_bg_stocks_interval_s", 15.0) or 15.0)
+            )
             out["cadence"] = _update_scan_cadence_drift(
                 "stocks",
                 int(time.time()),
-                float(settings.get("market_bg_stocks_interval_s", 15.0) or 15.0),
+                expected_cadence_s,
                 settings,
                 "ERROR",
             )
@@ -762,7 +968,7 @@ def _run_stocks(settings: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _run_forex(settings: Dict[str, Any]) -> Dict[str, Any]:
+def _run_forex(settings: Dict[str, Any], cadence_expected_s: float | None = None) -> Dict[str, Any]:
     forex_dir = os.path.join(HUB_DATA_DIR, "forex")
     os.makedirs(forex_dir, exist_ok=True)
     thinker_status_path = os.path.join(forex_dir, "forex_thinker_status.json")
@@ -797,10 +1003,15 @@ def _run_forex(settings: Dict[str, Any]) -> Dict[str, Any]:
             _update_sla_metrics("forex_scan", ok=True, elapsed_ms=(time.perf_counter() - t0) * 1000.0, extra={"state": t_state})
         rs = thinker.get("reject_summary", {}) if isinstance(thinker.get("reject_summary", {}), dict) else {}
         _update_scan_reject_drift("forex", float(rs.get("reject_rate_pct", 0.0) or 0.0), settings, t_state)
+        expected_cadence_s = float(
+            cadence_expected_s
+            if cadence_expected_s is not None
+            else (settings.get("market_bg_forex_interval_s", 10.0) or 10.0)
+        )
         out["cadence"] = _update_scan_cadence_drift(
             "forex",
             int(time.time()),
-            float(settings.get("market_bg_forex_interval_s", 10.0) or 10.0),
+            expected_cadence_s,
             settings,
             t_state,
         )
@@ -818,10 +1029,15 @@ def _run_forex(settings: Dict[str, Any]) -> Dict[str, Any]:
             out["scan_fallback_cached"] = True
             rs = cached.get("reject_summary", {}) if isinstance(cached.get("reject_summary", {}), dict) else {}
             _update_scan_reject_drift("forex", float(rs.get("reject_rate_pct", 0.0) or 0.0), settings, t_state)
+            expected_cadence_s = float(
+                cadence_expected_s
+                if cadence_expected_s is not None
+                else (settings.get("market_bg_forex_interval_s", 10.0) or 10.0)
+            )
             out["cadence"] = _update_scan_cadence_drift(
                 "forex",
                 int(time.time()),
-                float(settings.get("market_bg_forex_interval_s", 10.0) or 10.0),
+                expected_cadence_s,
                 settings,
                 t_state,
             )
@@ -843,10 +1059,15 @@ def _run_forex(settings: Dict[str, Any]) -> Dict[str, Any]:
             out["scan_state"] = "ERROR"
             _incident("error", "forex_thinker_failed", f"{type(exc).__name__}: {exc}", {"market": "forex"}, cooldown_key="forex_thinker_failed")
             _update_sla_metrics("forex_scan", ok=False, elapsed_ms=0.0, extra={"error": f"{type(exc).__name__}: {exc}"})
+            expected_cadence_s = float(
+                cadence_expected_s
+                if cadence_expected_s is not None
+                else (settings.get("market_bg_forex_interval_s", 10.0) or 10.0)
+            )
             out["cadence"] = _update_scan_cadence_drift(
                 "forex",
                 int(time.time()),
-                float(settings.get("market_bg_forex_interval_s", 10.0) or 10.0),
+                expected_cadence_s,
                 settings,
                 "ERROR",
             )
@@ -947,6 +1168,80 @@ def _write_market_intelligence(settings: Dict[str, Any]) -> None:
         )
 
 
+def _market_cycle_worker(
+    worker_key: str,
+    settings_key: str,
+    default_interval_s: float,
+    phase_name: str,
+    cycle_key: str,
+    runner_fn: Callable[[Dict[str, Any], float | None], Dict[str, Any]],
+    running: Dict[str, Any],
+    settings_state: Dict[str, Any],
+    loop_status: Dict[str, Any],
+    status_lock: threading.Lock,
+    after_cycle: Callable[[Dict[str, Any]], None] | None = None,
+) -> None:
+    next_due = time.time()
+    expected_interval_s: float | None = None
+    while bool(running.get("ok", False)):
+        if os.path.exists(STOP_FLAG_PATH):
+            break
+        settings = settings_state.get("value", {})
+        try:
+            configured_interval_s = max(1.0, float(settings.get(settings_key, default_interval_s) or default_interval_s))
+        except Exception:
+            configured_interval_s = float(default_interval_s)
+        if expected_interval_s is None:
+            expected_interval_s = float(configured_interval_s)
+        now = time.time()
+        if now < next_due:
+            time.sleep(min(1.0, max(0.1, next_due - now)))
+            continue
+        started = time.time()
+        _activate_loop_worker(
+            loop_status,
+            status_lock,
+            worker_key,
+            now_ts=started,
+            phase=phase_name,
+            phase_detail=cycle_key,
+            next_due_ts=next_due,
+        )
+        meta = runner_fn(settings, expected_interval_s)
+        if after_cycle is not None:
+            try:
+                after_cycle(settings)
+            except Exception as exc:
+                _incident(
+                    "warning",
+                    f"{worker_key}_post_cycle_failed",
+                    f"{type(exc).__name__}: {exc}",
+                    {"worker": worker_key, "phase": phase_name},
+                    cooldown_key=f"{worker_key}_post_cycle_failed",
+                )
+        done = time.time()
+        cycle_elapsed_s = max(0.0, done - started)
+        expected_interval_s = _effective_market_cycle_interval(configured_interval_s, cycle_elapsed_s, settings, market=worker_key)
+        next_due = started + float(expected_interval_s)
+        meta = dict(meta or {})
+        meta["effective_interval_s"] = round(float(expected_interval_s), 3)
+        meta["cycle_elapsed_ms"] = round(cycle_elapsed_s * 1000.0, 3)
+        scan_done = bool(str(meta.get("scan_state", "") or "").strip())
+        step_done = bool(str(meta.get("step_state", "") or "").strip())
+        _complete_loop_worker(
+            loop_status,
+            status_lock,
+            worker_key,
+            now_ts=done,
+            next_due_ts=next_due,
+            phase=phase_name,
+            cycle_key=cycle_key,
+            cycle_meta=meta,
+            mark_scan_complete=scan_done,
+            mark_step_complete=step_done,
+        )
+
+
 def main() -> int:
     running = {"ok": True}
 
@@ -957,18 +1252,20 @@ def main() -> int:
     signal.signal(signal.SIGINT, _stop)
 
     settings = _load_settings()
+    heartbeat_interval_s = max(2.0, float(settings.get("market_loop_heartbeat_interval_s", 5.0) or 5.0))
     now = time.time()
     next_snap = now
-    next_stock = now
-    next_fx = now
     next_intel = now
     last_settings_load = now
+    settings_state: Dict[str, Any] = {"value": settings}
+    status_lock = threading.Lock()
     loop_status: Dict[str, Any] = {
         "ts": int(now),
+        "heartbeat_ts": int(now),
         "started_ts": int(now),
         "next_snapshot_ts": int(next_snap),
-        "next_stocks_scan_ts": int(next_stock),
-        "next_forex_scan_ts": int(next_fx),
+        "next_stocks_scan_ts": int(now),
+        "next_forex_scan_ts": int(now),
         "stocks_last_scan_ts": 0,
         "stocks_last_step_ts": 0,
         "forex_last_scan_ts": 0,
@@ -976,8 +1273,56 @@ def main() -> int:
         "snapshots": {},
         "stocks_cycle": {},
         "forex_cycle": {},
+        "workers": {},
+        "phase": "idle",
+        "phase_started_ts": 0,
+        "phase_detail": "",
+        "last_phase": "startup",
+        "last_phase_ts": int(now),
     }
+    _ensure_loop_workers(loop_status)
     _write_loop_status(loop_status)
+    heartbeat_thread = threading.Thread(
+        target=_market_loop_heartbeat,
+        args=(running, loop_status, status_lock, heartbeat_interval_s),
+        daemon=True,
+    )
+    heartbeat_thread.start()
+    stocks_thread = threading.Thread(
+        target=_market_cycle_worker,
+        args=(
+            "stocks",
+            "market_bg_stocks_interval_s",
+            18.0,
+            "stocks_scan",
+            "stocks_cycle",
+            _run_stocks,
+            running,
+            settings_state,
+            loop_status,
+            status_lock,
+        ),
+        daemon=True,
+    )
+    forex_thread = threading.Thread(
+        target=_market_cycle_worker,
+        args=(
+            "forex",
+            "market_bg_forex_interval_s",
+            12.0,
+            "forex_scan",
+            "forex_cycle",
+            _run_forex,
+            running,
+            settings_state,
+            loop_status,
+            status_lock,
+            (lambda _settings: _write_market_trends()),
+        ),
+        daemon=True,
+    )
+    stocks_thread.start()
+    forex_thread.start()
 
     while running["ok"]:
         if os.path.exists(STOP_FLAG_PATH):
@@ -989,7 +1334,10 @@ def main() -> int:
             reload_every = 8.0
         if (now - last_settings_load) >= reload_every:
             settings = _load_settings()
+            settings_state["value"] = settings
             last_settings_load = now
+        else:
+            settings_state["value"] = settings
         try:
             snap_every = max(5.0, float(settings.get("market_bg_snapshot_interval_s", 15.0) or 15.0))
             stock_every = max(8.0, float(settings.get("market_bg_stocks_interval_s", 18.0) or 18.0))
@@ -1009,39 +1357,64 @@ def main() -> int:
         }
 
         if now >= next_snap:
+            snap_started = time.time()
+            _activate_loop_worker(
+                loop_status,
+                status_lock,
+                "snapshots",
+                now_ts=snap_started,
+                phase="snapshots",
+                phase_detail="broker_snapshots",
+                next_due_ts=next_snap,
+            )
             snap_meta = _write_snapshots(settings)
-            loop_status["snapshots"] = dict(snap_meta or {})
-            loop_status["last_snapshot_ts"] = int(now)
-            next_snap = now + _jittered_interval(snap_every, jitter_pct)
-        if now >= next_stock:
-            stock_meta = _run_stocks(settings)
-            loop_status["stocks_cycle"] = dict(stock_meta or {})
-            if str((stock_meta or {}).get("scan_state", "") or "").strip():
-                loop_status["stocks_last_scan_ts"] = int(now)
-            if str((stock_meta or {}).get("step_state", "") or "").strip():
-                loop_status["stocks_last_step_ts"] = int(now)
-            next_stock = now + _jittered_interval(stock_every, jitter_pct)
-        if now >= next_fx:
-            fx_meta = _run_forex(settings)
-            loop_status["forex_cycle"] = dict(fx_meta or {})
-            if str((fx_meta or {}).get("scan_state", "") or "").strip():
-                loop_status["forex_last_scan_ts"] = int(now)
-            if str((fx_meta or {}).get("step_state", "") or "").strip():
-                loop_status["forex_last_step_ts"] = int(now)
-            next_fx = now + _jittered_interval(fx_every, jitter_pct)
-            _write_market_trends()
+            snap_done = time.time()
+            next_snap = snap_started + _jittered_interval(snap_every, jitter_pct)
+            _complete_loop_worker(
+                loop_status,
+                status_lock,
+                "snapshots",
+                now_ts=snap_done,
+                next_due_ts=next_snap,
+                phase="snapshots",
+                cycle_key="snapshots",
+                cycle_meta=dict(snap_meta or {}),
+            )
         if now >= next_intel:
+            intel_started = time.time()
+            _activate_loop_worker(
+                loop_status,
+                status_lock,
+                "intelligence",
+                now_ts=intel_started,
+                phase="intelligence",
+                phase_detail="market_intelligence",
+                next_due_ts=next_intel,
+            )
             _write_market_intelligence(settings)
-            next_intel = now + _jittered_interval(intelligence_every, jitter_pct)
+            intel_done = time.time()
+            next_intel = intel_started + _jittered_interval(intelligence_every, jitter_pct)
+            _complete_loop_worker(
+                loop_status,
+                status_lock,
+                "intelligence",
+                now_ts=intel_done,
+                next_due_ts=next_intel,
+                phase="intelligence",
+            )
 
-        loop_status["ts"] = int(now)
-        loop_status["next_snapshot_ts"] = int(next_snap)
-        loop_status["next_stocks_scan_ts"] = int(next_stock)
-        loop_status["next_forex_scan_ts"] = int(next_fx)
-        loop_status["next_intelligence_ts"] = int(next_intel)
-        _write_loop_status(loop_status)
+        _flush_loop_status(
+            loop_status,
+            status_lock,
+            now_ts=now,
+            next_snapshot_ts=int(next_snap),
+            next_intelligence_ts=int(next_intel),
+        )
         time.sleep(1.0)
 
+    running["ok"] = False
+    stocks_thread.join(timeout=2.0)
+    forex_thread.join(timeout=2.0)
     return 0
 
 

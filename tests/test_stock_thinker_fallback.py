@@ -151,6 +151,93 @@ class TestStockThinkerFallback(unittest.TestCase):
             self.assertEqual(str(top.get("symbol", "")), "MSFT")
             self.assertTrue(bool(out.get("leader_stability_applied", False)))
 
+    def test_live_guarded_demotes_undertrained_leader_to_watch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "stocks"), exist_ok=True)
+            settings = {
+                "alpaca_api_key_id": "abc",
+                "alpaca_secret_key": "xyz",
+                "alpaca_paper_mode": False,
+                "market_rollout_stage": "live_guarded",
+                "stock_min_samples_live_guarded": 4,
+                "stock_min_calib_prob_live_guarded": 0.50,
+                "stock_scan_max_symbols": 20,
+                "stock_scan_use_daily_when_closed": True,
+            }
+
+            def _score(symbol: str, bars: list[dict], spread_bps: float = 0.0) -> dict:
+                return {
+                    "symbol": str(symbol).upper(),
+                    "score": 0.9,
+                    "side": "long",
+                    "last": 100.0,
+                    "change_6h_pct": 1.0,
+                    "change_24h_pct": 2.0,
+                    "volatility_pct": 0.5,
+                    "spread_bps": float(spread_bps),
+                    "confidence": "MED",
+                    "reason": "test",
+                }
+
+            with (
+                patch.object(stock_thinker, "get_alpaca_creds", return_value=("abc", "xyz")),
+                patch.object(stock_thinker, "AlpacaBrokerClient", _FakeAlpacaClient),
+                patch.object(stock_thinker, "_select_universe", return_value=["AAPL"]),
+                patch.object(stock_thinker, "_market_open_now", return_value=False),
+                patch.object(stock_thinker, "_score_bars", side_effect=_score),
+                patch.object(stock_thinker, "_apply_stock_mtf_confirmation", return_value=None),
+            ):
+                out = stock_thinker.run_scan(settings, td)
+
+            self.assertEqual(str(out.get("state", "")), "READY")
+            top = out.get("top_pick", {}) if isinstance(out.get("top_pick", {}), dict) else {}
+            self.assertEqual(str(top.get("side", "")).lower(), "watch")
+            self.assertFalse(bool(top.get("eligible_for_entry", True)))
+            self.assertIn("Calibration sample gate", str(top.get("entry_gate_reason", "") or ""))
+
+    def test_live_guarded_paper_mode_keeps_undertrained_leader_tradeable(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "stocks"), exist_ok=True)
+            settings = {
+                "alpaca_api_key_id": "abc",
+                "alpaca_secret_key": "xyz",
+                "alpaca_paper_mode": True,
+                "market_rollout_stage": "live_guarded",
+                "stock_min_samples_live_guarded": 4,
+                "stock_min_calib_prob_live_guarded": 0.50,
+                "stock_scan_max_symbols": 20,
+                "stock_scan_use_daily_when_closed": True,
+            }
+
+            def _score(symbol: str, bars: list[dict], spread_bps: float = 0.0) -> dict:
+                return {
+                    "symbol": str(symbol).upper(),
+                    "score": 0.9,
+                    "side": "long",
+                    "last": 100.0,
+                    "change_6h_pct": 1.0,
+                    "change_24h_pct": 2.0,
+                    "volatility_pct": 0.5,
+                    "spread_bps": float(spread_bps),
+                    "confidence": "MED",
+                    "reason": "test",
+                }
+
+            with (
+                patch.object(stock_thinker, "get_alpaca_creds", return_value=("abc", "xyz")),
+                patch.object(stock_thinker, "AlpacaBrokerClient", _FakeAlpacaClient),
+                patch.object(stock_thinker, "_select_universe", return_value=["AAPL"]),
+                patch.object(stock_thinker, "_market_open_now", return_value=False),
+                patch.object(stock_thinker, "_score_bars", side_effect=_score),
+                patch.object(stock_thinker, "_apply_stock_mtf_confirmation", return_value=None),
+            ):
+                out = stock_thinker.run_scan(settings, td)
+
+            top = out.get("top_pick", {}) if isinstance(out.get("top_pick", {}), dict) else {}
+            self.assertEqual(str(top.get("side", "")).lower(), "long")
+            self.assertTrue(bool(top.get("eligible_for_entry", False)))
+            self.assertEqual(str(top.get("entry_gate_reason", "") or ""), "")
+
 
 if __name__ == "__main__":
     unittest.main()

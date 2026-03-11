@@ -755,6 +755,79 @@ def _append_reason_parts(row: Dict[str, Any], logic: str = "", data: str = "") -
     row["reason"] = cur_logic if cur_logic else cur_data
 
 
+def _live_guarded_entry_gate_reason(settings: Dict[str, Any], row: Dict[str, Any]) -> str:
+    stage = str(settings.get("market_rollout_stage", "legacy") or "legacy").strip().lower()
+    if stage != "live_guarded":
+        return ""
+    # Paper mode is the calibration warmup path; keep live-only calibration gates off
+    # so the stock paper trader can accumulate the samples required for live_guarded.
+    if bool(settings.get("alpaca_paper_mode", True)):
+        return ""
+    symbol = str(row.get("symbol", "") or "").strip().upper()
+    if not symbol:
+        return ""
+    sample_count = int(float(row.get("samples", 0) or 0))
+    min_samples_guarded = max(0, int(float(settings.get("stock_min_samples_live_guarded", 5) or 5)))
+    if sample_count < min_samples_guarded:
+        return f"Calibration sample gate for {symbol} ({sample_count} < {min_samples_guarded})"
+    calib_prob = float(row.get("calib_prob", 0.0) or 0.0)
+    if calib_prob <= 0.0:
+        calib_prob = 0.5
+    min_calib_prob = max(0.0, min(1.0, float(settings.get("stock_min_calib_prob_live_guarded", 0.58) or 0.58)))
+    if calib_prob < min_calib_prob:
+        return f"Calibrated confidence gate for {symbol} ({calib_prob:.2f} < {min_calib_prob:.2f})"
+    return ""
+
+
+def _apply_stock_mtf_confirmation(
+    scored: List[Dict[str, Any]],
+    client: AlpacaBrokerClient,
+    feed: str,
+    settings: Dict[str, Any],
+) -> None:
+    if not scored:
+        return
+    try:
+        max_symbols = max(0, int(float(settings.get("stock_mtf_confirm_max_symbols", 24) or 24)))
+    except Exception:
+        max_symbols = 24
+    for row in scored:
+        row["mtf_side"] = "skipped"
+        row["mtf_confirmed"] = None
+    if max_symbols <= 0:
+        return
+    ranked = [
+        row
+        for row in scored
+        if isinstance(row, dict) and str(row.get("side", "watch")).strip().lower() == "long"
+    ]
+    ranked.sort(key=lambda row: abs(_float(row.get("score", 0.0), 0.0)), reverse=True)
+    for row in ranked[:max_symbols]:
+        symbol = str(row.get("symbol", "") or "").strip().upper()
+        if not symbol:
+            continue
+        spread_bps = _float(row.get("spread_bps", 0.0), 0.0)
+        mtf_side = "watch"
+        try:
+            bars_4h = client.get_stock_bars(symbol, timeframe="4Hour", limit=36, feed=feed)
+            if len(bars_4h) < 8:
+                bars_4h = client.get_stock_bars(symbol, timeframe="1Day", limit=36, feed=feed)
+            mtf = _score_bars(symbol, bars_4h, spread_bps=spread_bps)
+            mtf_score = float(mtf.get("score", 0.0) or 0.0)
+            mtf_side = "long" if mtf_score > 0 else "watch"
+        except Exception:
+            mtf_side = "watch"
+        row["mtf_side"] = mtf_side
+        row["mtf_confirmed"] = bool(mtf_side == "long")
+        if not bool(row["mtf_confirmed"]):
+            row["score"] = round(float(row.get("score", 0.0) or 0.0) * 0.70, 6)
+            _append_reason_parts(
+                row,
+                logic="Multi-timeframe mismatch lowered conviction",
+                data="mtf mismatch",
+            )
+
+
 def _bar_quality(bars: List[Dict[str, Any]]) -> Dict[str, float]:
     if not bars:
         return {"valid_ratio": 0.0, "stale_hours": 9999.0}
@@ -1333,26 +1406,6 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 row["valid_ratio"] = round(float(q.get("valid_ratio", 0.0)), 4)
                 row["stale_hours"] = round(float(q.get("stale_hours", 9999.0)), 3)
                 row["data_quality_ok"] = bool((row["valid_ratio"] >= min_valid_ratio) and (row["stale_hours"] <= max_stale_hours_effective))
-                # MTF confirmation: compare 1h direction with higher timeframe proxy.
-                mtf_side = "watch"
-                try:
-                    bars_4h = client.get_stock_bars(symbol, timeframe="4Hour", limit=36, feed=feed)
-                    if len(bars_4h) < 8:
-                        bars_4h = client.get_stock_bars(symbol, timeframe="1Day", limit=36, feed=feed)
-                    mtf = _score_bars(symbol, bars_4h, spread_bps=spread_bps)
-                    mtf_score = float(mtf.get("score", 0.0) or 0.0)
-                    mtf_side = "long" if mtf_score > 0 else "watch"
-                except Exception:
-                    mtf_side = "watch"
-                row["mtf_side"] = mtf_side
-                row["mtf_confirmed"] = bool((str(row.get("side", "watch")).lower() == "long") and (mtf_side == "long"))
-                if str(row.get("side", "watch")).lower() == "long" and (not row["mtf_confirmed"]):
-                    row["score"] = round(float(row.get("score", 0.0)) * 0.70, 6)
-                    _append_reason_parts(
-                        row,
-                        logic="Multi-timeframe mismatch lowered conviction",
-                        data="mtf mismatch",
-                    )
                 if bool(window_policy.get("active", False)) and str(row.get("side", "watch")).lower() == "long":
                     raw_score = float(row.get("score", 0.0) or 0.0)
                     mult = float(window_policy.get("score_mult", 1.0) or 1.0)
@@ -1394,6 +1447,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     continue
                 best_bars_by_symbol[symbol] = list(symbol_bars or [])
                 scored.append(row)
+            _apply_stock_mtf_confirmation(scored, client, feed, settings)
             bars_total = 0
             try:
                 bars_total = int(sum(len(list(v or [])) for v in best_bars_by_symbol.values()))
@@ -1601,6 +1655,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     exec_n = max(6, int(len(ranked_health) * 0.35))
     exec_bucket = {str(r.get("symbol", "")).strip().upper() for r in ranked_health[:exec_n]}
     for row in scored:
+        row["entry_gate_reason"] = ""
         row["eligible_for_entry"] = str(row.get("symbol", "")).strip().upper() in exec_bucket
         if (not row["eligible_for_entry"]) and (str(row.get("side", "watch")).lower() == "long"):
             _append_reason_parts(
@@ -1609,6 +1664,17 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 data="universe health bucket",
             )
             row["side"] = "watch"
+        elif str(row.get("side", "watch") or "watch").strip().lower() == "long":
+            entry_gate_reason = _live_guarded_entry_gate_reason(settings, row)
+            if entry_gate_reason:
+                row["eligible_for_entry"] = False
+                row["entry_gate_reason"] = entry_gate_reason
+                row["side"] = "watch"
+                _append_reason_parts(
+                    row,
+                    logic="Calibration history insufficient for live_guarded entry; hold as watch",
+                    data=entry_gate_reason,
+                )
         row["leader_rank_score"] = round(_leader_rank_score(row), 6)
 
     # Adaptive threshold blends volatility regime + replay recommendation (bounded step).
@@ -1648,7 +1714,10 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
 
     leaders_long = sorted(
         [row for row in scored if str(row.get("side", "")).lower() == "long"],
-        key=lambda r: float(r.get("leader_rank_score", r.get("score", -9999.0)) or -9999.0),
+        key=lambda r: (
+            1 if bool(r.get("eligible_for_entry", False)) else 0,
+            float(r.get("leader_rank_score", r.get("score", -9999.0)) or -9999.0),
+        ),
         reverse=True,
     )[:10]
     leader_mode = "long"
@@ -1658,7 +1727,10 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         watch_n = max(1, min(10, int(float(settings.get("stock_scan_watch_leaders_count", 6) or 6))))
         leaders = sorted(
             list(scored),
-            key=lambda r: float(r.get("leader_rank_score", r.get("score", -9999.0)) or -9999.0),
+            key=lambda r: (
+                1 if bool(r.get("eligible_for_entry", False)) else 0,
+                float(r.get("leader_rank_score", r.get("score", -9999.0)) or -9999.0),
+            ),
             reverse=True,
         )[:watch_n]
         leader_mode = "watch_fallback"

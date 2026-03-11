@@ -15,23 +15,42 @@ class _AliveProc:
         return None
 
 
+def _scripts(base_dir: str) -> dict[str, str]:
+    return {
+        "thinker": os.path.join(base_dir, "noop_thinker.py"),
+        "trader": os.path.join(base_dir, "noop_trader.py"),
+        "markets": os.path.join(base_dir, "noop_markets.py"),
+        "autopilot": os.path.join(base_dir, "noop_autopilot.py"),
+    }
+
+
 class TestRunnerWatchdog(unittest.TestCase):
-    def test_market_loop_stale_note_emitted_and_throttled(self) -> None:
+    def test_market_loop_watchdog_stale_after_uses_latency_budget(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             hub = os.path.join(td, "hub_data")
             logs = os.path.join(hub, "logs")
             os.makedirs(logs, exist_ok=True)
+            runtime_state_path = os.path.join(hub, "runtime_state.json")
+            with open(runtime_state_path, "w", encoding="utf-8") as f:
+                f.write(
+                    """
+{
+  "sla_metrics": {
+    "stocks_snapshot": {"p95_ms": 400.0},
+    "forex_snapshot": {"p95_ms": 300.0},
+    "stocks_scan": {"p95_ms": 118000.0},
+    "forex_scan": {"p95_ms": 11000.0},
+    "stocks_trader_step": {"p95_ms": 600.0},
+    "forex_trader_step": {"p95_ms": 500.0}
+  }
+}
+""".strip()
+                )
             settings_path = os.path.join(td, "gui_settings.json")
             with open(settings_path, "w", encoding="utf-8") as f:
                 f.write("{}")
 
-            scripts = {
-                "thinker": os.path.join(td, "noop_thinker.py"),
-                "trader": os.path.join(td, "noop_trader.py"),
-                "markets": os.path.join(td, "noop_markets.py"),
-                "autopilot": os.path.join(td, "noop_autopilot.py"),
-                "autofix": os.path.join(td, "noop_autofix.py"),
-            }
+            scripts = _scripts(td)
             for path in scripts.values():
                 with open(path, "w", encoding="utf-8") as f:
                     f.write("print('noop')\n")
@@ -45,7 +64,136 @@ class TestRunnerWatchdog(unittest.TestCase):
                 stack.enter_context(patch.object(pt_runner, "TRADER_LOG_PATH", os.path.join(logs, "trader.log")))
                 stack.enter_context(patch.object(pt_runner, "MARKETS_LOG_PATH", os.path.join(logs, "markets.log")))
                 stack.enter_context(patch.object(pt_runner, "AUTOPILOT_LOG_PATH", os.path.join(logs, "autopilot.log")))
-                stack.enter_context(patch.object(pt_runner, "AUTOFIX_LOG_PATH", os.path.join(logs, "autofix.log")))
+                stack.enter_context(patch.object(pt_runner, "MARKET_LOOP_STATUS_PATH", os.path.join(hub, "market_loop_status.json")))
+                stack.enter_context(patch.object(pt_runner, "RUNTIME_STATE_PATH", runtime_state_path))
+                stack.enter_context(patch.object(pt_runner, "RUNTIME_EVENTS_PATH", os.path.join(hub, "runtime_events.jsonl")))
+                stack.enter_context(patch.object(pt_runner, "INCIDENTS_PATH", os.path.join(hub, "incidents.jsonl")))
+                stack.enter_context(patch.object(pt_runner, "TRADER_STATUS_PATH", os.path.join(hub, "trader_status.json")))
+                stack.enter_context(patch.object(pt_runner, "resolve_settings_path", return_value=settings_path))
+                stack.enter_context(
+                    patch.object(
+                        pt_runner,
+                        "read_settings_file",
+                        return_value={
+                            "market_bg_snapshot_interval_s": 15.0,
+                            "market_bg_stocks_interval_s": 12.0,
+                            "market_bg_forex_interval_s": 8.0,
+                        },
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        pt_runner,
+                        "sanitize_settings",
+                        side_effect=lambda x: (x if isinstance(x, dict) else {}),
+                    )
+                )
+                stack.enter_context(patch.object(pt_runner, "_settings_scripts", return_value=scripts))
+                runner = pt_runner.Runner()
+                stale_after = runner._market_loop_watchdog_stale_after(
+                    {
+                        "market_bg_snapshot_interval_s": 15.0,
+                        "market_bg_stocks_interval_s": 12.0,
+                        "market_bg_forex_interval_s": 8.0,
+                    },
+                    floor_s=90.0,
+                )
+
+            self.assertGreaterEqual(float(stale_after), 140.0)
+
+    def test_market_loop_phase_timeout_uses_active_phase_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            hub = os.path.join(td, "hub_data")
+            logs = os.path.join(hub, "logs")
+            os.makedirs(logs, exist_ok=True)
+            runtime_state_path = os.path.join(hub, "runtime_state.json")
+            with open(runtime_state_path, "w", encoding="utf-8") as f:
+                f.write(
+                    """
+{
+  "sla_metrics": {
+    "stocks_scan": {"p95_ms": 110000.0, "last_ms": 100000.0}
+  }
+}
+""".strip()
+                )
+            market_loop_status_path = os.path.join(hub, "market_loop_status.json")
+            with open(market_loop_status_path, "w", encoding="utf-8") as f:
+                f.write('{"phase":"stocks_scan","phase_started_ts":1000,"ts":1200,"heartbeat_ts":1200}')
+            settings_path = os.path.join(td, "gui_settings.json")
+            with open(settings_path, "w", encoding="utf-8") as f:
+                f.write("{}")
+
+            scripts = _scripts(td)
+            for path in scripts.values():
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("print('noop')\n")
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(pt_runner, "BASE_DIR", td))
+                stack.enter_context(patch.object(pt_runner, "HUB_DATA_DIR", hub))
+                stack.enter_context(patch.object(pt_runner, "LOG_DIR", logs))
+                stack.enter_context(patch.object(pt_runner, "RUNNER_LOG_PATH", os.path.join(logs, "runner.log")))
+                stack.enter_context(patch.object(pt_runner, "THINKER_LOG_PATH", os.path.join(logs, "thinker.log")))
+                stack.enter_context(patch.object(pt_runner, "TRADER_LOG_PATH", os.path.join(logs, "trader.log")))
+                stack.enter_context(patch.object(pt_runner, "MARKETS_LOG_PATH", os.path.join(logs, "markets.log")))
+                stack.enter_context(patch.object(pt_runner, "AUTOPILOT_LOG_PATH", os.path.join(logs, "autopilot.log")))
+                stack.enter_context(patch.object(pt_runner, "MARKET_LOOP_STATUS_PATH", market_loop_status_path))
+                stack.enter_context(patch.object(pt_runner, "RUNTIME_STATE_PATH", runtime_state_path))
+                stack.enter_context(patch.object(pt_runner, "RUNTIME_EVENTS_PATH", os.path.join(hub, "runtime_events.jsonl")))
+                stack.enter_context(patch.object(pt_runner, "INCIDENTS_PATH", os.path.join(hub, "incidents.jsonl")))
+                stack.enter_context(patch.object(pt_runner, "TRADER_STATUS_PATH", os.path.join(hub, "trader_status.json")))
+                stack.enter_context(patch.object(pt_runner, "resolve_settings_path", return_value=settings_path))
+                stack.enter_context(
+                    patch.object(
+                        pt_runner,
+                        "read_settings_file",
+                        return_value={"market_bg_forex_interval_s": 12.0},
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        pt_runner,
+                        "sanitize_settings",
+                        side_effect=lambda x: (x if isinstance(x, dict) else {}),
+                    )
+                )
+                stack.enter_context(patch.object(pt_runner, "_settings_scripts", return_value=scripts))
+                runner = pt_runner.Runner()
+                runner.children["markets"].proc = _AliveProc()  # type: ignore[assignment]
+
+                with patch.object(runner, "_status_file_stale", return_value=False), patch.object(
+                    pt_runner, "_append_incident"
+                ) as mock_incident, patch.object(pt_runner, "_runner_log"):
+                    runner._watchdog_tick(1260.0)
+
+                events = [str(call.args[1]) for call in mock_incident.call_args_list if len(call.args) >= 2]
+                self.assertIn("runner_market_loop_status_stale", events)
+                self.assertIn("runner_market_loop_restart", events)
+
+    def test_market_loop_stale_note_emitted_and_throttled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            hub = os.path.join(td, "hub_data")
+            logs = os.path.join(hub, "logs")
+            os.makedirs(logs, exist_ok=True)
+            settings_path = os.path.join(td, "gui_settings.json")
+            with open(settings_path, "w", encoding="utf-8") as f:
+                f.write("{}")
+
+            scripts = _scripts(td)
+            for path in scripts.values():
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("print('noop')\n")
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(pt_runner, "BASE_DIR", td))
+                stack.enter_context(patch.object(pt_runner, "HUB_DATA_DIR", hub))
+                stack.enter_context(patch.object(pt_runner, "LOG_DIR", logs))
+                stack.enter_context(patch.object(pt_runner, "RUNNER_LOG_PATH", os.path.join(logs, "runner.log")))
+                stack.enter_context(patch.object(pt_runner, "THINKER_LOG_PATH", os.path.join(logs, "thinker.log")))
+                stack.enter_context(patch.object(pt_runner, "TRADER_LOG_PATH", os.path.join(logs, "trader.log")))
+                stack.enter_context(patch.object(pt_runner, "MARKETS_LOG_PATH", os.path.join(logs, "markets.log")))
+                stack.enter_context(patch.object(pt_runner, "AUTOPILOT_LOG_PATH", os.path.join(logs, "autopilot.log")))
                 stack.enter_context(patch.object(pt_runner, "MARKET_LOOP_STATUS_PATH", os.path.join(hub, "market_loop_status.json")))
                 stack.enter_context(patch.object(pt_runner, "RUNTIME_EVENTS_PATH", os.path.join(hub, "runtime_events.jsonl")))
                 stack.enter_context(patch.object(pt_runner, "INCIDENTS_PATH", os.path.join(hub, "incidents.jsonl")))
@@ -101,13 +249,7 @@ class TestRunnerWatchdog(unittest.TestCase):
             with open(settings_path, "w", encoding="utf-8") as f:
                 f.write("{}")
 
-            scripts = {
-                "thinker": os.path.join(td, "noop_thinker.py"),
-                "trader": os.path.join(td, "noop_trader.py"),
-                "markets": os.path.join(td, "noop_markets.py"),
-                "autopilot": os.path.join(td, "noop_autopilot.py"),
-                "autofix": os.path.join(td, "noop_autofix.py"),
-            }
+            scripts = _scripts(td)
             for path in scripts.values():
                 with open(path, "w", encoding="utf-8") as f:
                     f.write("print('noop')\n")
@@ -121,7 +263,6 @@ class TestRunnerWatchdog(unittest.TestCase):
                 stack.enter_context(patch.object(pt_runner, "TRADER_LOG_PATH", os.path.join(logs, "trader.log")))
                 stack.enter_context(patch.object(pt_runner, "MARKETS_LOG_PATH", os.path.join(logs, "markets.log")))
                 stack.enter_context(patch.object(pt_runner, "AUTOPILOT_LOG_PATH", os.path.join(logs, "autopilot.log")))
-                stack.enter_context(patch.object(pt_runner, "AUTOFIX_LOG_PATH", os.path.join(logs, "autofix.log")))
                 stack.enter_context(patch.object(pt_runner, "MARKET_LOOP_STATUS_PATH", os.path.join(hub, "market_loop_status.json")))
                 stack.enter_context(patch.object(pt_runner, "RUNTIME_EVENTS_PATH", os.path.join(hub, "runtime_events.jsonl")))
                 stack.enter_context(patch.object(pt_runner, "INCIDENTS_PATH", os.path.join(hub, "incidents.jsonl")))
@@ -161,13 +302,7 @@ class TestRunnerWatchdog(unittest.TestCase):
             with open(settings_path, "w", encoding="utf-8") as f:
                 f.write("{}")
 
-            scripts_old = {
-                "thinker": os.path.join(td, "noop_thinker.py"),
-                "trader": os.path.join(td, "noop_trader.py"),
-                "markets": os.path.join(td, "noop_markets.py"),
-                "autopilot": os.path.join(td, "noop_autopilot.py"),
-                "autofix": os.path.join(td, "noop_autofix.py"),
-            }
+            scripts_old = _scripts(td)
             scripts_new = dict(scripts_old)
             scripts_new["trader"] = os.path.join(td, "new_trader.py")
             for path in set(list(scripts_old.values()) + [scripts_new["trader"]]):
@@ -183,7 +318,6 @@ class TestRunnerWatchdog(unittest.TestCase):
                 stack.enter_context(patch.object(pt_runner, "TRADER_LOG_PATH", os.path.join(logs, "trader.log")))
                 stack.enter_context(patch.object(pt_runner, "MARKETS_LOG_PATH", os.path.join(logs, "markets.log")))
                 stack.enter_context(patch.object(pt_runner, "AUTOPILOT_LOG_PATH", os.path.join(logs, "autopilot.log")))
-                stack.enter_context(patch.object(pt_runner, "AUTOFIX_LOG_PATH", os.path.join(logs, "autofix.log")))
                 stack.enter_context(patch.object(pt_runner, "MARKET_LOOP_STATUS_PATH", os.path.join(hub, "market_loop_status.json")))
                 stack.enter_context(patch.object(pt_runner, "RUNTIME_EVENTS_PATH", os.path.join(hub, "runtime_events.jsonl")))
                 stack.enter_context(patch.object(pt_runner, "INCIDENTS_PATH", os.path.join(hub, "incidents.jsonl")))
@@ -224,13 +358,7 @@ class TestRunnerWatchdog(unittest.TestCase):
             with open(settings_path, "w", encoding="utf-8") as f:
                 f.write("{}")
 
-            scripts = {
-                "thinker": os.path.join(td, "noop_thinker.py"),
-                "trader": os.path.join(td, "noop_trader.py"),
-                "markets": os.path.join(td, "noop_markets.py"),
-                "autopilot": os.path.join(td, "noop_autopilot.py"),
-                "autofix": os.path.join(td, "noop_autofix.py"),
-            }
+            scripts = _scripts(td)
             for path in scripts.values():
                 with open(path, "w", encoding="utf-8") as f:
                     f.write("print('noop')\n")
@@ -244,7 +372,6 @@ class TestRunnerWatchdog(unittest.TestCase):
                 stack.enter_context(patch.object(pt_runner, "TRADER_LOG_PATH", os.path.join(logs, "trader.log")))
                 stack.enter_context(patch.object(pt_runner, "MARKETS_LOG_PATH", os.path.join(logs, "markets.log")))
                 stack.enter_context(patch.object(pt_runner, "AUTOPILOT_LOG_PATH", os.path.join(logs, "autopilot.log")))
-                stack.enter_context(patch.object(pt_runner, "AUTOFIX_LOG_PATH", os.path.join(logs, "autofix.log")))
                 stack.enter_context(patch.object(pt_runner, "MARKET_LOOP_STATUS_PATH", os.path.join(hub, "market_loop_status.json")))
                 stack.enter_context(patch.object(pt_runner, "RUNTIME_EVENTS_PATH", os.path.join(hub, "runtime_events.jsonl")))
                 stack.enter_context(patch.object(pt_runner, "INCIDENTS_PATH", os.path.join(hub, "incidents.jsonl")))

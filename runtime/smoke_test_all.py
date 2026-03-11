@@ -20,7 +20,6 @@ from engines.forex_thinker import run_scan as run_forex_scan
 from engines.forex_trader import run_step as run_forex_step
 from engines.stock_thinker import run_scan as run_stock_scan
 from engines.stock_trader import run_step as run_stock_step
-from runtime.pt_autofix import run_once as run_autofix_once
 from runtime.pt_autopilot import run_once as run_autopilot_once
 
 
@@ -97,19 +96,7 @@ def main() -> int:
         out["ok"] = False
         out["steps"]["autopilot"] = {"error": f"{type(exc).__name__}: {exc}"}
 
-    # 6) autofix dry-run
-    try:
-        autofix = run_autofix_once(dry_run=True)
-        out["steps"]["autofix"] = {
-            "enabled": bool((autofix or {}).get("enabled", False)),
-            "mode": str((autofix or {}).get("mode", "")),
-            "tickets_created": int((autofix or {}).get("tickets_created", 0) or 0),
-        }
-    except Exception as exc:
-        out["ok"] = False
-        out["steps"]["autofix"] = {"error": f"{type(exc).__name__}: {exc}"}
-
-    # 7) rejection replay report
+    # 6) rejection replay report
     try:
         replay_payload = build_rejection_replay_report(hub_dir, settings)
         replay_path = os.path.join(hub_dir, "rejection_replay.json")
@@ -125,7 +112,7 @@ def main() -> int:
         out["ok"] = False
         out["steps"]["rejection_replay"] = {"error": f"{type(exc).__name__}: {exc}"}
 
-    # 8) operator notes bootstrap
+    # 7) operator notes bootstrap
     try:
         md_path, log_path = ensure_operator_notes_files(hub_dir)
         out["steps"]["operator_notes"] = {
@@ -145,7 +132,6 @@ def main() -> int:
         "forex_universe_quality": _safe_json(os.path.join(hub_dir, "forex", "universe_quality.json")),
         "runtime_startup_checks": _safe_json(os.path.join(hub_dir, "runtime_startup_checks.json")),
         "runtime_state": _safe_json(os.path.join(hub_dir, "runtime_state.json")),
-        "autofix_status": _safe_json(os.path.join(hub_dir, "autofix_status.json")),
         "market_loop_status": _safe_json(os.path.join(hub_dir, "market_loop_status.json")),
         "scanner_cadence_drift": _safe_json(os.path.join(hub_dir, "scanner_cadence_drift.json")),
         "market_sla_metrics": _safe_json(os.path.join(hub_dir, "market_sla_metrics.json")),

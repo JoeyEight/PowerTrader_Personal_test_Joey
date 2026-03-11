@@ -70,7 +70,7 @@ def _normalize_log_line(line: str) -> str:
 
 def _log_spam_metrics(hub_dir: str) -> Dict[str, Any]:
     logs_dir = os.path.join(hub_dir, "logs")
-    files = ["thinker.log", "markets.log", "trader.log", "runner.log", "autopilot.log", "autofix.log"]
+    files = ["thinker.log", "markets.log", "trader.log", "runner.log", "autopilot.log"]
     counts: Dict[str, int] = {}
     total = 0
     for name in files:

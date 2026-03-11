@@ -135,6 +135,53 @@ class TestForexThinkerFallback(unittest.TestCase):
             self.assertEqual(str(top.get("pair", "")), "USD_JPY")
             self.assertTrue(bool(out.get("leader_stability_applied", False)))
 
+    def test_live_guarded_demotes_undertrained_leader_to_watch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "forex"), exist_ok=True)
+            settings = {
+                "oanda_account_id": "abc",
+                "oanda_api_token": "xyz",
+                "oanda_rest_url": "https://api-fxpractice.oanda.com",
+                "market_rollout_stage": "live_guarded",
+                "forex_min_samples_live_guarded": 4,
+                "forex_min_calib_prob_live_guarded": 0.48,
+                "forex_scan_max_pairs": 4,
+                "forex_max_stale_hours": 10000.0,
+            }
+            candles = [
+                {"complete": True, "time": f"2026-03-01T{(i % 24):02d}:00:00.000000000Z", "mid": {"o": "1.1000", "h": "1.1100", "l": "1.0900", "c": "1.1050"}, "volume": 1000}
+                for i in range(48)
+            ]
+
+            def _score(pair: str, rows: list[dict], spread_bps: float = 0.0) -> dict:
+                return {
+                    "pair": str(pair).upper(),
+                    "score": 0.62,
+                    "side": "long",
+                    "last": 1.2345,
+                    "change_6h_pct": 0.2,
+                    "change_24h_pct": 0.4,
+                    "volatility_pct": 0.05,
+                    "spread_bps": float(spread_bps),
+                    "confidence": "MED",
+                    "reason": "test",
+                }
+
+            with (
+                patch.object(forex_thinker, "get_oanda_creds", return_value=("abc", "xyz")),
+                patch.object(forex_thinker, "OandaBrokerClient", _FakeOandaClient),
+                patch.object(forex_thinker, "_request_json", return_value={"candles": candles}),
+                patch.object(forex_thinker, "_score_candles", side_effect=_score),
+                patch.object(forex_thinker, "_load_forexfactory_context", return_value={"enabled": False, "events": [], "state": "disabled", "error": ""}),
+            ):
+                out = forex_thinker.run_scan(settings, td)
+
+            self.assertEqual(str(out.get("state", "")), "READY")
+            top = out.get("top_pick", {}) if isinstance(out.get("top_pick", {}), dict) else {}
+            self.assertEqual(str(top.get("side", "")).lower(), "watch")
+            self.assertFalse(bool(top.get("eligible_for_entry", True)))
+            self.assertIn("Calibration sample gate", str(top.get("entry_gate_reason", "") or ""))
+
 
 if __name__ == "__main__":
     unittest.main()

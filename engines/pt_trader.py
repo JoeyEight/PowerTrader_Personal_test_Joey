@@ -493,6 +493,19 @@ class CryptoAPITrading:
             "holdings_buy_value": None,
             "percent_in_trade": None,
         }
+        self._last_good_holdings_results: List[Dict[str, Any]] = []
+        self._last_good_holdings_ts = 0.0
+        self._last_good_positions_snapshot: Dict[str, Dict[str, Any]] = {}
+        self._bootstrap_last_good_snapshot_from_disk()
+        self._seed_cost_basis_from_fallbacks()
+        if not self.dca_levels_triggered:
+            for symbol, pos in self._last_good_positions_snapshot.items():
+                try:
+                    stages = int(float((pos or {}).get("dca_triggered_stages", 0) or 0.0))
+                except Exception:
+                    stages = 0
+                if stages > 0:
+                    self.dca_levels_triggered[str(symbol).upper().strip()] = list(range(stages))
 
         # --- DCA rate-limit (per trade, per coin, rolling 24h window) ---
         self.max_dca_buys_per_24h = int(MAX_DCA_BUYS_PER_24H)
@@ -508,6 +521,27 @@ class CryptoAPITrading:
         self._status_note = ""
         self._loop_sleep_ok = float(CRYPTO_TRADER_LOOP_SLEEP_S)
         self._loop_sleep_error = float(CRYPTO_TRADER_ERROR_SLEEP_S)
+
+    def _seed_cost_basis_from_fallbacks(self) -> None:
+        cost_basis = getattr(self, "cost_basis", {})
+        if not isinstance(cost_basis, dict):
+            self.cost_basis = {}
+        else:
+            self.cost_basis = cost_basis
+        symbols = set(self._last_good_positions_snapshot.keys()) | self._ledger_open_position_bases()
+        for symbol in symbols:
+            coin = str(symbol or "").strip().upper()
+            if not coin:
+                continue
+            try:
+                existing = float(self.cost_basis.get(coin, 0.0) or 0.0)
+            except Exception:
+                existing = 0.0
+            if existing > 0.0:
+                continue
+            fallback = self._fallback_avg_cost_basis(coin, quantity=0.0)
+            if fallback > 0.0:
+                self.cost_basis[coin] = float(fallback)
 
 
 
@@ -595,6 +629,214 @@ class CryptoAPITrading:
             self._status_note = str(note or "").strip()
         except Exception:
             self._status_note = ""
+
+    @staticmethod
+    def _copy_holdings_results(holdings_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for row in list(holdings_results or []):
+            if isinstance(row, dict):
+                out.append(dict(row))
+        return out
+
+    @staticmethod
+    def _active_holding_rows(holdings_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        active: List[Dict[str, Any]] = []
+        for row in list(holdings_results or []):
+            if not isinstance(row, dict):
+                continue
+            try:
+                qty = float(row.get("total_quantity", 0.0) or 0.0)
+            except Exception:
+                qty = 0.0
+            if qty <= 0.0:
+                continue
+            coin = str(row.get("asset_code", "") or "").strip().upper()
+            if not coin or coin == "USDC":
+                continue
+            active.append(dict(row))
+        return active
+
+    def _ledger_open_position_bases(self) -> set:
+        out = set()
+        try:
+            open_positions = self._pnl_ledger.get("open_positions", {})
+        except Exception:
+            open_positions = {}
+        if not isinstance(open_positions, dict):
+            return out
+        for base, row in open_positions.items():
+            try:
+                qty = float((row or {}).get("qty", 0.0) or 0.0)
+                usd_cost = float((row or {}).get("usd_cost", 0.0) or 0.0)
+            except Exception:
+                qty = 0.0
+                usd_cost = 0.0
+            if qty > 0.0 or usd_cost > 1e-6:
+                coin = str(base or "").strip().upper()
+                if coin:
+                    out.add(coin)
+        return out
+
+    def _ledger_avg_cost_basis(self, base_symbol: str, quantity: float = 0.0) -> float:
+        coin = str(base_symbol or "").strip().upper()
+        if not coin:
+            return 0.0
+        try:
+            open_positions = self._pnl_ledger.get("open_positions", {})
+        except Exception:
+            open_positions = {}
+        if not isinstance(open_positions, dict):
+            return 0.0
+        row = open_positions.get(coin, {})
+        if not isinstance(row, dict):
+            return 0.0
+        try:
+            usd_cost = float(row.get("usd_cost", 0.0) or 0.0)
+        except Exception:
+            usd_cost = 0.0
+        try:
+            qty = float(quantity or 0.0)
+        except Exception:
+            qty = 0.0
+        if qty <= 0.0:
+            try:
+                qty = float(row.get("qty", 0.0) or 0.0)
+            except Exception:
+                qty = 0.0
+        if usd_cost > 0.0 and qty > 0.0:
+            return float(usd_cost / qty)
+        return 0.0
+
+    def _fallback_avg_cost_basis(self, base_symbol: str, quantity: float = 0.0) -> float:
+        coin = str(base_symbol or "").strip().upper()
+        if not coin:
+            return 0.0
+        try:
+            direct = float((getattr(self, "cost_basis", {}) or {}).get(coin, 0.0) or 0.0)
+        except Exception:
+            direct = 0.0
+        if direct > 0.0:
+            return float(direct)
+        try:
+            snap = self._last_good_positions_snapshot.get(coin, {})
+        except Exception:
+            snap = {}
+        if isinstance(snap, dict):
+            try:
+                snap_avg = float(snap.get("avg_cost_basis", 0.0) or 0.0)
+            except Exception:
+                snap_avg = 0.0
+            if snap_avg > 0.0:
+                return float(snap_avg)
+        ledger_avg = self._ledger_avg_cost_basis(coin, quantity=quantity)
+        if ledger_avg > 0.0:
+            return float(ledger_avg)
+        return 0.0
+
+    def _bootstrap_last_good_snapshot_from_disk(self) -> None:
+        try:
+            with open(TRADER_DETAIL_PATH, "r", encoding="utf-8") as f:
+                payload = json.load(f) or {}
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        account = payload.get("account", {}) if isinstance(payload.get("account", {}), dict) else {}
+        snapshot = dict(self._last_good_account_snapshot)
+        for key in ("total_account_value", "buying_power", "holdings_sell_value", "holdings_buy_value", "percent_in_trade"):
+            try:
+                raw_val = account.get(key, None)
+                if raw_val is None or raw_val == "":
+                    continue
+                snapshot[key] = float(raw_val)
+            except Exception:
+                continue
+        self._last_good_account_snapshot = snapshot
+
+        positions = payload.get("positions", {}) if isinstance(payload.get("positions", {}), dict) else {}
+        seeded_positions: Dict[str, Dict[str, Any]] = {}
+        seeded_holdings: List[Dict[str, Any]] = []
+        for symbol, pos in positions.items():
+            if not isinstance(pos, dict):
+                continue
+            coin = str(symbol or "").strip().upper()
+            if not coin:
+                continue
+            try:
+                qty = float(pos.get("quantity", 0.0) or 0.0)
+            except Exception:
+                qty = 0.0
+            if qty <= 0.0:
+                continue
+            seeded_positions[coin] = dict(pos)
+            seeded_holdings.append({"asset_code": coin, "total_quantity": qty})
+
+        if not seeded_holdings:
+            try:
+                open_positions = self._pnl_ledger.get("open_positions", {})
+            except Exception:
+                open_positions = {}
+            if isinstance(open_positions, dict):
+                for symbol, row in open_positions.items():
+                    try:
+                        qty = float((row or {}).get("qty", 0.0) or 0.0)
+                    except Exception:
+                        qty = 0.0
+                    coin = str(symbol or "").strip().upper()
+                    if coin and qty > 0.0:
+                        seeded_holdings.append({"asset_code": coin, "total_quantity": qty})
+
+        if seeded_positions:
+            self._last_good_positions_snapshot = seeded_positions
+        if seeded_holdings:
+            self._last_good_holdings_results = self._copy_holdings_results(seeded_holdings)
+            try:
+                self._last_good_holdings_ts = float(payload.get("timestamp", 0.0) or 0.0)
+            except Exception:
+                self._last_good_holdings_ts = time.time()
+            if self._last_good_holdings_ts <= 0.0:
+                self._last_good_holdings_ts = time.time()
+        self._seed_cost_basis_from_fallbacks()
+
+    def _remember_good_holdings(self, holdings_results: List[Dict[str, Any]]) -> None:
+        active_rows = self._active_holding_rows(holdings_results)
+        if not active_rows:
+            return
+        self._last_good_holdings_results = self._copy_holdings_results(active_rows)
+        self._last_good_holdings_ts = time.time()
+
+    def _should_reuse_cached_holdings(
+        self,
+        holdings_results: List[Dict[str, Any]],
+        recent_trade: bool = False,
+    ) -> bool:
+        if recent_trade:
+            return False
+        if self._active_holding_rows(holdings_results):
+            return False
+        cached_rows = self._active_holding_rows(getattr(self, "_last_good_holdings_results", []))
+        if not cached_rows:
+            return False
+        if self._ledger_open_position_bases():
+            return True
+        age_s = time.time() - float(getattr(self, "_last_good_holdings_ts", 0.0) or 0.0)
+        return age_s <= 90.0
+
+    def _resolve_holdings_results(self, holdings: Any, recent_trade: bool = False) -> tuple:
+        holdings_results: List[Dict[str, Any]] = []
+        if isinstance(holdings, dict):
+            raw_results = holdings.get("results", [])
+            if isinstance(raw_results, list):
+                holdings_results = self._copy_holdings_results(raw_results)
+        if self._active_holding_rows(holdings_results):
+            self._remember_good_holdings(holdings_results)
+            return holdings_results, False
+        if self._should_reuse_cached_holdings(holdings_results, recent_trade=recent_trade):
+            if not str(getattr(self, "_status_note", "") or "").strip():
+                self._set_status_note("Broker holdings snapshot incomplete; using cached crypto positions.")
+            return self._copy_holdings_results(self._last_good_holdings_results), True
+        return holdings_results, False
 
     def _can_place_buy(
         self,
@@ -1448,6 +1690,74 @@ class CryptoAPITrading:
 
         return cost_basis
 
+    def _calculate_symbol_cost_basis(self, base_symbol: str, current_quantity: float) -> float:
+        coin = str(base_symbol or "").strip().upper()
+        try:
+            qty_needed = float(current_quantity or 0.0)
+        except Exception:
+            qty_needed = 0.0
+        if (not coin) or qty_needed <= 0.0:
+            return 0.0
+
+        orders = self.get_orders(f"{coin}-USD")
+        if not orders or "results" not in orders:
+            return 0.0
+
+        buy_orders = [
+            order for order in orders.get("results", [])
+            if isinstance(order, dict) and order.get("side") == "buy" and order.get("state") == "filled"
+        ]
+        if not buy_orders:
+            return 0.0
+        buy_orders.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+
+        remaining_quantity = float(qty_needed)
+        total_cost = 0.0
+
+        for order in buy_orders:
+            for execution in list(order.get("executions", []) or []):
+                try:
+                    quantity = float(execution.get("quantity", 0.0) or 0.0)
+                    price = float(execution.get("effective_price", 0.0) or 0.0)
+                except Exception:
+                    continue
+
+                if quantity <= 0.0 or price <= 0.0:
+                    continue
+                if remaining_quantity <= 0.0:
+                    break
+
+                used_quantity = min(quantity, remaining_quantity)
+                total_cost += used_quantity * price
+                remaining_quantity -= used_quantity
+            if remaining_quantity <= 0.0:
+                break
+
+        if qty_needed > 0.0 and total_cost > 0.0:
+            return float(total_cost / qty_needed)
+        return 0.0
+
+    def _refresh_missing_cost_basis(self, holdings_results: List[Dict[str, Any]]) -> None:
+        if not isinstance(self.cost_basis, dict):
+            self.cost_basis = {}
+        for row in list(holdings_results or []):
+            if not isinstance(row, dict):
+                continue
+            coin = str(row.get("asset_code", "") or "").strip().upper()
+            if (not coin) or coin == "USDC":
+                continue
+            try:
+                qty = float(row.get("total_quantity", 0.0) or 0.0)
+            except Exception:
+                qty = 0.0
+            if qty <= 0.0:
+                continue
+            if self._fallback_avg_cost_basis(coin, quantity=qty) > 0.0:
+                continue
+            recomputed = self._calculate_symbol_cost_basis(coin, qty)
+            if recomputed > 0.0:
+                self.cost_basis[coin] = float(recomputed)
+
     def get_price(self, symbols: list) -> Dict[str, float]:
         buy_prices = {}
         sell_prices = {}
@@ -2039,14 +2349,11 @@ class CryptoAPITrading:
         trading_pairs = self.get_trading_pairs()
         if not isinstance(account, dict):
             account = {}
-        holdings_results = []
-        if isinstance(holdings, dict):
-            raw_results = holdings.get("results", [])
-            if isinstance(raw_results, list):
-                holdings_results = raw_results
+        holdings_results, used_cached_holdings = self._resolve_holdings_results(holdings, recent_trade=bool(trades_made))
         holdings = {"results": holdings_results}
         if not isinstance(trading_pairs, list):
             trading_pairs = []
+        self._refresh_missing_cost_basis(holdings_results)
 
         # Use the stored cost_basis instead of recalculating
         cost_basis = self.cost_basis
@@ -2069,14 +2376,11 @@ class CryptoAPITrading:
             trading_pairs = self.get_trading_pairs()
             if not isinstance(account, dict):
                 account = {}
-            holdings_results = []
-            if isinstance(holdings, dict):
-                raw_results = holdings.get("results", [])
-                if isinstance(raw_results, list):
-                    holdings_results = raw_results
+            holdings_results, used_cached_holdings = self._resolve_holdings_results(holdings, recent_trade=bool(trades_made))
             holdings = {"results": holdings_results}
             if not isinstance(trading_pairs, list):
                 trading_pairs = []
+            self._refresh_missing_cost_basis(holdings_results)
             symbols = [holding["asset_code"] + "-USD" for holding in holdings.get("results", [])]
             for s in crypto_symbols:
                 full = f"{s}-USD"
@@ -2089,7 +2393,10 @@ class CryptoAPITrading:
 
         # buying power
         try:
-            buying_power = float(account.get("buying_power", 0))
+            raw_buying_power = account.get("buying_power", None)
+            if raw_buying_power is None or raw_buying_power == "":
+                raise ValueError("missing buying_power")
+            buying_power = float(raw_buying_power)
         except Exception:
             buying_power = 0.0
             snapshot_ok = False
@@ -2103,6 +2410,18 @@ class CryptoAPITrading:
         except Exception:
             holdings_list = []
             snapshot_ok = False
+
+        last_good_buying_power = None
+        try:
+            raw_last_buying_power = (self._last_good_account_snapshot or {}).get("buying_power", None)
+            if raw_last_buying_power is not None and raw_last_buying_power != "":
+                last_good_buying_power = float(raw_last_buying_power)
+        except Exception:
+            last_good_buying_power = None
+
+        if used_cached_holdings and last_good_buying_power is not None:
+            if (last_good_buying_power - float(buying_power)) > 5.0:
+                snapshot_ok = False
 
         holdings_buy_value = 0.0
         holdings_sell_value = 0.0
@@ -2176,7 +2495,9 @@ class CryptoAPITrading:
             quantity = float(holding["total_quantity"])
             current_buy_price = current_buy_prices.get(full_symbol, 0)
             current_sell_price = current_sell_prices.get(full_symbol, 0)
-            avg_cost_basis = cost_basis.get(symbol, 0)
+            avg_cost_basis = self._fallback_avg_cost_basis(symbol, quantity=quantity)
+            if avg_cost_basis > 0.0:
+                cost_basis[str(symbol).upper().strip()] = float(avg_cost_basis)
 
             if avg_cost_basis > 0:
                 gain_loss_percentage_buy = ((current_buy_price - avg_cost_basis) / avg_cost_basis) * 100
@@ -2545,6 +2866,36 @@ class CryptoAPITrading:
                     "trail_peak": 0.0,
                     "dist_to_trail_pct": 0.0,
                 }
+        except Exception:
+            pass
+
+        try:
+            live_positions = {}
+            for symbol, pos in positions.items():
+                if not isinstance(pos, dict):
+                    continue
+                try:
+                    qty = float(pos.get("quantity", 0.0) or 0.0)
+                except Exception:
+                    qty = 0.0
+                if qty > 0.0:
+                    coin = str(symbol).upper().strip()
+                    prev = dict(self._last_good_positions_snapshot.get(coin, {}) or {})
+                    merged = dict(prev)
+                    merged.update(dict(pos))
+                    try:
+                        merged_avg = float(merged.get("avg_cost_basis", 0.0) or 0.0)
+                    except Exception:
+                        merged_avg = 0.0
+                    try:
+                        prev_avg = float(prev.get("avg_cost_basis", 0.0) or 0.0)
+                    except Exception:
+                        prev_avg = 0.0
+                    if merged_avg <= 0.0 and prev_avg > 0.0:
+                        merged["avg_cost_basis"] = prev_avg
+                    live_positions[coin] = merged
+            if live_positions:
+                self._last_good_positions_snapshot = live_positions
         except Exception:
             pass
 

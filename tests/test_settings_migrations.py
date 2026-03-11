@@ -30,6 +30,7 @@ class TestSettingsMigrations(unittest.TestCase):
         }
         out = sanitize_settings(raw)
         self.assertEqual(int(out.get("settings_schema_version", 0) or 0), int(CURRENT_SETTINGS_VERSION))
+        self.assertNotIn("script_autofix", out)
         notes = list(out.get("settings_upgrade_notes", []) or [])
         self.assertTrue(len(notes) >= 1)
 

@@ -142,7 +142,9 @@ class TestMarketIntelligence(unittest.TestCase):
     def test_notification_center_payload(self) -> None:
         runtime_state = {
             "ts": 1_700_000_000,
+            "checks": {"ok": True, "warnings": [], "errors": []},
             "alerts": {"severity": "warning", "reasons": ["scan_reject_pressure"], "hints": ["Tune thresholds."]},
+            "scan_cadence": {"active": []},
             "market_trends": {
                 "stocks": {
                     "quality_aggregates": {"reject_rate_pct": 95.0},
@@ -159,11 +161,52 @@ class TestMarketIntelligence(unittest.TestCase):
         incidents = [
             {"ts": 1_699_999_900, "severity": "error", "event": "stocks_trader_error", "msg": "boom", "details": {"market": "stocks"}},
             {"ts": 1_699_999_901, "severity": "warning", "event": "forex_thinker_failed", "msg": "nope", "details": {"market": "forex"}},
+            {"ts": 1_699_999_902, "severity": "critical", "event": "scanner_cadence_drift", "msg": "late", "details": {"market": "forex"}},
+            {"ts": 1_699_999_903, "severity": "warning", "event": "runner_startup_check", "msg": "stale_pid_file_removed", "details": {"component": "runner"}},
         ]
         out = build_notification_center_payload(runtime_state, incidents_rows=incidents)
         self.assertGreaterEqual(int(out.get("total", 0) or 0), 2)
         self.assertTrue(isinstance(out.get("items", []), list))
         self.assertTrue(isinstance(out.get("by_market", {}), dict))
+        titles = [str((row or {}).get("title", "") or "") for row in list(out.get("items", []) or [])]
+        self.assertNotIn("scanner_cadence_drift", titles)
+        self.assertNotIn("runner_startup_check", titles)
+
+    def test_notification_center_filters_resolved_market_loop_incidents(self) -> None:
+        runtime_state = {
+            "ts": 1_700_000_000,
+            "checks": {"ok": True, "warnings": [], "errors": []},
+            "alerts": {"severity": "ok", "reasons": [], "hints": [], "metrics": {"market_loop_stale": False}},
+            "scan_cadence": {"active": []},
+            "market_trends": {"stocks": {}, "forex": {}},
+        }
+        incidents = [
+            {"ts": 1_699_999_950, "severity": "warning", "event": "runner_market_loop_status_stale", "msg": "loop stale"},
+            {"ts": 1_699_999_960, "severity": "warning", "event": "runner_market_loop_restart", "msg": "loop restart"},
+        ]
+        out = build_notification_center_payload(runtime_state, incidents_rows=incidents)
+        titles = [str((row or {}).get("title", "") or "") for row in list(out.get("items", []) or [])]
+        self.assertNotIn("runner_market_loop_status_stale", titles)
+        self.assertNotIn("runner_market_loop_restart", titles)
+
+    def test_notification_center_dedupes_transient_incidents_and_expires_old_ui_rows(self) -> None:
+        runtime_state = {
+            "ts": 1_700_000_000,
+            "checks": {"ok": True, "warnings": [], "errors": []},
+            "alerts": {"severity": "ok", "reasons": [], "hints": []},
+            "scan_cadence": {"active": []},
+            "market_trends": {"stocks": {}, "forex": {}},
+        }
+        incidents = [
+            {"ts": 1_699_999_900, "severity": "warning", "event": "runner_watchdog_restart", "msg": "markets restarted"},
+            {"ts": 1_699_999_990, "severity": "warning", "event": "runner_watchdog_restart", "msg": "markets restarted"},
+            {"ts": 1_699_999_600, "severity": "warning", "event": "ui_market_panel_desync", "msg": "Forex leaders blank", "details": {"market": "forex"}},
+        ]
+        out = build_notification_center_payload(runtime_state, incidents_rows=incidents)
+        items = list(out.get("items", []) or [])
+        titles = [str((row or {}).get("title", "") or "") for row in items]
+        self.assertEqual(titles.count("runner_watchdog_restart"), 1)
+        self.assertNotIn("ui_market_panel_desync", titles)
 
 
 if __name__ == "__main__":

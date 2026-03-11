@@ -17,7 +17,7 @@ The desktop hub UI is in [ui/pt_hub.py](/Users/joeydelestre/PowerTrader_AI/ui/pt
 - `app/` shared utilities (settings, paths, health, runtime helpers)
 - `brokers/` Alpaca/OANDA broker adapters
 - `engines/` thinker/trader/trainer modules
-- `runtime/` process orchestration (`pt_runner`, `pt_markets`, `pt_autopilot`, `pt_autofix`)
+- `runtime/` process orchestration (`pt_runner`, `pt_markets`, `pt_autopilot`)
 - `ui/` Tkinter hub application
 - `tests/` unit/integration tests
 - `docs/` runbook/changelog/checklists
@@ -33,27 +33,27 @@ python3 -m pip install -r requirements-dev.txt
 ## Run
 ### Hub UI
 ```bash
-python3 ui/pt_hub.py
+./launch_powertrader.command
+```
+
+Alternative:
+```bash
+./venv/bin/python -m ui.pt_hub
 ```
 
 ### Runner (all background services)
 ```bash
-python3 runtime/pt_runner.py
+./venv/bin/python -m runtime.pt_runner
 ```
 
 ### Markets loop only (scanner + market trader steps)
 ```bash
-python3 runtime/pt_markets.py
+./venv/bin/python -m runtime.pt_markets
 ```
 
 ### Autopilot one-shot tune
 ```bash
-python3 runtime/pt_autopilot.py --once
-```
-
-### Autofix overseer one-shot (safe dry-run)
-```bash
-python3 runtime/pt_autofix.py --once --dry-run
+./venv/bin/python -m runtime.pt_autopilot --once
 ```
 
 ## Preflight (Run Before Shadow/Live)
@@ -136,27 +136,13 @@ Set this in Hub Settings -> Advanced.
 - `hub_data/scanner_cadence_drift.json`
 - `hub_data/runtime_events.jsonl`
 - `hub_data/incidents.jsonl`
-- `hub_data/autofix_status.json`
-- `hub_data/autofix_state.json`
-- `hub_data/autofix/tickets/*.json`
 
 ### Logs
 - `hub_data/logs/runner.log`
 - `hub_data/logs/markets.log`
 - `hub_data/logs/autopilot.log`
-- `hub_data/logs/autofix.log`
 - `hub_data/logs/thinker.log`
 - `hub_data/logs/trader.log`
-
-## Autofix Modes
-Configure in `gui_settings.json`:
-- `autofix_enabled=true|false`
-- `autofix_mode=report_only|manual|shadow_apply`
-- `autofix_allow_live_apply=true|false` (default false)
-
-Recommended:
-1. Start with `report_only` and review generated tickets under `hub_data/autofix/tickets/`.
-2. Use `shadow_apply` only in paper/practice stages after validating your test command.
 
 ## Credentials
 ### Crypto (Robinhood)

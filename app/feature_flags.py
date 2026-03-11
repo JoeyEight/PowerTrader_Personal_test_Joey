@@ -39,13 +39,6 @@ _FEATURE_FLAG_REGISTRY: List[Dict[str, str]] = [
         "description": "Requires forex scanner data-quality health to be OK before entries.",
     },
     {
-        "id": "autofix_live_apply",
-        "setting_key": "autofix_allow_live_apply",
-        "label": "Autofix live apply",
-        "category": "autofix",
-        "description": "Allows AI Assist patches to auto-apply in live_guarded mode.",
-    },
-    {
         "id": "stock_auto_trade",
         "setting_key": "stock_auto_trade_enabled",
         "label": "Stocks auto trade",
@@ -97,4 +90,3 @@ def build_feature_flag_snapshot(settings: Dict[str, Any]) -> Dict[str, Any]:
         "enabled_count": int(enabled),
         "total_count": int(len(rows)),
     }
-

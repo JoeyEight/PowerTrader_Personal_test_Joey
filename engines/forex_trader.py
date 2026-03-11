@@ -56,6 +56,17 @@ def _rollout_at_least(settings: Dict[str, Any], stage: str) -> bool:
     return int(ROLLOUT_ORDER.get(cur, 0)) >= int(ROLLOUT_ORDER.get(stage, 0))
 
 
+def _broker_mode_label(settings: Dict[str, Any]) -> str:
+    return "Practice" if bool(settings.get("oanda_practice_mode", True)) else "Live"
+
+
+def _trader_state_label(settings: Dict[str, Any], auto_enabled: bool, shadow_only: bool) -> str:
+    mode = _broker_mode_label(settings)
+    if auto_enabled:
+        return f"{mode} shadow-run" if shadow_only else f"{mode} auto-run"
+    return f"{mode} manual-ready"
+
+
 def _parse_positions(raw_positions: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     for row in raw_positions or []:
@@ -548,6 +559,8 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 fail = ""
                 if bars_count > 0 and bars_count < min_bars_required:
                     fail = f"Bars preflight failed for {pair} ({bars_count} < {min_bars_required})"
+                elif str(cand.get("entry_gate_reason", "") or "").strip():
+                    fail = str(cand.get("entry_gate_reason", "") or "").strip()
                 elif side not in ("long", "short"):
                     fail = f"Top pair {pair} is WATCH"
                 elif not bool(cand.get("eligible_for_entry", True)):
@@ -738,6 +751,10 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     )
 
     msg_parts = [entry_msg]
+    if shadow_only:
+        msg_parts.append("rollout shadow_only: real entries suppressed")
+    elif not enable_exec_v2:
+        msg_parts.append(f"rollout {stage}: execution disabled")
     if trade_units_effective < abs(trade_units):
         msg_parts.append(f"size x{loss_size_scale:.2f}")
     if trade_units_entry < trade_units_effective:
@@ -770,11 +787,12 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     _safe_write_json(state_path, out_state)
     return {
         "state": "READY",
-        "trader_state": ("Practice auto-run" if auto_enabled else "Practice manual-ready"),
+        "trader_state": _trader_state_label(settings, auto_enabled, shadow_only),
         "msg": " | ".join(x for x in msg_parts if x),
         "actions": actions[-12:],
         "open_positions": len(positions),
         "auto_enabled": auto_enabled,
+        "broker_mode": str(_broker_mode_label(settings)).lower(),
         "rollout_stage": str(settings.get("market_rollout_stage", "legacy") or "legacy"),
         "execution_enabled": enable_exec_v2 and (not shadow_only),
         "trade_units": int(abs(trade_units)),

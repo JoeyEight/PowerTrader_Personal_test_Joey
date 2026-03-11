@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -27,6 +28,25 @@ class TestMarketsLoopStatus(unittest.TestCase):
                 obj = json.load(f)
             self.assertEqual(int(obj.get("ts", 0) or 0), 123)
             self.assertTrue(bool(obj.get("ok", False)))
+
+    def test_flush_loop_status_sets_heartbeat_and_updates_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "market_loop_status.json")
+            loop_status = {"ts": 10, "phase": "idle"}
+            with patch.object(pt_markets, "MARKET_LOOP_STATUS_PATH", path):
+                pt_markets._flush_loop_status(
+                    loop_status,
+                    threading.Lock(),
+                    now_ts=321,
+                    phase="stocks_scan",
+                    phase_started_ts=320,
+                )
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            self.assertEqual(int(obj.get("ts", 0) or 0), 321)
+            self.assertEqual(int(obj.get("heartbeat_ts", 0) or 0), 321)
+            self.assertEqual(str(obj.get("phase", "")), "stocks_scan")
+            self.assertEqual(int(obj.get("phase_started_ts", 0) or 0), 320)
 
     def test_update_scan_cadence_drift_creates_active_alert(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -59,6 +79,28 @@ class TestMarketsLoopStatus(unittest.TestCase):
             self.assertEqual(int(out.get("fallback_age_s", -1)), 50)
             stale = pt_markets._cached_status_fallback(path, max_age_s=10.0, now_ts=200)
             self.assertEqual(stale, {})
+
+    def test_effective_market_cycle_interval_expands_for_overrun(self) -> None:
+        settings = {
+            "market_scan_overrun_interval_mult": 1.10,
+            "market_scan_overrun_min_pause_s": 1.0,
+        }
+        fast = pt_markets._effective_market_cycle_interval(12.0, 6.0, settings, market="stocks")
+        slow = pt_markets._effective_market_cycle_interval(12.0, 121.0, settings, market="stocks")
+        self.assertEqual(float(fast), 12.0)
+        self.assertGreaterEqual(float(slow), 133.0)
+
+    def test_sync_loop_phase_prefers_oldest_active_worker(self) -> None:
+        loop_status = {
+            "workers": {
+                "stocks": {"active": True, "phase": "stocks_scan", "phase_started_ts": 100, "phase_detail": "stocks_cycle"},
+                "forex": {"active": True, "phase": "forex_scan", "phase_started_ts": 120, "phase_detail": "forex_cycle"},
+            }
+        }
+        pt_markets._sync_loop_phase(loop_status)
+        self.assertEqual(str(loop_status.get("phase", "")), "stocks_scan")
+        self.assertEqual(int(loop_status.get("phase_started_ts", -1) or -1), 100)
+        self.assertEqual(str(loop_status.get("phase_detail", "")), "stocks_cycle")
 
 
 if __name__ == "__main__":

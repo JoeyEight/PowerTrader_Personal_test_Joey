@@ -524,6 +524,26 @@ def _append_reason_parts(row: Dict[str, Any], logic: str = "", data: str = "") -
     row["reason"] = cur_logic if cur_logic else cur_data
 
 
+def _live_guarded_entry_gate_reason(settings: Dict[str, Any], row: Dict[str, Any]) -> str:
+    stage = str(settings.get("market_rollout_stage", "legacy") or "legacy").strip().lower()
+    if stage != "live_guarded":
+        return ""
+    pair = str(row.get("pair", "") or "").strip().upper()
+    if not pair:
+        return ""
+    sample_count = int(float(row.get("samples", 0) or 0))
+    min_samples_guarded = max(0, int(float(settings.get("forex_min_samples_live_guarded", 5) or 5)))
+    if sample_count < min_samples_guarded:
+        return f"Calibration sample gate for {pair} ({sample_count} < {min_samples_guarded})"
+    calib_prob = float(row.get("calib_prob", 0.0) or 0.0)
+    if calib_prob <= 0.0:
+        calib_prob = 0.5
+    min_calib_prob = max(0.0, min(1.0, float(settings.get("forex_min_calib_prob_live_guarded", 0.56) or 0.56)))
+    if calib_prob < min_calib_prob:
+        return f"Calibrated confidence gate for {pair} ({calib_prob:.2f} < {min_calib_prob:.2f})"
+    return ""
+
+
 def _append_jsonl(path: str, row: Dict[str, Any]) -> None:
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1199,6 +1219,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         exec_n = max(6, int(len(ranked_health) * 0.40))
         exec_bucket = {str(r.get("pair", "")).strip().upper() for r in ranked_health[:exec_n]}
         for row in scored:
+            row["entry_gate_reason"] = ""
             row["eligible_for_entry"] = str(row.get("pair", "")).strip().upper() in exec_bucket
             if not row["eligible_for_entry"]:
                 _append_reason_parts(
@@ -1215,10 +1236,24 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     logic="Entry paused around nearby high-impact macro event",
                     data=f"event window block | severity {str(row.get('event_risk_severity', 'none')).upper()}",
                 )
+            elif str(row.get("side", "watch") or "watch").strip().lower() in {"long", "short"}:
+                entry_gate_reason = _live_guarded_entry_gate_reason(settings, row)
+                if entry_gate_reason:
+                    row["eligible_for_entry"] = False
+                    row["entry_gate_reason"] = entry_gate_reason
+                    row["side"] = "watch"
+                    _append_reason_parts(
+                        row,
+                        logic="Calibration history insufficient for live_guarded entry; hold as watch",
+                        data=entry_gate_reason,
+                    )
             row["leader_rank_score"] = round(_leader_rank_score(row), 6)
         leaders = sorted(
             scored,
-            key=lambda r: float(r.get("leader_rank_score", abs(float(r.get("score", 0.0) or 0.0))) or 0.0),
+            key=lambda r: (
+                1 if bool(r.get("eligible_for_entry", False)) else 0,
+                float(r.get("leader_rank_score", abs(float(r.get("score", 0.0) or 0.0))) or 0.0),
+            ),
             reverse=True,
         )[:10]
         event_risk_active_count = int(sum(1 for row in scored if bool((row or {}).get("event_risk_active", False))))

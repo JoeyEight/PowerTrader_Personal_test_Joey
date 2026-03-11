@@ -26,7 +26,6 @@ class TestPreflightReadiness(unittest.TestCase):
         self._touch(os.path.join(base_dir, "engines", "pt_trader.py"))
         self._touch(os.path.join(base_dir, "runtime", "pt_markets.py"))
         self._touch(os.path.join(base_dir, "runtime", "pt_autopilot.py"))
-        self._touch(os.path.join(base_dir, "runtime", "pt_autofix.py"))
 
     def test_report_passes_without_critical_issues(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -122,13 +121,12 @@ class TestPreflightReadiness(unittest.TestCase):
             self.assertIn("stocks_cred_runtime_mismatch", codes)
             self.assertIn("forex_cred_runtime_mismatch", codes)
 
-    def test_report_warns_when_ai_assist_key_missing(self) -> None:
+    def test_report_does_not_require_openai_key(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             self._seed_script_paths(td)
             self._write_json(
                 os.path.join(td, "gui_settings.json"),
                 {
-                    "autofix_enabled": True,
                     "stock_auto_trade_enabled": False,
                     "forex_auto_trade_enabled": False,
                     "market_rollout_stage": "shadow_only",
@@ -138,7 +136,7 @@ class TestPreflightReadiness(unittest.TestCase):
                 out = build_preflight_report(td, now_ts=1_700_000_000)
             issues = list(out.get("issues", []) or [])
             codes = {str(i.get("code", "")) for i in issues}
-            self.assertIn("autofix_openai_key_missing", codes)
+            self.assertNotIn("autofix_openai_key_missing", codes)
 
     def test_report_flags_endpoint_mode_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as td:

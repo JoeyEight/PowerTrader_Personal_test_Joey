@@ -32,8 +32,6 @@ class TestSmokeHarnessIntegration(unittest.TestCase):
                 smoke_test_all, "run_forex_step", return_value={"state": "READY", "msg": "step ok"}
             ), patch.object(
                 smoke_test_all, "run_autopilot_once", return_value={"stable_cycles": 5, "api_unstable": False, "changes": {}}
-            ), patch.object(
-                smoke_test_all, "run_autofix_once", return_value={"enabled": True, "mode": "report_only", "tickets_created": 0}
             ):
                 rc = smoke_test_all.main()
                 self.assertEqual(rc, 0)
@@ -47,9 +45,7 @@ class TestSmokeHarnessIntegration(unittest.TestCase):
             self.assertIn("stock_scan", report.get("steps", {}))
             self.assertIn("forex_scan", report.get("steps", {}))
             self.assertIn("autopilot", report.get("steps", {}))
-            self.assertIn("autofix", report.get("steps", {}))
             self.assertIn("runtime_state", report.get("files", {}))
-            self.assertIn("autofix_status", report.get("files", {}))
             self.assertIn("market_loop_status", report.get("files", {}))
             self.assertIn("scanner_cadence_drift", report.get("files", {}))
             self.assertIn("stock_universe_quality", report.get("files", {}))
@@ -77,8 +73,6 @@ class TestSmokeHarnessIntegration(unittest.TestCase):
                 smoke_test_all, "run_forex_step", return_value={"state": "READY", "msg": "step ok"}
             ), patch.object(
                 smoke_test_all, "run_autopilot_once", return_value={"stable_cycles": 1, "api_unstable": False, "changes": {}}
-            ), patch.object(
-                smoke_test_all, "run_autofix_once", return_value={"enabled": True, "mode": "report_only", "tickets_created": 0}
             ):
                 rc = smoke_test_all.main()
                 self.assertEqual(rc, 1)
