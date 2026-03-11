@@ -5,6 +5,7 @@ import json
 import csv
 import time
 import math
+import traceback
 import textwrap
 import queue
 import threading
@@ -18,6 +19,12 @@ import re
 import hashlib
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
+if __package__ in (None, ""):
+    _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _ROOT not in sys.path:
+        sys.path.insert(0, _ROOT)
+
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -27,6 +34,7 @@ from matplotlib.patches import Rectangle
 from matplotlib.ticker import FuncFormatter
 from matplotlib.transforms import blended_transform_factory
 from app.path_utils import resolve_runtime_paths, resolve_settings_path, read_settings_file, log_once
+from app.runtime_logging import append_jsonl, runtime_event
 from app.rejection_replay import build_rejection_replay_report
 from app.operator_notes import (
     append_operator_note_entry,
@@ -38,7 +46,9 @@ from app.operator_notes import (
 from app.settings_utils import sanitize_settings
 from app.live_mode_guard import evaluate_live_mode_checklist
 from app.market_awareness import build_awareness_payload
-from app.status_hydration import load_market_status_bundle
+from app.health_rules import evaluate_runtime_alerts
+from app.notification_center import build_notification_center_from_hub
+from app.status_hydration import load_market_status_bundle, needs_market_snapshot_refresh
 from app.api_endpoint_validation import (
     ALPACA_DATA_HOST,
     ALPACA_LIVE_HOST,
@@ -77,29 +87,6 @@ DARK_ACCENT = "#00FF66"
 DARK_ACCENT2 = "#00E5FF"   
 DARK_SELECT_BG = "#17324A"
 DARK_SELECT_FG = "#00FF66"
-AUTOFIX_REQUEST_MAX_CHARS = 8000
-AUTOFIX_CHAT_TEMPLATES: Dict[str, str] = {
-    "UI Layout parity": (
-        "Update the Stocks and Forex charts to match Crypto UX behavior.\n"
-        "Keep existing visual style, improve resize handling, and include tests."
-    ),
-    "Scanner reliability": (
-        "Investigate scanner reliability issues.\n"
-        "Analyze logs and improve fallback handling with minimal risk."
-    ),
-    "Execution explainability": (
-        "Improve execution rationale on dashboard.\n"
-        "Show plain-language reason first and detailed metrics on hover/tooltips."
-    ),
-    "Performance pass": (
-        "Run a focused performance pass on this feature.\n"
-        "Reduce unnecessary redraws and avoid blocking UI operations."
-    ),
-    "Error recovery": (
-        "Improve error recovery and user feedback for this workflow.\n"
-        "Add clear remediation guidance and safe retry behavior."
-    ),
-}
 BADGE_STYLES: Dict[str, Tuple[str, str, str]] = {
     "good": ("#0F2B1D", "#6CFFB0", "#1E5A3C"),
     "warn": ("#2C2312", "#FFD27A", "#6A5324"),
@@ -108,6 +95,41 @@ BADGE_STYLES: Dict[str, Tuple[str, str, str]] = {
     "muted": ("#141B28", "#A7B4C4", "#2A3A52"),
 }
 BASE_DIR, SETTINGS_PATH, DEFAULT_HUB_DATA_DIR, _BOOT_SETTINGS = resolve_runtime_paths(__file__, "pt_hub")
+
+ROLLOUT_ORDER: Dict[str, int] = {
+    "legacy": 0,
+    "scan_expanded": 1,
+    "risk_caps": 2,
+    "execution_v2": 3,
+    "shadow_only": 4,
+    "live_guarded": 5,
+}
+
+
+def _normalize_rollout_stage(stage: str, default: str = "legacy") -> str:
+    cur = str(stage or "").strip().lower()
+    if cur not in ROLLOUT_ORDER:
+        cur = str(default or "legacy").strip().lower()
+    if cur not in ROLLOUT_ORDER:
+        cur = "legacy"
+    return cur
+
+
+def _resolve_rollout_stage_for_broker_modes(stage: str, alpaca_paper_mode: bool, oanda_practice_mode: bool) -> Tuple[str, str]:
+    cur = _normalize_rollout_stage(stage)
+    original = cur
+    live_markets: List[str] = []
+    if not bool(alpaca_paper_mode):
+        live_markets.append("Stocks/Alpaca")
+    if not bool(oanda_practice_mode):
+        live_markets.append("Forex/OANDA")
+    if live_markets and int(ROLLOUT_ORDER.get(cur, 0)) < int(ROLLOUT_ORDER["execution_v2"]):
+        cur = "live_guarded"
+    elif live_markets and cur == "shadow_only":
+        cur = "live_guarded"
+    if live_markets and cur != original:
+        return cur, "Live broker mode requires an executable rollout stage. Auto-promoted rollout to live_guarded."
+    return cur, ""
 
 
 @dataclass
@@ -412,21 +434,6 @@ DEFAULT_SETTINGS = {
     "crypto_trader_loop_sleep_s": 1.0,
     "crypto_trader_error_sleep_s": 1.5,
     "script_autopilot": "runtime/pt_autopilot.py",
-    "script_autofix": "runtime/pt_autofix.py",
-    "autofix_enabled": True,
-    "autofix_mode": "report_only",  # report_only | manual | shadow_apply
-    "autofix_allow_live_apply": False,
-    "autofix_poll_interval_s": 45.0,
-    "autofix_max_fixes_per_day": 2,
-    "autofix_model": "gpt-5-mini",
-    "autofix_api_base": "https://api.openai.com/v1",
-    "autofix_request_timeout_s": 25.0,
-    "autofix_test_command": "python -m unittest tests.test_settings_sanitize tests.test_runner_watchdog",
-    "autofix_request_block_on_quota": True,
-    "autofix_request_block_on_missing_key": True,
-    "autofix_request_block_on_bad_request": True,
-    "autofix_request_block_on_invalid_output": True,
-    "autofix_request_block_on_no_patch": True,
     "kucoin_min_interval_sec": 0.40,
     "kucoin_cache_ttl_sec": 2.5,
     "kucoin_stale_max_sec": 120.0,
@@ -2326,6 +2333,7 @@ class AccountValueChart(ttk.Frame):
         # --- Trade dots (BUY / DCA / SELL) for ALL coins ---
         try:
             trades = _read_trade_history_jsonl(self.trade_history_path) if self.trade_history_path else []
+            plotted_trade_points = []
             if trades:
                 ts_list = [float(p[0]) for p in points]  # matches xs/ys indices
                 t_min = ts_list[0]
@@ -2539,11 +2547,13 @@ class PowerTraderHub(tk.Tk):
         self.operator_notes_md_path = os.path.join(self.hub_dir, "operator_notes.md")
         self.operator_notes_log_path = os.path.join(self.hub_dir, "operator_notes_log.jsonl")
         self.rejection_replay_path = os.path.join(self.hub_dir, "rejection_replay.json")
+        self.runtime_state_path = os.path.join(self.hub_dir, "runtime_state.json")
         self.ui_layout_state_path = os.path.join(self.hub_dir, "ui_layout_state.json")
         self.runner_logs_dir = os.path.join(self.hub_dir, "logs")
         _ensure_dir(self.runner_logs_dir)
         ensure_operator_notes_files(self.hub_dir)
-        self.runner_log_path = os.path.join(self.runner_logs_dir, "runner.log")
+        self.runner_log_path = os.path.join(self.runner_logs_dir, "thinker.log")
+        self.supervisor_log_path = os.path.join(self.runner_logs_dir, "runner.log")
         self.runner_launch_log_path = os.path.join(self.runner_logs_dir, "runner_ui_launch.log")
         self.trader_log_path = os.path.join(self.runner_logs_dir, "trader.log")
         self.market_state_dirs = {
@@ -2582,12 +2592,8 @@ class PowerTraderHub(tk.Tk):
         # file written by pt_thinker.py (runner readiness gate used for Start All)
         self.runner_ready_path = os.path.join(self.hub_dir, "runner_ready.json")
         self.autopilot_status_path = os.path.join(self.hub_dir, "autopilot_status.json")
-        self.autofix_status_path = os.path.join(self.hub_dir, "autofix_status.json")
-        self.autofix_state_path = os.path.join(self.hub_dir, "autofix_state.json")
-        self.autofix_dir = os.path.join(self.hub_dir, "autofix")
-        self.autofix_tickets_dir = os.path.join(self.autofix_dir, "tickets")
-        self.autofix_patches_dir = os.path.join(self.autofix_dir, "patches")
-        self.autofix_script_path = os.path.abspath(os.path.join(self.project_dir, "runtime", "pt_autofix.py"))
+        self.incidents_path = os.path.join(self.hub_dir, "incidents.jsonl")
+        self.runtime_events_path = os.path.join(self.hub_dir, "runtime_events.jsonl")
         self.user_action_required_path = os.path.join(self.hub_dir, "user_action_required.json")
         self.runtime_startup_checks_path = os.path.join(self.hub_dir, "runtime_startup_checks.json")
         self.onboarding_state_path = os.path.join(self.hub_dir, "onboarding_state.json")
@@ -2597,18 +2603,15 @@ class PowerTraderHub(tk.Tk):
             self._while_you_were_gone_previous = {}
         self._while_you_were_gone_shown = False
         self._settings_win: Optional[tk.Toplevel] = None
-        self._autofix_win: Optional[tk.Toplevel] = None
         self._operator_notes_win: Optional[tk.Toplevel] = None
         self._operator_notes_ui: Dict[str, Any] = {}
         self._replay_win: Optional[tk.Toplevel] = None
         self._replay_ui: Dict[str, Any] = {}
         self._replay_busy = False
-        self._autofix_queue_ui: Dict[str, Any] = {}
         self._manual_order_queue_win: Optional[tk.Toplevel] = None
         self._manual_order_queue_ui: Dict[str, Any] = {}
-        self._autofix_apply_busy = False
-        self._autofix_request_busy = False
         self._invalid_credentials_route_done = False
+        self._ui_incident_cooldowns: Dict[str, float] = {}
 
 
         # internal: when Start All is pressed, we start the runner first and only start the trader once ready
@@ -3178,7 +3181,6 @@ class PowerTraderHub(tk.Tk):
             self.bind_all("<Control-e>", lambda _e: self._export_trade_history_csv())
             self.bind_all("<Control-Shift-E>", lambda _e: self._export_active_chart_png())
             self.bind_all("<Control-Shift-S>", lambda _e: self._export_market_status_snapshot_json())
-            self.bind_all("<Control-Shift-A>", lambda _e: self.open_autofix_queue())
             self.bind_all("<Control-Shift-N>", lambda _e: self._open_operator_notes_editor())
             self.bind_all("<Control-Shift-R>", lambda _e: self._run_rejection_replay("both"))
             self.bind_all("<Control-d>", lambda _e: self._export_diagnostics_bundle())
@@ -3377,7 +3379,6 @@ class PowerTraderHub(tk.Tk):
             ("stop_trades", "Stop Trades"),
             ("open_settings", "Open Settings"),
             ("open_operator_notes", "Open Operator Notes"),
-            ("open_ai_assist", "Open AI Assist"),
             ("open_alerts", "Open Alerts"),
             ("open_diagnostics", "Run Quick Diagnostics"),
             ("run_rejection_replay", "Run Rejection Replay"),
@@ -3443,8 +3444,6 @@ class PowerTraderHub(tk.Tk):
                     self.stop_all_scripts()
                 elif cmd == "open_settings":
                     self.open_settings_dialog()
-                elif cmd == "open_ai_assist":
-                    self.open_autofix_queue()
                 elif cmd == "open_operator_notes":
                     self._open_operator_notes_editor()
                 elif cmd == "open_alerts":
@@ -3506,19 +3505,403 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
 
+    def _active_market_key(self) -> str:
+        nb = getattr(self, "market_nb", None)
+        if nb is None:
+            return "crypto"
+        try:
+            label = str(nb.tab(nb.select(), "text") or "Crypto").strip().lower()
+        except Exception:
+            label = "crypto"
+        if label == "stocks":
+            return "stocks"
+        if label == "forex":
+            return "forex"
+        return "crypto"
+
+    def _refresh_active_market_context(self) -> None:
+        try:
+            runtime = self._read_runner_status()
+            runtime_state = str(runtime.get("state", "STOPPED") or "STOPPED").upper().strip()
+            neural_running = bool(runtime.get("thinker_pid", None))
+            trader_running = bool(runtime.get("trader_pid", None))
+            gate_symbols = [str(c or "").strip().upper() for c in list(self.coins or []) if str(c or "").strip()]
+            gate_status = self._training_status_map(gate_symbols)
+            all_trained = all(v == "TRAINED" for v in gate_status.values()) if gate_status else False
+            can_toggle_all = True
+            if (not all_trained) and (not neural_running) and (not trader_running) and (not self._auto_start_trader_pending):
+                can_toggle_all = False
+            runtime_snapshot = _safe_read_json(self._runtime_state_file_path()) or {}
+            self._update_global_command_bar(
+                runtime_state=runtime_state,
+                neural_running=neural_running,
+                trader_running=trader_running,
+                runtime_snapshot=runtime_snapshot,
+                can_toggle=can_toggle_all,
+            )
+            ui = getattr(self, "_notification_ui", {}) if isinstance(getattr(self, "_notification_ui", {}), dict) else {}
+            market_var = ui.get("market_var")
+            refresh_fn = ui.get("refresh")
+            if callable(refresh_fn) and hasattr(market_var, "get"):
+                if str(market_var.get() or "").strip().lower() == "current tab":
+                    refresh_fn(False)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _market_display_name(market_key: str) -> str:
+        key = str(market_key or "").strip().lower()
+        if key == "stocks":
+            return "Stocks"
+        if key == "forex":
+            return "Forex"
+        if key == "crypto":
+            return "Crypto"
+        if key == "ai_assist":
+            return "AI_Assist"
+        if key == "global":
+            return "Global"
+        return (key or "Global").title()
+
+    @staticmethod
+    def _normalize_alert_severity(value: Any) -> str:
+        txt = str(value or "").strip().lower()
+        if txt in {"critical", "error", "high"}:
+            return "critical"
+        if txt in {"warning", "warn", "medium"}:
+            return "warning"
+        if txt in {"ok", "none", "low"}:
+            return "ok"
+        return "info"
+
+    def _markets_for_global_alert(self, reason: str, runtime_snapshot: Dict[str, Any]) -> List[str]:
+        snap = runtime_snapshot if isinstance(runtime_snapshot, dict) else {}
+        key = str(reason or "").strip().lower()
+        all_markets = ["crypto", "stocks", "forex"]
+        if key in {
+            "startup_checks_failed",
+            "startup_warnings",
+            "api_unstable",
+            "key_rotation_due",
+            "drawdown_guard_triggered",
+            "stop_flag_active",
+            "notification_center_critical",
+        }:
+            return all_markets
+
+        if key in {"cadence_drift_pressure", "market_loop_stale"}:
+            scan_cadence = snap.get("scan_cadence", {}) if isinstance(snap.get("scan_cadence", {}), dict) else {}
+            active = scan_cadence.get("active", []) if isinstance(scan_cadence.get("active", []), list) else []
+            out: List[str] = []
+            for row in active:
+                if not isinstance(row, dict):
+                    continue
+                market = str(row.get("market", "") or "").strip().lower()
+                if market in {"stocks", "forex"} and market not in out:
+                    out.append(market)
+            return out or ["stocks", "forex"]
+
+        if key == "shadow_scorecard_blocked":
+            stage = str((self.settings if isinstance(getattr(self, "settings", {}), dict) else {}).get("market_rollout_stage", "legacy") or "legacy").strip().lower()
+            if stage in {"execution_v2", "live_guarded"}:
+                return []
+            scorecards = snap.get("shadow_scorecards", {}) if isinstance(snap.get("shadow_scorecards", {}), dict) else {}
+            out: List[str] = []
+            for market in ("stocks", "forex"):
+                row = scorecards.get(market, {}) if isinstance(scorecards.get(market, {}), dict) else {}
+                gate = str(row.get("promotion_gate", "") or "").strip().upper()
+                if gate == "BLOCK":
+                    out.append(market)
+            return out
+
+        if key == "exposure_concentration":
+            exposure = snap.get("exposure_map", {}) if isinstance(snap.get("exposure_map", {}), dict) else {}
+            top_positions = exposure.get("top_positions", []) if isinstance(exposure.get("top_positions", []), list) else []
+            if top_positions and isinstance(top_positions[0], dict):
+                market = str(top_positions[0].get("market", "") or "").strip().lower()
+                if market in {"crypto", "stocks", "forex"}:
+                    return [market]
+            by_market_pct = exposure.get("by_market_pct", {}) if isinstance(exposure.get("by_market_pct", {}), dict) else {}
+            out: List[str] = []
+            for market, pct in by_market_pct.items():
+                try:
+                    pct_val = float(pct or 0.0)
+                except Exception:
+                    pct_val = 0.0
+                market_key = str(market or "").strip().lower()
+                if market_key in {"crypto", "stocks", "forex"} and pct_val > 0.0:
+                    out.append(market_key)
+            return out
+
+        if key == "execution_temporarily_disabled":
+            now_ts = int(snap.get("ts", 0) or 0)
+            guard = snap.get("execution_guard", {}) if isinstance(snap.get("execution_guard", {}), dict) else {}
+            markets = guard.get("markets", {}) if isinstance(guard.get("markets", {}), dict) else {}
+            out: List[str] = []
+            for market, row in markets.items():
+                if not isinstance(row, dict):
+                    continue
+                market_key = str(market or "").strip().lower()
+                if market_key not in {"stocks", "forex", "crypto"}:
+                    continue
+                try:
+                    disabled_until = int(row.get("disabled_until", 0) or 0)
+                except Exception:
+                    disabled_until = 0
+                if disabled_until > now_ts:
+                    out.append(market_key)
+            return out
+
+        if key in {"scan_reject_pressure", "scanner_reject_spike", "error_incidents"}:
+            out: List[str] = []
+            notification_center = snap.get("notification_center", {}) if isinstance(snap.get("notification_center", {}), dict) else {}
+            items = notification_center.get("items", []) if isinstance(notification_center.get("items", []), list) else []
+            for row in items:
+                if not isinstance(row, dict):
+                    continue
+                market = str(row.get("market", "") or "").strip().lower()
+                sev = self._normalize_alert_severity(row.get("severity", "info"))
+                if market in {"crypto", "stocks", "forex"} and sev in {"critical", "warning"} and market not in out:
+                    out.append(market)
+            return out
+
+        return all_markets
+
+    def _notification_item_applies_to_market(
+        self,
+        row: Dict[str, Any],
+        market_key: str,
+        runtime_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if not isinstance(row, dict):
+            return False
+        selected = str(market_key or "").strip().lower()
+        if selected not in {"crypto", "stocks", "forex"}:
+            return True
+        market = str(row.get("market", "global") or "global").strip().lower()
+        if market == selected:
+            return True
+        if market != "global":
+            return False
+        source = str(row.get("source", "") or "").strip().lower()
+        title = str(row.get("title", "") or "").strip()
+        if source == "runtime_alerts" and title:
+            affected = self._markets_for_global_alert(title, runtime_snapshot if isinstance(runtime_snapshot, dict) else {})
+            return selected in affected
+        return True
+
+    def _scoped_notification_items(
+        self,
+        runtime_snapshot: Optional[Dict[str, Any]],
+        market_key: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        snap = runtime_snapshot if isinstance(runtime_snapshot, dict) else {}
+        try:
+            nc = self._notification_payload()
+        except Exception:
+            nc = {}
+        items = nc.get("items", []) if isinstance(nc.get("items", []), list) else []
+        if not items:
+            nc = snap.get("notification_center", {}) if isinstance(snap.get("notification_center", {}), dict) else {}
+            items = nc.get("items", []) if isinstance(nc.get("items", []), list) else []
+        selected = str(market_key or self._active_market_key() or "crypto").strip().lower()
+        return [
+            row
+            for row in items
+            if isinstance(row, dict) and self._notification_item_applies_to_market(row, selected, snap)
+        ]
+
+    def _resolve_notification_market_filter(self, market_filter: Optional[str] = None) -> str:
+        value = str(market_filter or "").strip().lower()
+        if value == "":
+            return "all"
+        if value == "current tab":
+            return self._active_market_key()
+        if value in {"all", "global", "stocks", "forex", "crypto", "ai_assist"}:
+            return value
+        normalized = value.replace(" ", "_")
+        if normalized in {"all", "global", "stocks", "forex", "crypto", "ai_assist"}:
+            return normalized
+        return self._active_market_key()
+
+    def _filtered_notification_items(
+        self,
+        runtime_snapshot: Optional[Dict[str, Any]],
+        payload: Optional[Dict[str, Any]],
+        market_filter: Optional[str],
+        severity_filter: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        snap = runtime_snapshot if isinstance(runtime_snapshot, dict) else {}
+        payload_row = payload if isinstance(payload, dict) else {}
+        resolved_market = self._resolve_notification_market_filter(market_filter)
+        severity_value = str(severity_filter or "all").strip().lower()
+        if resolved_market in {"stocks", "forex", "crypto"}:
+            items = self._scoped_notification_items(snap, resolved_market)
+        else:
+            items = payload_row.get("items", []) if isinstance(payload_row.get("items", []), list) else []
+        out: List[Dict[str, Any]] = []
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            market = str(row.get("market", "global") or "global").strip().lower()
+            severity = str(row.get("severity", "info") or "info").strip().lower()
+            if resolved_market not in {"all", "stocks", "forex", "crypto"} and market != resolved_market:
+                continue
+            if severity_value != "all" and severity != severity_value:
+                continue
+            out.append(row)
+        return out
+
+    def _notification_empty_state_text(
+        self,
+        runtime_snapshot: Optional[Dict[str, Any]],
+        market_filter: Optional[str],
+        severity_filter: Optional[str] = None,
+    ) -> str:
+        resolved_market = self._resolve_notification_market_filter(market_filter)
+        severity_value = str(severity_filter or "all").strip().lower()
+        if resolved_market in {"stocks", "forex", "crypto"}:
+            scoped = self._scoped_alert_snapshot(runtime_snapshot, resolved_market)
+            reasons = [str(x or "").strip() for x in list(scoped.get("reasons", []) or []) if str(x or "").strip()]
+            hints = [str(x or "").strip() for x in list(scoped.get("hints", []) or []) if str(x or "").strip()]
+            sev = str(scoped.get("severity", "ok") or "ok").strip().upper()
+            title = self._market_display_name(resolved_market)
+            lines = [f"{title} alerts: {sev}"]
+            if severity_value != "all":
+                lines.append(f"Severity filter: {severity_value.upper()}")
+            if reasons:
+                lines.append(f"Top reasons: {', '.join(reasons[:4])}")
+            if hints:
+                lines.append(f"Latest detail: {hints[0]}")
+            else:
+                lines.append("No notifications matched the current filter.")
+            return "\n".join(lines)
+        scope_label = "All markets" if resolved_market == "all" else self._market_display_name(resolved_market)
+        if severity_value != "all":
+            return f"{scope_label}: no {severity_value.upper()} notifications matched the current filter."
+        return f"{scope_label}: no notifications matched the current filter."
+
+    def _scoped_alert_snapshot(
+        self,
+        runtime_snapshot: Optional[Dict[str, Any]],
+        market_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        snap = runtime_snapshot if isinstance(runtime_snapshot, dict) else {}
+        selected = str(market_key or self._active_market_key() or "crypto").strip().lower()
+        items = self._scoped_notification_items(snap, selected)
+        by_sev = {"critical": 0, "warning": 0, "info": 0}
+        reasons: List[str] = []
+        hints: List[str] = []
+        seen = set()
+        for row in items:
+            sev = self._normalize_alert_severity(row.get("severity", "info"))
+            if sev not in by_sev:
+                sev = "info"
+            by_sev[sev] = int(by_sev.get(sev, 0) or 0) + 1
+            if sev not in {"critical", "warning"}:
+                continue
+            title = str(row.get("title", "") or "").strip()
+            if title and title not in seen:
+                reasons.append(title)
+                seen.add(title)
+            msg = str(row.get("message", "") or "").strip()
+            if msg:
+                hints.append(msg)
+
+        severity = "ok"
+        if by_sev["critical"] > 0:
+            severity = "critical"
+        elif by_sev["warning"] > 0:
+            severity = "warning"
+        elif by_sev["info"] > 0:
+            severity = "info"
+
+        alerts = snap.get("alerts", {}) if isinstance(snap.get("alerts", {}), dict) else {}
+        raw_reasons = [str(x or "").strip() for x in list(alerts.get("reasons", []) or []) if str(x or "").strip()]
+        quickfix_src = [str(x or "").strip() for x in list(alerts.get("quickfix_suggestions", []) or []) if str(x or "").strip()]
+        runbook_src = list(alerts.get("runbook_links", []) or []) if isinstance(alerts.get("runbook_links", []), list) else []
+        quickfix: List[str] = []
+        runbooks: List[Dict[str, str]] = []
+        for idx, reason in enumerate(raw_reasons):
+            if reason not in reasons:
+                continue
+            if idx < len(quickfix_src):
+                tip = quickfix_src[idx]
+                if tip and tip not in quickfix:
+                    quickfix.append(tip)
+            for row in runbook_src:
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("reason", "") or "").strip() != reason:
+                    continue
+                if row not in runbooks:
+                    runbooks.append(row)
+
+        return {
+            "market": selected,
+            "severity": severity,
+            "reasons": reasons,
+            "hints": hints,
+            "quickfix_suggestions": quickfix,
+            "runbook_links": runbooks,
+            "by_severity": by_sev,
+            "items": items,
+        }
+
+    def _runtime_state_file_path(self) -> str:
+        state = self.__dict__ if isinstance(getattr(self, "__dict__", None), dict) else {}
+        direct = str(state.get("runtime_state_path", "") or "").strip()
+        if direct:
+            return direct
+        hub_dir = str(state.get("hub_dir", DEFAULT_HUB_DATA_DIR) or DEFAULT_HUB_DATA_DIR).strip()
+        return os.path.join(hub_dir, "runtime_state.json")
+
     def _notification_payload(self) -> Dict[str, Any]:
         path = os.path.join(self.hub_dir, "notification_center.json")
+        runtime_snapshot = _safe_read_json(self._runtime_state_file_path()) or {}
+        has_live_runtime = isinstance(runtime_snapshot, dict) and any(
+            key in runtime_snapshot for key in ("ts", "alerts", "market_trends", "scan_cadence", "shadow_scorecards", "exposure_map")
+        )
+        if has_live_runtime:
+            try:
+                live_runtime = dict(runtime_snapshot)
+                live_runtime["alerts"] = evaluate_runtime_alerts(
+                    live_runtime,
+                    sanitize_settings(dict(self.settings) if isinstance(getattr(self, "settings", {}), dict) else {}, defaults=DEFAULT_SETTINGS),
+                )
+                rebuilt = build_notification_center_from_hub(self.hub_dir, runtime_state=live_runtime)
+                if isinstance(rebuilt, dict):
+                    return rebuilt
+            except Exception:
+                pass
         row = _safe_read_json(path) or {}
         if isinstance(row, dict) and row:
             return row
-        runtime_snapshot = _safe_read_json(self.runtime_state_path) or {}
         nc = runtime_snapshot.get("notification_center", {}) if isinstance(runtime_snapshot.get("notification_center", {}), dict) else {}
         return nc if isinstance(nc, dict) else {}
 
-    def open_notification_center(self) -> None:
+    def open_notification_center(self, initial_market: Optional[str] = None) -> None:
+        requested_initial_market = initial_market if initial_market is not None else "all"
+        resolved_initial_market = self._resolve_notification_market_filter(requested_initial_market)
+        initial_market_label = (
+            "All" if resolved_initial_market == "all" else self._market_display_name(resolved_initial_market)
+        )
         existing = getattr(self, "_notification_win", None)
         try:
             if existing is not None and existing.winfo_exists():
+                ui = getattr(self, "_notification_ui", {}) if isinstance(getattr(self, "_notification_ui", {}), dict) else {}
+                market_var = ui.get("market_var")
+                refresh_fn = ui.get("refresh")
+                if hasattr(market_var, "set"):
+                    try:
+                        market_var.set(initial_market_label)
+                    except Exception:
+                        pass
+                    if callable(refresh_fn):
+                        try:
+                            refresh_fn(False)
+                        except Exception:
+                            pass
                 existing.lift()
                 existing.focus_set()
                 return
@@ -3536,8 +3919,14 @@ class PowerTraderHub(tk.Tk):
         top = ttk.Frame(win)
         top.pack(fill="x", padx=8, pady=(8, 4))
         ttk.Label(top, text="Market:").pack(side="left")
-        market_var = tk.StringVar(value="All")
-        market_combo = ttk.Combobox(top, textvariable=market_var, values=["All", "Global", "Stocks", "Forex", "Crypto", "AI_Assist"], width=12, state="readonly")
+        market_var = tk.StringVar(value=initial_market_label)
+        market_combo = ttk.Combobox(
+            top,
+            textvariable=market_var,
+            values=["Current Tab", "All", "Global", "Stocks", "Forex", "Crypto", "AI_Assist"],
+            width=12,
+            state="readonly",
+        )
         market_combo.pack(side="left", padx=(6, 8))
         ttk.Label(top, text="Severity:").pack(side="left")
         severity_var = tk.StringVar(value="All")
@@ -3585,39 +3974,54 @@ class PowerTraderHub(tk.Tk):
                 pass
 
         def _refresh(_from_timer: bool = False) -> None:
-            payload = self._notification_payload()
-            items = payload.get("items", []) if isinstance(payload.get("items", []), list) else []
-            market_filter = str(market_var.get() or "All").strip().lower()
-            severity_filter = str(severity_var.get() or "All").strip().lower()
-            tree.delete(*tree.get_children())
-            kept = 0
-            for row in items:
-                if not isinstance(row, dict):
-                    continue
-                market = str(row.get("market", "global") or "global").strip().lower()
-                severity = str(row.get("severity", "info") or "info").strip().lower()
-                if market_filter != "all" and market != market_filter:
-                    continue
-                if severity_filter != "all" and severity != severity_filter:
-                    continue
-                ts = int(float(row.get("ts", 0) or 0))
-                ts_label = self._format_ui_timestamp(ts)
-                values = (
-                    ts_label,
-                    market.upper(),
-                    severity.upper(),
-                    str(row.get("source", "") or ""),
-                    str(row.get("title", "") or ""),
-                    str(row.get("message", "") or ""),
-                )
-                iid = str(row.get("id", "") or f"note_{kept}_{ts}")
-                tree.insert("", "end", iid=iid, values=values)
-                kept += 1
-                if kept >= 300:
-                    break
-            status_var.set(f"{kept} notifications shown")
-            if kept <= 0:
-                _set_detail("No notifications matched the current filter.")
+            try:
+                runtime_snapshot = _safe_read_json(self._runtime_state_file_path()) or {}
+                payload = self._notification_payload()
+                market_filter = str(market_var.get() or initial_market_label).strip()
+                severity_filter = str(severity_var.get() or "All").strip().lower()
+                resolved_market = self._resolve_notification_market_filter(market_filter)
+                items = self._filtered_notification_items(runtime_snapshot, payload, market_filter, severity_filter)
+                tree.delete(*tree.get_children())
+                kept = 0
+                for row in items:
+                    if not isinstance(row, dict):
+                        continue
+                    market = str(row.get("market", "global") or "global").strip().lower()
+                    severity = str(row.get("severity", "info") or "info").strip().lower()
+                    ts = int(float(row.get("ts", 0) or 0))
+                    ts_label = self._format_ui_timestamp(ts)
+                    values = (
+                        ts_label,
+                        market.upper(),
+                        severity.upper(),
+                        str(row.get("source", "") or ""),
+                        str(row.get("title", "") or ""),
+                        str(row.get("message", "") or ""),
+                    )
+                    # Use a UI-local iid so stale payload ids never break refresh.
+                    tree.insert("", "end", iid=f"note_{kept}", values=values)
+                    kept += 1
+                    if kept >= 300:
+                        break
+                status_scope = "All" if resolved_market == "all" else self._market_display_name(resolved_market)
+                status_var.set(f"{kept} notifications shown ({status_scope})")
+                if kept <= 0:
+                    _set_detail(self._notification_empty_state_text(runtime_snapshot, market_filter, severity_filter))
+                    return
+                children = tree.get_children()
+                if children:
+                    try:
+                        tree.selection_set(children[0])
+                        tree.focus(children[0])
+                        tree.see(children[0])
+                        _on_select()
+                    except Exception:
+                        pass
+            except Exception as exc:
+                status_var.set(f"Notification refresh failed ({type(exc).__name__})")
+                _set_detail(f"Notification refresh failed.\n\n{type(exc).__name__}: {exc}")
+
+        ui["refresh"] = _refresh
 
         def _on_select(_event: Optional[tk.Event] = None) -> None:
             sel = tree.selection()
@@ -3715,12 +4119,6 @@ class PowerTraderHub(tk.Tk):
         ).pack(side="right", padx=(8, 0))
         ttk.Button(
             right,
-            text="AI Assist",
-            style="Compact.TButton",
-            command=self.open_autofix_queue,
-        ).pack(side="right", padx=(8, 0))
-        ttk.Button(
-            right,
             text="Notes",
             style="Compact.TButton",
             command=self._open_operator_notes_editor,
@@ -3799,7 +4197,6 @@ class PowerTraderHub(tk.Tk):
 
         snap = runtime_snapshot if isinstance(runtime_snapshot, dict) else {}
         aq = snap.get("api_quota", {}) if isinstance(snap.get("api_quota", {}), dict) else {}
-        autofix_snap = snap.get("autofix", {}) if isinstance(snap.get("autofix", {}), dict) else {}
         quota_state = str(aq.get("status", "n/a") or "n/a").strip().lower()
         q15 = int(aq.get("total_15m", 0) or 0)
         if quota_state in {"ok", "healthy"}:
@@ -3810,21 +4207,16 @@ class PowerTraderHub(tk.Tk):
             api_tone = "bad"
         else:
             api_tone = "muted"
-        ai_key_missing = bool(autofix_snap.get("enabled", False)) and (not bool(autofix_snap.get("api_key_configured", True)))
-        if ai_key_missing and api_tone == "good":
-            api_tone = "warn"
         api_txt = f"APIs: {quota_state.upper()} ({q15}/15m)"
-        if ai_key_missing:
-            api_txt += " | AI KEY MISSING"
         self._set_badge_style(self.lbl_toolbar_api_badge, api_txt, tone=api_tone)
 
         checks = snap.get("checks", {}) if isinstance(snap.get("checks", {}), dict) else {}
-        alerts = snap.get("alerts", {}) if isinstance(snap.get("alerts", {}), dict) else {}
+        scoped_alerts = self._scoped_alert_snapshot(snap, self._active_market_key())
         stop_flag = snap.get("stop_flag", {}) if isinstance(snap.get("stop_flag", {}), dict) else {}
         drawdown = snap.get("drawdown_guard", {}) if isinstance(snap.get("drawdown_guard", {}), dict) else {}
         checks_ok = bool(checks.get("ok", False))
-        sev = str(alerts.get("severity", "n/a") or "n/a").strip().lower()
-        reasons = [str(x or "").strip() for x in list(alerts.get("reasons", []) or []) if str(x or "").strip()]
+        sev = str(scoped_alerts.get("severity", "ok") or "ok").strip().lower()
+        reasons = [str(x or "").strip() for x in list(scoped_alerts.get("reasons", []) or []) if str(x or "").strip()]
         if checks_ok and sev in {"ok", "low", "none"}:
             checks_tone = "good"
         elif sev in {"critical", "high"}:
@@ -3838,10 +4230,6 @@ class PowerTraderHub(tk.Tk):
         if primary_reason:
             extra = max(0, len(reasons) - 1)
             reason_suffix = f" | {primary_reason}" + (f" +{extra}" if extra > 0 else "")
-        elif ai_key_missing:
-            reason_suffix = " | ai_assist_key_missing"
-            if checks_tone == "good":
-                checks_tone = "warn"
         sf_reason = str(stop_flag.get("reason", "") or "").strip().lower()
         sf_details = stop_flag.get("details", {}) if isinstance(stop_flag.get("details", {}), dict) else {}
         if bool(stop_flag.get("active", False)) and sf_reason == "drawdown_guard":
@@ -3855,13 +4243,12 @@ class PowerTraderHub(tk.Tk):
                 reason_suffix += f" | resume in {max(1, remaining // 60)}m"
             else:
                 reason_suffix += " | awaiting recovery/ack"
-        runbook_links = list(alerts.get("runbook_links", []) or []) if isinstance(alerts.get("runbook_links", []), list) else []
+        runbook_links = list(scoped_alerts.get("runbook_links", []) or []) if isinstance(scoped_alerts.get("runbook_links", []), list) else []
         if runbook_links:
             top_link = runbook_links[0] if isinstance(runbook_links[0], dict) else {}
             rlabel = self._alert_reason_compact(str(top_link.get("reason", "") or ""))
             reason_suffix += f" | runbook:{rlabel}"
-        notifications = snap.get("notification_center", {}) if isinstance(snap.get("notification_center", {}), dict) else {}
-        by_sev = notifications.get("by_severity", {}) if isinstance(notifications.get("by_severity", {}), dict) else {}
+        by_sev = scoped_alerts.get("by_severity", {}) if isinstance(scoped_alerts.get("by_severity", {}), dict) else {}
         crit_notes = int(by_sev.get("critical", 0) or 0)
         warn_notes = int(by_sev.get("warning", 0) or 0)
         if crit_notes > 0:
@@ -3937,7 +4324,6 @@ class PowerTraderHub(tk.Tk):
         )
         m_settings.add_command(label="Settings...", command=self.open_settings_dialog)
         m_settings.add_command(label="Operator Notes...", command=self._open_operator_notes_editor, accelerator="Ctrl+Shift+N")
-        m_settings.add_command(label="Autofix Queue...", command=self.open_autofix_queue, accelerator="Ctrl+Shift+A")
         m_settings.add_command(label="Command Palette...", command=self._open_command_palette, accelerator="Ctrl+P")
         m_settings.add_separator()
         m_settings.add_command(label="Apply Safe Risk Defaults", command=self._apply_safe_risk_defaults)
@@ -4724,1514 +5110,6 @@ class PowerTraderHub(tk.Tk):
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _autofix_extract_json_obj(self, text: str) -> Dict[str, Any]:
-        raw = str(text or "").strip()
-        if not raw:
-            return {}
-        try:
-            parsed = json.loads(raw)
-            return parsed if isinstance(parsed, dict) else {}
-        except Exception:
-            pass
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start < 0 or end <= start:
-            return {}
-        try:
-            parsed = json.loads(raw[start : end + 1])
-            return parsed if isinstance(parsed, dict) else {}
-        except Exception:
-            return {}
-
-    def _autofix_read_ticket_rows(self) -> List[Dict[str, Any]]:
-        rows: List[Dict[str, Any]] = []
-        try:
-            paths = glob.glob(os.path.join(self.autofix_tickets_dir, "*.json"))
-        except Exception:
-            paths = []
-        for path in paths:
-            row = _safe_read_json(path)
-            if not isinstance(row, dict):
-                continue
-            tid = str(row.get("id", "") or "").strip()
-            if not tid:
-                tid = os.path.splitext(os.path.basename(path))[0]
-                row["id"] = tid
-            row["_ticket_path"] = path
-            try:
-                tsv = int(float(row.get("ts", 0) or 0))
-            except Exception:
-                try:
-                    tsv = int(os.path.getmtime(path))
-                except Exception:
-                    tsv = 0
-            row["_sort_ts"] = tsv
-            rows.append(row)
-        rows.sort(key=lambda r: int(r.get("_sort_ts", 0) or 0), reverse=True)
-        return rows
-
-    def _autofix_resolve_patch_path(self, row: Dict[str, Any]) -> str:
-        proposal = row.get("proposal", {}) if isinstance(row.get("proposal", {}), dict) else {}
-        patch_path = str(proposal.get("patch_diff_path", "") or "").strip()
-        if patch_path:
-            if not os.path.isabs(patch_path):
-                patch_path = os.path.abspath(os.path.join(self.project_dir, patch_path))
-            if os.path.isfile(patch_path):
-                return patch_path
-        tid = str(row.get("id", "") or "").strip()
-        if tid:
-            fallback = os.path.join(self.autofix_patches_dir, f"{tid}.diff")
-            if os.path.isfile(fallback):
-                return fallback
-        return ""
-
-    def _autofix_set_text(self, widget: tk.Text, text: str) -> None:
-        try:
-            widget.configure(state="normal")
-            widget.delete("1.0", "end")
-            widget.insert("1.0", str(text or ""))
-            widget.configure(state="disabled")
-        except Exception:
-            pass
-
-    def _copy_text_to_clipboard(self, text: str, title: str = "Copied") -> None:
-        txt = str(text or "").strip()
-        if not txt:
-            messagebox.showinfo(title, "Nothing to copy.")
-            return
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(txt)
-            messagebox.showinfo(title, "Copied to clipboard.")
-        except Exception as exc:
-            messagebox.showerror("Clipboard", f"Unable to copy text.\n{type(exc).__name__}: {exc}")
-
-    def _autofix_mode(self) -> str:
-        status_row = _safe_read_json(self.autofix_status_path) or {}
-        return str(status_row.get("mode", self.settings.get("autofix_mode", "report_only")) or "report_only").strip().lower()
-
-    def _autofix_filter_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        ui = self._autofix_queue_ui if isinstance(getattr(self, "_autofix_queue_ui", {}), dict) else {}
-        status_var = ui.get("ticket_status_filter_var")
-        kind_var = ui.get("ticket_kind_filter_var")
-        search_var = ui.get("ticket_search_var")
-        try:
-            status_filter = str(status_var.get() if status_var is not None else "All").strip().lower()
-        except Exception:
-            status_filter = "all"
-        try:
-            kind_filter = str(kind_var.get() if kind_var is not None else "All").strip().lower()
-        except Exception:
-            kind_filter = "all"
-        try:
-            query = str(search_var.get() if search_var is not None else "").strip().lower()
-        except Exception:
-            query = ""
-
-        out: List[Dict[str, Any]] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            status = str(row.get("status", "open") or "open").strip().lower()
-            if status_filter not in {"all", ""} and status != status_filter:
-                continue
-            cls = row.get("classifier", {}) if isinstance(row.get("classifier", {}), dict) else {}
-            kind = str(cls.get("kind", "unknown") or "unknown").strip().lower()
-            if kind_filter not in {"all", ""} and kind != kind_filter:
-                continue
-            if query:
-                incident = row.get("incident", {}) if isinstance(row.get("incident", {}), dict) else {}
-                request_row = row.get("request", {}) if isinstance(row.get("request", {}), dict) else {}
-                parts = [
-                    str(row.get("id", "") or ""),
-                    str(kind),
-                    str(status),
-                    str(incident.get("component", "") or ""),
-                    str(incident.get("event", "") or ""),
-                    str(incident.get("msg", "") or ""),
-                    str(request_row.get("text", "") or ""),
-                ]
-                hay = " ".join(parts).lower()
-                if query not in hay:
-                    continue
-            out.append(row)
-        return out
-
-    def _autofix_clear_filters(self) -> None:
-        ui = self._autofix_queue_ui if isinstance(getattr(self, "_autofix_queue_ui", {}), dict) else {}
-        for key, value in (
-            ("ticket_status_filter_var", "All"),
-            ("ticket_kind_filter_var", "All"),
-            ("ticket_search_var", ""),
-        ):
-            var = ui.get(key)
-            if var is None:
-                continue
-            try:
-                var.set(value)
-            except Exception:
-                pass
-        self._refresh_autofix_queue(keep_selection=False)
-
-    def _autofix_on_filter_change(self, _event: Optional[tk.Event] = None) -> None:
-        self._refresh_autofix_queue(keep_selection=True)
-
-    def _autofix_set_feedback(self, msg: str, level: str = "info") -> None:
-        ui = self._autofix_queue_ui if isinstance(getattr(self, "_autofix_queue_ui", {}), dict) else {}
-        var = ui.get("chat_feedback_var")
-        label = ui.get("chat_feedback_label")
-        text = str(msg or "").strip()
-        if var is not None:
-            try:
-                var.set(text)
-            except Exception:
-                pass
-        if label is not None:
-            fg = DARK_MUTED
-            lv = str(level or "info").strip().lower()
-            if lv in {"ok", "good", "success"}:
-                fg = DARK_ACCENT
-            elif lv in {"warn", "warning"}:
-                fg = "#FFD27A"
-            elif lv in {"error", "bad"}:
-                fg = "#FF8D80"
-            try:
-                label.configure(foreground=fg)
-            except Exception:
-                pass
-
-    def _autofix_human_apply_reason(self, reason: str) -> str:
-        key = str(reason or "").strip().lower()
-        mapped = {
-            "applied_and_tests_passed": "Patch applied and tests passed.",
-            "applied_no_tests": "Patch applied (no tests configured).",
-            "awaiting_manual_approval": "Awaiting manual approval.",
-            "mode_not_shadow_apply": "Mode blocks auto-apply.",
-            "live_guarded_blocked": "Live-guard blocked auto-apply.",
-            "missing_openai_api_key": "OpenAI key missing.",
-            "llm_quota_blocked": "OpenAI quota/billing blocked request.",
-            "llm_network_unreachable": "OpenAI endpoint not reachable from runtime.",
-            "llm_request_rejected": "OpenAI request payload rejected.",
-            "llm_output_invalid": "AI output format invalid; retrying with stricter prompt.",
-            "llm_no_patch_generated": "AI response did not include a patch diff.",
-            "llm_timeout": "AI request timed out before patch generation completed.",
-            "llm_service_unavailable": "AI service unavailable; retry queued.",
-            "llm_quota_blocked_retries_exhausted": "Blocked after repeated quota failures.",
-            "missing_openai_api_key_retries_exhausted": "Blocked after repeated missing-key failures.",
-            "llm_request_rejected_retries_exhausted": "Blocked after repeated request-format failures.",
-            "llm_output_invalid_retries_exhausted": "Blocked after repeated invalid-output responses.",
-            "llm_no_patch_generated_retries_exhausted": "Blocked after repeated no-patch responses.",
-            "missing_patch_file": "Patch was not generated.",
-            "dry_run": "Dry-run mode; no apply attempted.",
-        }
-        return mapped.get(key, str(reason or "").strip())
-
-    def _autofix_update_input_state(self, _event: Optional[tk.Event] = None) -> None:
-        ui = self._autofix_queue_ui if isinstance(getattr(self, "_autofix_queue_ui", {}), dict) else {}
-        chat_input = ui.get("chat_input")
-        send_btn = ui.get("chat_send_btn")
-        ticket_btn = ui.get("chat_send_apply_btn")
-        chars_var = ui.get("chat_chars_var")
-        mode_var = ui.get("chat_mode_hint_var")
-        if chat_input is None:
-            return
-        try:
-            raw = str(chat_input.get("1.0", "end-1c") or "")
-        except Exception:
-            raw = ""
-        text = str(raw).strip()
-        n_chars = len(raw)
-        over = max(0, int(n_chars - AUTOFIX_REQUEST_MAX_CHARS))
-        if chars_var is not None:
-            try:
-                if over > 0:
-                    chars_var.set(f"Length: {n_chars}/{AUTOFIX_REQUEST_MAX_CHARS} (+{over} over limit)")
-                else:
-                    chars_var.set(f"Length: {n_chars}/{AUTOFIX_REQUEST_MAX_CHARS}")
-            except Exception:
-                pass
-        mode = self._autofix_mode()
-        if mode_var is not None:
-            try:
-                if mode in {"manual", "shadow_apply"}:
-                    mode_var.set("Mode hint: requests can auto-implement.")
-                else:
-                    mode_var.set("Mode hint: report_only (implementation may require approval/force).")
-            except Exception:
-                pass
-        can_send = (not self._autofix_request_busy) and bool(text) and (over == 0)
-        for btn in (send_btn, ticket_btn):
-            if btn is None:
-                continue
-            try:
-                btn.configure(state=("normal" if can_send else "disabled"))
-            except Exception:
-                pass
-
-    def _autofix_insert_template(self) -> None:
-        ui = self._autofix_queue_ui if isinstance(getattr(self, "_autofix_queue_ui", {}), dict) else {}
-        chat_input = ui.get("chat_input")
-        template_var = ui.get("chat_template_var")
-        if chat_input is None or template_var is None:
-            return
-        try:
-            label = str(template_var.get() or "").strip()
-        except Exception:
-            label = ""
-        if not label:
-            return
-        body = str(AUTOFIX_CHAT_TEMPLATES.get(label, "") or "").strip()
-        if not body:
-            return
-        try:
-            cur = str(chat_input.get("1.0", "end-1c") or "")
-        except Exception:
-            cur = ""
-        merged = f"{cur.rstrip()}\n\n{body}\n" if cur.strip() else (body + "\n")
-        try:
-            chat_input.delete("1.0", "end")
-            chat_input.insert("1.0", merged)
-            chat_input.focus_set()
-        except Exception:
-            pass
-        self._autofix_update_input_state()
-
-    def _autofix_use_selected_ticket_request(self) -> None:
-        row = self._selected_autofix_row()
-        if not row:
-            return
-        request_row = row.get("request", {}) if isinstance(row.get("request", {}), dict) else {}
-        incident = row.get("incident", {}) if isinstance(row.get("incident", {}), dict) else {}
-        txt = str(request_row.get("text", "") or "").strip()
-        if not txt:
-            txt = str(incident.get("msg", "") or "").strip()
-        if not txt:
-            messagebox.showinfo("AI Assist", "Selected ticket has no reusable request text.")
-            return
-        ui = self._autofix_queue_ui if isinstance(getattr(self, "_autofix_queue_ui", {}), dict) else {}
-        chat_input = ui.get("chat_input")
-        if chat_input is None:
-            return
-        try:
-            chat_input.delete("1.0", "end")
-            chat_input.insert("1.0", txt + "\n")
-            chat_input.focus_set()
-        except Exception:
-            pass
-        self._autofix_update_input_state()
-        self._autofix_set_feedback("Loaded selected ticket text into prompt box.", level="info")
-
-    def _autofix_copy_selected_ticket_id(self) -> None:
-        row = self._selected_autofix_row()
-        tid = str((row if isinstance(row, dict) else {}).get("id", "") or "").strip()
-        self._copy_text_to_clipboard(tid, title="Ticket ID")
-
-    def _autofix_copy_text_widget(self, widget_key: str, title: str) -> None:
-        ui = self._autofix_queue_ui if isinstance(getattr(self, "_autofix_queue_ui", {}), dict) else {}
-        widget = ui.get(widget_key)
-        if widget is None:
-            return
-        try:
-            txt = str(widget.get("1.0", "end-1c") or "")
-        except Exception:
-            txt = ""
-        self._copy_text_to_clipboard(txt, title=title)
-
-    def _autofix_clear_chat_log(self) -> None:
-        ui = self._autofix_queue_ui if isinstance(getattr(self, "_autofix_queue_ui", {}), dict) else {}
-        widget = ui.get("chat_text")
-        if widget is None:
-            return
-        try:
-            widget.configure(state="normal")
-            widget.delete("1.0", "end")
-            widget.configure(state="disabled")
-        except Exception:
-            pass
-        self._autofix_set_feedback("Chat log cleared.", level="info")
-
-    def _on_autofix_chat_shortcut(self, auto_apply: bool, _event: Optional[tk.Event] = None) -> str:
-        self._submit_autofix_chat_request(auto_apply=bool(auto_apply))
-        return "break"
-
-    def _selected_autofix_row(self) -> Dict[str, Any]:
-        ui = self._autofix_queue_ui if isinstance(getattr(self, "_autofix_queue_ui", {}), dict) else {}
-        lb = ui.get("listbox")
-        rows = ui.get("rows", [])
-        if not isinstance(rows, list) or lb is None:
-            return {}
-        try:
-            sel = lb.curselection()
-            if not sel:
-                return {}
-            idx = int(sel[0])
-            if 0 <= idx < len(rows):
-                row = rows[idx]
-                return row if isinstance(row, dict) else {}
-        except Exception:
-            return {}
-        return {}
-
-    def _render_autofix_selected_row(self) -> None:
-        ui = self._autofix_queue_ui if isinstance(getattr(self, "_autofix_queue_ui", {}), dict) else {}
-        details_text = ui.get("details_text")
-        patch_text = ui.get("patch_text")
-        apply_btn = ui.get("apply_btn")
-        force_apply_btn = ui.get("force_apply_btn")
-        row = self._selected_autofix_row()
-
-        if details_text is None or patch_text is None:
-            return
-
-        if not row:
-            self._autofix_set_text(details_text, "No autofix ticket selected.")
-            self._autofix_set_text(patch_text, "No patch selected.")
-            try:
-                apply_btn.configure(state="disabled", text="Approve + Apply")
-            except Exception:
-                pass
-            try:
-                if force_apply_btn is not None:
-                    force_apply_btn.configure(state="disabled", text="Force Apply")
-            except Exception:
-                pass
-            return
-
-        tid = str(row.get("id", "") or "").strip()
-        status = str(row.get("status", "open") or "open").strip().lower()
-        incident = row.get("incident", {}) if isinstance(row.get("incident", {}), dict) else {}
-        details = incident.get("details", {}) if isinstance(incident.get("details", {}), dict) else {}
-        classifier = row.get("classifier", {}) if isinstance(row.get("classifier", {}), dict) else {}
-        proposal = row.get("proposal", {}) if isinstance(row.get("proposal", {}), dict) else {}
-        evidence = row.get("evidence", {}) if isinstance(row.get("evidence", {}), dict) else {}
-        request_row = row.get("request", {}) if isinstance(row.get("request", {}), dict) else {}
-        retry_row = row.get("request_retry", {}) if isinstance(row.get("request_retry", {}), dict) else {}
-        apply_row = row.get("apply", {}) if isinstance(row.get("apply", {}), dict) else {}
-        blocked_row = row.get("blocked", {}) if isinstance(row.get("blocked", {}), dict) else {}
-        trace_files = evidence.get("trace_files", []) if isinstance(evidence.get("trace_files", []), list) else []
-        log_tail = evidence.get("log_tail", []) if isinstance(evidence.get("log_tail", []), list) else []
-        patch_path = self._autofix_resolve_patch_path(row)
-
-        try:
-            created_ts = int(float(row.get("ts", 0) or 0))
-            created_txt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created_ts)) if created_ts > 0 else "N/A"
-        except Exception:
-            created_txt = "N/A"
-
-        detail_lines: List[str] = []
-        detail_lines.append(f"Ticket: {tid}")
-        detail_lines.append(f"Status: {status.upper()}")
-        detail_lines.append(f"Created: {created_txt}")
-        detail_lines.append(f"Mode at create: {str(row.get('mode', 'n/a') or 'n/a')}")
-        detail_lines.append(f"Stage at create: {str(row.get('market_rollout_stage', 'n/a') or 'n/a')}")
-        detail_lines.append("")
-        detail_lines.append("Request")
-        detail_lines.append(f"- auto_apply={bool(request_row.get('auto_apply_requested', False))}")
-        detail_lines.append(f"- force_apply={bool(request_row.get('force_apply_requested', False))}")
-        req_preview = str(request_row.get("text", "") or "").strip()
-        if req_preview:
-            if len(req_preview) > 180:
-                req_preview = req_preview[:180] + "..."
-            detail_lines.append(f"- text={req_preview}")
-        if retry_row:
-            detail_lines.append("- retry")
-            detail_lines.append(f"  attempts={int(float(retry_row.get('attempts', 0) or 0))}")
-            try:
-                retry_last_ts = int(float(retry_row.get("last_ts", 0) or 0))
-            except Exception:
-                retry_last_ts = 0
-            retry_last_txt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(retry_last_ts)) if retry_last_ts > 0 else "N/A"
-            detail_lines.append(f"  last={retry_last_txt}")
-            try:
-                retry_next_ts = int(float(retry_row.get("next_retry_ts", 0) or 0))
-            except Exception:
-                retry_next_ts = 0
-            retry_next_txt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(retry_next_ts)) if retry_next_ts > 0 else "N/A"
-            detail_lines.append(f"  next={retry_next_txt}")
-            retry_err = str(retry_row.get("last_error", "") or "").strip()
-            if retry_err:
-                if len(retry_err) > 180:
-                    retry_err = retry_err[:180] + "..."
-                detail_lines.append(f"  last_error={retry_err}")
-        detail_lines.append("")
-        detail_lines.append("Classifier")
-        detail_lines.append(
-            f"- kind={str(classifier.get('kind', 'unknown') or 'unknown')} "
-            f"confidence={float(classifier.get('confidence', 0.0) or 0.0):.2f}"
-        )
-        detail_lines.append(f"- match={str(classifier.get('match', '') or '')}")
-        detail_lines.append("")
-        detail_lines.append("Incident")
-        detail_lines.append(f"- severity={str(incident.get('severity', '') or '')}")
-        detail_lines.append(f"- component={str(incident.get('component', '') or '')}")
-        detail_lines.append(f"- event={str(incident.get('event', '') or '')}")
-        detail_lines.append(f"- message={str(incident.get('msg', '') or '')}")
-        if details:
-            child = str(details.get("child", "") or "").strip()
-            if child:
-                detail_lines.append(f"- child={child}")
-        detail_lines.append("")
-        detail_lines.append("Proposal")
-        detail_lines.append(f"- summary={str(proposal.get('summary', '') or '')}")
-        risk = proposal.get("risk", {}) if isinstance(proposal.get("risk", {}), dict) else {}
-        diff_stats = proposal.get("diff_stats", {}) if isinstance(proposal.get("diff_stats", {}), dict) else {}
-        target_files = proposal.get("target_files", []) if isinstance(proposal.get("target_files", []), list) else []
-        risk_level = str(risk.get("level", "unknown") or "unknown").strip().lower()
-        try:
-            risk_score = int(float(risk.get("score", 0) or 0))
-        except Exception:
-            risk_score = 0
-        detail_lines.append(f"- risk={risk_level.upper()} (score {risk_score})")
-        risk_reasons = list(risk.get("reasons", []) or []) if isinstance(risk.get("reasons", []), list) else []
-        if risk_reasons:
-            detail_lines.append(f"- risk reasons={', '.join(str(x) for x in risk_reasons[:6])}")
-        if diff_stats:
-            detail_lines.append(
-                "- diff stats="
-                f"files={int(diff_stats.get('files', 0) or 0)} "
-                f"hunks={int(diff_stats.get('hunks', 0) or 0)} "
-                f"changed={int(diff_stats.get('changed', 0) or 0)} "
-                f"(+{int(diff_stats.get('added', 0) or 0)}/-{int(diff_stats.get('removed', 0) or 0)})"
-            )
-        if target_files:
-            detail_lines.append("- target files:")
-            for path in target_files[:10]:
-                detail_lines.append(f"  {str(path or '').strip()}")
-        llm = proposal.get("llm", {}) if isinstance(proposal.get("llm", {}), dict) else {}
-        detail_lines.append(
-            f"- llm used={bool(llm.get('used', False))} ok={bool(llm.get('ok', False))} "
-            f"model={str(llm.get('model', '') or '')}"
-        )
-        llm_err = str(llm.get("error", "") or "").strip()
-        llm_detail = str(llm.get("detail", "") or "").strip()
-        if llm_err:
-            detail_lines.append(f"- llm error={llm_err}")
-        if llm_detail:
-            d = llm_detail if len(llm_detail) <= 280 else (llm_detail[:280] + "...")
-            detail_lines.append(f"- llm detail={d}")
-        detail_lines.append(f"- patch={patch_path if patch_path else 'N/A'}")
-        tests = proposal.get("recommended_tests", []) if isinstance(proposal.get("recommended_tests", []), list) else []
-        if tests:
-            detail_lines.append("- recommended tests:")
-            for t in tests[:6]:
-                detail_lines.append(f"  {str(t or '').strip()}")
-        detail_lines.append("")
-        detail_lines.append("Apply")
-        detail_lines.append(f"- attempted={bool(apply_row.get('attempted', False))}")
-        detail_lines.append(f"- ok={bool(apply_row.get('ok', False))}")
-        detail_lines.append(f"- reason={str(apply_row.get('reason', '') or '')}")
-        if blocked_row:
-            detail_lines.append("- blocked")
-            detail_lines.append(f"  reason={str(blocked_row.get('reason', '') or '')}")
-            try:
-                blocked_ts = int(float(blocked_row.get("ts", 0) or 0))
-            except Exception:
-                blocked_ts = 0
-            blocked_txt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(blocked_ts)) if blocked_ts > 0 else "N/A"
-            detail_lines.append(f"  ts={blocked_txt}")
-            detail_lines.append(f"  retry_max_attempts={int(float(blocked_row.get('retry_max_attempts', 0) or 0))}")
-        detail_lines.append("")
-        if trace_files:
-            detail_lines.append("Trace files")
-            for tf in trace_files[:8]:
-                if isinstance(tf, dict):
-                    detail_lines.append(
-                        f"- {str(tf.get('path', '') or '')}:{str(tf.get('line', '') or '')} "
-                        f"{str(tf.get('func', '') or '')}"
-                    )
-                else:
-                    detail_lines.append(f"- {str(tf or '')}")
-            detail_lines.append("")
-        if log_tail:
-            detail_lines.append("Recent log tail")
-            for line in log_tail[-30:]:
-                detail_lines.append(str(line or ""))
-
-        self._autofix_set_text(details_text, "\n".join(detail_lines).strip() + "\n")
-
-        if patch_path and os.path.isfile(patch_path):
-            try:
-                with open(patch_path, "r", encoding="utf-8") as f:
-                    patch_body = f.read()
-            except Exception as exc:
-                patch_body = f"[patch read failed] {type(exc).__name__}: {exc}"
-        else:
-            apply_reason_l = str((apply_row.get("reason", "") if isinstance(apply_row, dict) else "") or "").strip().lower()
-            llm_err_l = str(llm_err or "").strip().lower()
-            if ("_retries_exhausted" in apply_reason_l) and ("llm_quota_blocked" in apply_reason_l):
-                patch_body = (
-                    "No patch diff is available yet.\n\n"
-                    "Reason: Ticket auto-closed after repeated OpenAI quota failures.\n"
-                    "Resolve quota/billing, then submit a new request."
-                )
-            elif ("_retries_exhausted" in apply_reason_l) and ("missing_openai_api_key" in apply_reason_l):
-                patch_body = (
-                    "No patch diff is available yet.\n\n"
-                    "Reason: Ticket auto-closed after repeated missing API key failures.\n"
-                    "Set OPENAI_API_KEY (or keys/openai_api_key.txt), then submit a new request."
-                )
-            elif ("_retries_exhausted" in apply_reason_l) and ("llm_request_rejected" in apply_reason_l):
-                patch_body = (
-                    "No patch diff is available yet.\n\n"
-                    "Reason: Ticket auto-closed after repeated request-format failures.\n"
-                    "Submit a new request from current app version."
-                )
-            elif ("_retries_exhausted" in apply_reason_l) and ("llm_output_invalid" in apply_reason_l):
-                patch_body = (
-                    "No patch diff is available yet.\n\n"
-                    "Reason: Ticket auto-closed after repeated invalid-output responses.\n"
-                    "Try a narrower request with file names and expected behavior."
-                )
-            elif ("_retries_exhausted" in apply_reason_l) and ("llm_no_patch_generated" in apply_reason_l):
-                patch_body = (
-                    "No patch diff is available yet.\n\n"
-                    "Reason: Ticket auto-closed after repeated no-patch responses.\n"
-                    "Re-submit with concrete acceptance criteria (target file, UI behavior, and tests)."
-                )
-            elif "missing_openai_api_key" in llm_err_l:
-                patch_body = (
-                    "No patch diff is available yet.\n\n"
-                    "Reason: OpenAI API key is missing for Autofix runtime.\n"
-                    "Set OPENAI_API_KEY or add keys/openai_api_key.txt, relaunch, then retry."
-                )
-            elif ("http_429" in llm_err_l) or ("insufficient_quota" in str(llm_detail or "").lower()):
-                patch_body = (
-                    "No patch diff is available yet.\n\n"
-                    "Reason: OpenAI API quota/billing is currently blocked (HTTP 429 / insufficient_quota).\n"
-                    "Fix account quota, then submit again or wait for auto-retry."
-                )
-            elif ("urlerror" in llm_err_l) or ("nodename nor servname" in str(llm_detail or "").lower()):
-                patch_body = (
-                    "No patch diff is available yet.\n\n"
-                    "Reason: Autofix runtime could not reach OpenAI (network/DNS issue).\n"
-                    "Check internet/DNS connectivity for this process, then retry."
-                )
-            elif "http_400" in llm_err_l:
-                patch_body = (
-                    "No patch diff is available yet.\n\n"
-                    "Reason: API request payload was rejected (HTTP 400).\n"
-                    "Create a new ticket from AI Assist so it uses current request formatting."
-                )
-            elif ("model_output_not_json" in llm_err_l) or ("invalid_json_response" in llm_err_l):
-                patch_body = (
-                    "No patch diff is available yet.\n\n"
-                    "Reason: AI returned an invalid patch payload format.\n"
-                    "Autofix will retry automatically; you can also retry manually from this panel."
-                )
-            elif ("llm_no_patch_generated" in apply_reason_l) or ("missing_patch_file" in apply_reason_l):
-                patch_body = (
-                    "No patch diff is available yet.\n\n"
-                    "Reason: AI response did not include a usable patch diff.\n"
-                    "Use Retry to regenerate the proposal, or submit a tighter request."
-                )
-            else:
-                patch_body = (
-                    "No patch diff is available for this ticket yet.\n\n"
-                    "If this is a chat improvement request, use 'Send + Implement' or switch Autofix mode to manual/shadow_apply."
-                )
-        if len(patch_body) > 60000:
-            patch_body = patch_body[:60000] + "\n...\n[patch preview truncated]"
-        self._autofix_set_text(patch_text, patch_body)
-
-        can_apply = bool(tid) and bool(patch_path) and (status != "applied") and (not self._autofix_apply_busy)
-        try:
-            if self._autofix_apply_busy:
-                apply_btn.configure(state="disabled", text="Applying...")
-                if force_apply_btn is not None:
-                    force_apply_btn.configure(state="disabled", text="Applying...")
-            elif status == "applied":
-                apply_btn.configure(state="disabled", text="Already Applied")
-                if force_apply_btn is not None:
-                    force_apply_btn.configure(state="disabled", text="Already Applied")
-            elif status == "blocked":
-                apply_btn.configure(state="disabled", text="Blocked")
-                if force_apply_btn is not None:
-                    force_apply_btn.configure(state="disabled", text="Blocked")
-            elif not patch_path:
-                apply_btn.configure(state="disabled", text="No Patch")
-                if force_apply_btn is not None:
-                    force_apply_btn.configure(state="disabled", text="No Patch")
-            else:
-                apply_btn.configure(state=("normal" if can_apply else "disabled"), text="Approve + Apply")
-                if force_apply_btn is not None:
-                    force_apply_btn.configure(state=("normal" if can_apply else "disabled"), text="Force Apply")
-        except Exception:
-            pass
-
-    def _refresh_autofix_queue(self, keep_selection: bool = True) -> None:
-        ui = self._autofix_queue_ui if isinstance(getattr(self, "_autofix_queue_ui", {}), dict) else {}
-        if not ui:
-            return
-        lb = ui.get("listbox")
-        status_var = ui.get("status_var")
-        if lb is None or status_var is None:
-            return
-
-        prev_id = str(ui.get("selected_id", "") or "").strip()
-        if keep_selection and not prev_id:
-            row = self._selected_autofix_row()
-            prev_id = str(row.get("id", "") or "").strip()
-
-        all_rows = self._autofix_read_ticket_rows()
-        rows = self._autofix_filter_rows(all_rows)
-        ui["rows_all"] = all_rows
-        ui["rows"] = rows
-
-        try:
-            lb.delete(0, "end")
-        except Exception:
-            pass
-
-        for row in rows:
-            tid = str(row.get("id", "") or "").strip()
-            incident = row.get("incident", {}) if isinstance(row.get("incident", {}), dict) else {}
-            classifier = row.get("classifier", {}) if isinstance(row.get("classifier", {}), dict) else {}
-            proposal = row.get("proposal", {}) if isinstance(row.get("proposal", {}), dict) else {}
-            risk = proposal.get("risk", {}) if isinstance(proposal.get("risk", {}), dict) else {}
-            risk_level = str(risk.get("level", "low") or "low").strip().lower()
-            risk_tag = str(risk_level[:1].upper() if risk_level else "L")
-            status = str(row.get("status", "open") or "open").strip().upper()
-            kind = str(classifier.get("kind", "unknown") or "unknown").strip()
-            comp = str(incident.get("component", "") or "").strip()
-            msg = str(incident.get("msg", "") or "").replace("\n", " ").strip()
-            if len(msg) > 72:
-                msg = msg[:72] + "..."
-            try:
-                tsv = int(float(row.get("ts", 0) or 0))
-                ttxt = time.strftime("%m-%d %H:%M:%S", time.localtime(tsv)) if tsv > 0 else "N/A"
-            except Exception:
-                ttxt = "N/A"
-            label = f"{status:<8} {ttxt} | R{risk_tag} | {kind:<14} | {(comp or '-'):<8} | {msg}"
-            try:
-                lb.insert("end", label)
-            except Exception:
-                pass
-            if not tid:
-                continue
-
-        selected_idx = 0 if rows else -1
-        if prev_id:
-            for i, row in enumerate(rows):
-                if str(row.get("id", "") or "").strip() == prev_id:
-                    selected_idx = i
-                    break
-        if selected_idx >= 0 and rows:
-            try:
-                lb.selection_clear(0, "end")
-                lb.selection_set(selected_idx)
-                lb.activate(selected_idx)
-                lb.see(selected_idx)
-                ui["selected_id"] = str(rows[selected_idx].get("id", "") or "").strip()
-            except Exception:
-                pass
-        else:
-            ui["selected_id"] = ""
-
-        open_count = sum(1 for r in all_rows if str(r.get("status", "open") or "open").strip().lower() == "open")
-        applied_count = sum(1 for r in all_rows if str(r.get("status", "")).strip().lower() == "applied")
-        blocked_count = sum(1 for r in all_rows if str(r.get("status", "")).strip().lower() == "blocked")
-        quota_blocked = 0
-        key_blocked = 0
-        request_rejected = 0
-        output_invalid = 0
-        no_patch_blocked = 0
-        open_high_risk = 0
-        for r in all_rows:
-            if str(r.get("status", "open") or "open").strip().lower() != "open":
-                blocked_row = r.get("blocked", {}) if isinstance(r.get("blocked", {}), dict) else {}
-                proposal_row = r.get("proposal", {}) if isinstance(r.get("proposal", {}), dict) else {}
-                llm_row = proposal_row.get("llm", {}) if isinstance(proposal_row.get("llm", {}), dict) else {}
-                blocked_reason = str(blocked_row.get("reason", "") or "").strip().lower()
-                llm_err = str(llm_row.get("error", "") or "").strip().lower()
-                llm_detail = str(llm_row.get("detail", "") or "").strip().lower()
-                if ("llm_quota_blocked" in blocked_reason) or ("http_429" in llm_err) or ("insufficient_quota" in llm_detail):
-                    quota_blocked += 1
-                elif ("missing_openai_api_key" in blocked_reason) or ("missing_openai_api_key" in llm_err):
-                    key_blocked += 1
-                elif ("llm_request_rejected" in blocked_reason) or ("http_400" in llm_err):
-                    request_rejected += 1
-                elif ("llm_output_invalid" in blocked_reason) or ("model_output_not_json" in llm_err) or ("invalid_json_response" in llm_err):
-                    output_invalid += 1
-                elif ("llm_no_patch_generated" in blocked_reason) or ("missing_patch_file" in blocked_reason):
-                    no_patch_blocked += 1
-                continue
-            p = r.get("proposal", {}) if isinstance(r.get("proposal", {}), dict) else {}
-            rk = p.get("risk", {}) if isinstance(p.get("risk", {}), dict) else {}
-            if str(rk.get("level", "") or "").strip().lower() == "high":
-                open_high_risk += 1
-        status_row = _safe_read_json(self.autofix_status_path) or {}
-        state_row = _safe_read_json(self.autofix_state_path) or {}
-        mode = str(status_row.get("mode", self.settings.get("autofix_mode", "report_only")) or "report_only")
-        enabled = bool(status_row.get("enabled", self.settings.get("autofix_enabled", True)))
-        api_key_cfg = bool(status_row.get("api_key_configured", False))
-        retry_attempted = int(float(status_row.get("request_retry_attempted", 0) or 0))
-        retry_updated = int(float(status_row.get("request_retry_updated", 0) or 0))
-        retry_blocked = int(float(status_row.get("request_retry_blocked", 0) or 0))
-        daily = int(float(state_row.get("applied_count_day", 0) or 0))
-        tick_ts = status_row.get("last_tick_ts", status_row.get("ts", 0))
-        api_hint = "" if api_key_cfg else " (keys/openai_api_key.txt)"
-        status_extra = ""
-        if quota_blocked > 0:
-            status_extra += f" | QuotaBlocked={quota_blocked}"
-        if key_blocked > 0:
-            status_extra += f" | KeyBlocked={key_blocked}"
-        if request_rejected > 0:
-            status_extra += f" | ReqRejected={request_rejected}"
-        if output_invalid > 0:
-            status_extra += f" | OutputInvalid={output_invalid}"
-        if no_patch_blocked > 0:
-            status_extra += f" | NoPatch={no_patch_blocked}"
-        if str(mode or "").strip().lower() == "report_only":
-            status_extra += " | Hint: use Send + Implement for direct apply"
-        status_var.set(
-            f"Mode={mode} | Enabled={'ON' if enabled else 'OFF'} | Open={open_count} | "
-            f"HighRiskOpen={open_high_risk} | Applied={applied_count} | Blocked={blocked_count} | Today={daily} | "
-            f"ReqRetry={retry_updated}/{retry_attempted} blocked={retry_blocked} | "
-            f"Shown={len(rows)}/{len(all_rows)} | API Key={'YES' if api_key_cfg else 'NO'}{api_hint} | {self._market_age_text(tick_ts)}"
-            f"{status_extra}"
-        )
-
-        self._autofix_update_input_state()
-        self._render_autofix_selected_row()
-
-    def _on_autofix_ticket_select(self, _event: Optional[tk.Event] = None) -> None:
-        ui = self._autofix_queue_ui if isinstance(getattr(self, "_autofix_queue_ui", {}), dict) else {}
-        row = self._selected_autofix_row()
-        ui["selected_id"] = str(row.get("id", "") or "").strip()
-        self._render_autofix_selected_row()
-
-    def _autofix_queue_tick(self) -> None:
-        win = self._autofix_win
-        if win is None or not win.winfo_exists():
-            return
-        ui = self._autofix_queue_ui if isinstance(getattr(self, "_autofix_queue_ui", {}), dict) else {}
-        auto_refresh_var = ui.get("auto_refresh_var")
-        should_refresh = True
-        if auto_refresh_var is not None:
-            try:
-                should_refresh = bool(auto_refresh_var.get())
-            except Exception:
-                should_refresh = True
-        if should_refresh and (not self._autofix_apply_busy) and (not self._autofix_request_busy):
-            self._refresh_autofix_queue(keep_selection=True)
-        try:
-            aft = self.after(8000, self._autofix_queue_tick)
-            ui["after_id"] = aft
-        except Exception:
-            pass
-
-    def _close_autofix_queue(self) -> None:
-        ui = self._autofix_queue_ui if isinstance(getattr(self, "_autofix_queue_ui", {}), dict) else {}
-        aft = ui.get("after_id")
-        if aft:
-            try:
-                self.after_cancel(aft)
-            except Exception:
-                pass
-        try:
-            if self._autofix_win is not None and self._autofix_win.winfo_exists():
-                self._autofix_win.destroy()
-        except Exception:
-            pass
-        self._autofix_win = None
-        self._autofix_queue_ui = {}
-        self._autofix_apply_busy = False
-        self._autofix_request_busy = False
-
-    def _apply_selected_autofix_ticket(self, force_apply: bool = False) -> None:
-        if self._autofix_apply_busy:
-            return
-        row = self._selected_autofix_row()
-        if not row:
-            return
-        tid = str(row.get("id", "") or "").strip()
-        if not tid:
-            return
-        patch_path = self._autofix_resolve_patch_path(row)
-        if not patch_path:
-            messagebox.showerror("Autofix Queue", "No patch file exists for the selected ticket.")
-            return
-        if not os.path.isfile(self.autofix_script_path):
-            messagebox.showerror("Autofix Queue", f"Cannot find autofix script:\n{self.autofix_script_path}")
-            return
-        if not messagebox.askyesno(
-            "Autofix Queue",
-            (
-                f"{'Force apply' if force_apply else 'Approve and apply'} patch for ticket {tid}?\n\n"
-                + "This will edit source files in this project."
-                + ("\nLive-guard blocks will be bypassed for this action." if force_apply else "")
-            ),
-        ):
-            return
-
-        self._autofix_apply_busy = True
-        self._render_autofix_selected_row()
-        ui = self._autofix_queue_ui if isinstance(getattr(self, "_autofix_queue_ui", {}), dict) else {}
-        status_var = ui.get("status_var")
-        if status_var is not None:
-            try:
-                status_var.set(f"Applying ticket {tid} ...")
-            except Exception:
-                pass
-
-        def _worker() -> None:
-            rc = 1
-            out = ""
-            err = ""
-            payload: Dict[str, Any] = {}
-            try:
-                cmd = [sys.executable, self.autofix_script_path, "--apply-ticket", tid]
-                if bool(force_apply):
-                    cmd.append("--force-apply")
-                env = os.environ.copy()
-                env["POWERTRADER_HUB_DIR"] = self.hub_dir
-                env["POWERTRADER_PROJECT_DIR"] = self.project_dir
-                settings_path = resolve_settings_path(BASE_DIR) or SETTINGS_PATH or os.path.join(BASE_DIR, SETTINGS_FILE)
-                env["POWERTRADER_GUI_SETTINGS"] = str(settings_path)
-                proc = subprocess.run(
-                    cmd,
-                    cwd=self.project_dir,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                    check=False,
-                )
-                rc = int(proc.returncode)
-                out = str(proc.stdout or "").strip()
-                err = str(proc.stderr or "").strip()
-                payload = self._autofix_extract_json_obj(out)
-            except Exception as exc:
-                rc = 1
-                err = f"{type(exc).__name__}: {exc}"
-
-            def _finish() -> None:
-                self._autofix_apply_busy = False
-                self._refresh_autofix_queue(keep_selection=True)
-                ok = bool(payload.get("ok", False)) and (rc == 0)
-                reason = str(payload.get("reason", "") or "").strip()
-                if not reason:
-                    reason = ("ok" if ok else f"exit_{rc}")
-                if ok:
-                    messagebox.showinfo("Autofix Queue", f"Ticket {tid} applied.\nReason: {reason}")
-                    return
-                tail = (err or out or "No output returned.").strip()
-                if len(tail) > 1200:
-                    tail = tail[-1200:]
-                messagebox.showerror(
-                    "Autofix Queue",
-                    f"Apply failed for ticket {tid}.\nReason: {reason}\n\n{tail}",
-                )
-
-            try:
-                self.after(0, _finish)
-            except Exception:
-                self._autofix_apply_busy = False
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _retry_selected_autofix_ticket(self) -> None:
-        if self._autofix_request_busy or self._autofix_apply_busy:
-            return
-        row = self._selected_autofix_row()
-        if not row:
-            messagebox.showinfo("AI Assist", "Select a ticket to retry.")
-            return
-        status = str(row.get("status", "open") or "open").strip().lower()
-        if status == "applied":
-            messagebox.showinfo("AI Assist", "Selected ticket is already applied.")
-            return
-        tid = str(row.get("id", "") or "").strip()
-        if not tid:
-            messagebox.showerror("AI Assist", "Selected ticket ID is missing.")
-            return
-        if not os.path.isfile(self.autofix_script_path):
-            messagebox.showerror("AI Assist", f"Cannot find autofix script:\n{self.autofix_script_path}")
-            return
-        request_row = row.get("request", {}) if isinstance(row.get("request", {}), dict) else {}
-        auto_apply = bool(request_row.get("auto_apply_requested", False))
-        force_apply = bool(request_row.get("force_apply_requested", False))
-        self._append_autofix_chat_line(
-            "AI Assist",
-            f"Retrying ticket {tid} (auto-apply={'yes' if auto_apply else 'no'}).",
-        )
-        self._autofix_request_busy = True
-        self._set_autofix_request_controls(False)
-        self._autofix_set_feedback("Retrying selected ticket...", level="info")
-        ui = self._autofix_queue_ui if isinstance(getattr(self, "_autofix_queue_ui", {}), dict) else {}
-        status_var = ui.get("status_var")
-        if status_var is not None:
-            try:
-                status_var.set(f"Retrying ticket {tid} ...")
-            except Exception:
-                pass
-
-        def _worker() -> None:
-            rc = 1
-            out = ""
-            err = ""
-            payload: Dict[str, Any] = {}
-            try:
-                cmd = [sys.executable, self.autofix_script_path, "--retry-ticket", tid]
-                if bool(auto_apply):
-                    cmd.append("--retry-auto-apply")
-                if bool(force_apply):
-                    cmd.append("--force-apply")
-                env = os.environ.copy()
-                env["POWERTRADER_HUB_DIR"] = self.hub_dir
-                env["POWERTRADER_PROJECT_DIR"] = self.project_dir
-                settings_path = resolve_settings_path(BASE_DIR) or SETTINGS_PATH or os.path.join(BASE_DIR, SETTINGS_FILE)
-                env["POWERTRADER_GUI_SETTINGS"] = str(settings_path)
-                proc = subprocess.run(
-                    cmd,
-                    cwd=self.project_dir,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                    check=False,
-                )
-                rc = int(proc.returncode)
-                out = str(proc.stdout or "").strip()
-                err = str(proc.stderr or "").strip()
-                payload = self._autofix_extract_json_obj(out)
-            except Exception as exc:
-                rc = 1
-                err = f"{type(exc).__name__}: {exc}"
-
-            def _finish() -> None:
-                self._autofix_request_busy = False
-                self._set_autofix_request_controls(True)
-                self._refresh_autofix_queue(keep_selection=True)
-                if bool(payload.get("ok", False)) and (rc == 0):
-                    status_txt = str(payload.get("status", "open") or "open").upper()
-                    proposal_ok = bool(payload.get("proposal_ok", False))
-                    applied = bool(payload.get("applied", False))
-                    apply_reason = str(payload.get("apply_reason", "") or "").strip()
-                    msg = (
-                        f"Retry complete for {tid}. "
-                        f"status={status_txt} proposal={'yes' if proposal_ok else 'no'} auto-apply={'yes' if applied else 'no'}"
-                    )
-                    self._append_autofix_chat_line("AI Assist", msg)
-                    if apply_reason:
-                        self._append_autofix_chat_line(
-                            "AI Assist",
-                            f"Apply reason: {self._autofix_human_apply_reason(apply_reason)}",
-                        )
-                    self._autofix_set_feedback("Retry completed.", level=("ok" if (proposal_ok or applied) else "warn"))
-                    return
-                tail = (err or out or "No output returned.").strip()
-                if len(tail) > 1200:
-                    tail = tail[-1200:]
-                self._append_autofix_chat_line("AI Assist", f"Retry failed for {tid}: {tail}")
-                self._autofix_set_feedback(f"Retry failed for {tid}.", level="error")
-
-            try:
-                self.after(0, _finish)
-            except Exception:
-                self._autofix_request_busy = False
-                self._set_autofix_request_controls(True)
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _append_autofix_chat_line(self, speaker: str, text: str) -> None:
-        ui = self._autofix_queue_ui if isinstance(getattr(self, "_autofix_queue_ui", {}), dict) else {}
-        widget = ui.get("chat_text")
-        if widget is None:
-            return
-        stamp = time.strftime("%H:%M:%S")
-        line = f"[{stamp}] {str(speaker or 'AI').strip()}: {str(text or '').strip()}\n"
-        try:
-            widget.configure(state="normal")
-            widget.insert("end", line)
-            widget.see("end")
-            widget.configure(state="disabled")
-        except Exception:
-            pass
-
-    def _set_autofix_request_controls(self, enabled: bool) -> None:
-        ui = self._autofix_queue_ui if isinstance(getattr(self, "_autofix_queue_ui", {}), dict) else {}
-        chat_input = ui.get("chat_input")
-        send_btn = ui.get("chat_send_btn")
-        send_apply_btn = ui.get("chat_send_apply_btn")
-        template_btn = ui.get("chat_template_use_btn")
-        reuse_btn = ui.get("chat_reuse_btn")
-        clear_btn = ui.get("chat_clear_btn")
-        state = "normal" if bool(enabled) else "disabled"
-        try:
-            if chat_input is not None:
-                chat_input.configure(state=state)
-        except Exception:
-            pass
-        try:
-            if send_btn is not None:
-                send_btn.configure(state=state)
-        except Exception:
-            pass
-        try:
-            if send_apply_btn is not None:
-                send_apply_btn.configure(state=state)
-        except Exception:
-            pass
-        for btn in (template_btn, reuse_btn, clear_btn):
-            if btn is None:
-                continue
-            try:
-                btn.configure(state=state)
-            except Exception:
-                pass
-        self._autofix_update_input_state()
-
-    def _submit_autofix_chat_request(self, auto_apply: bool = False) -> None:
-        if self._autofix_request_busy:
-            return
-        ui = self._autofix_queue_ui if isinstance(getattr(self, "_autofix_queue_ui", {}), dict) else {}
-        chat_input = ui.get("chat_input")
-        status_var = ui.get("status_var")
-        if chat_input is None:
-            return
-        try:
-            req_raw = str(chat_input.get("1.0", "end-1c") or "")
-        except Exception:
-            req_raw = ""
-        req = str(req_raw).strip()
-        if not req:
-            self._autofix_set_feedback("Enter a request before sending.", level="warn")
-            self._autofix_update_input_state()
-            return
-        if len(req_raw) > AUTOFIX_REQUEST_MAX_CHARS:
-            self._autofix_set_feedback(
-                f"Request exceeds {AUTOFIX_REQUEST_MAX_CHARS} characters. Shorten prompt before sending.",
-                level="warn",
-            )
-            self._autofix_update_input_state()
-            return
-        status_row = _safe_read_json(self.autofix_status_path) or {}
-        mode = str(status_row.get("mode", self.settings.get("autofix_mode", "report_only")) or "report_only").strip().lower()
-        request_auto_apply = bool(auto_apply)
-        # In non-report modes, a normal request behaves like "send + auto-apply" so the assistant
-        # can actually implement approved changes from chat.
-        if (not request_auto_apply) and mode in {"manual", "shadow_apply"}:
-            request_auto_apply = True
-        try:
-            chat_input.delete("1.0", "end")
-        except Exception:
-            pass
-        self._append_autofix_chat_line("You", req)
-        if request_auto_apply and (not bool(auto_apply)):
-            self._append_autofix_chat_line("AI Assist", f"Mode {mode}: request will auto-apply when safe.")
-        elif (not request_auto_apply) and mode == "report_only":
-            self._append_autofix_chat_line(
-                "AI Assist",
-                "Ticket-only mode: use 'Send + Implement' for direct implementation.",
-            )
-        self._autofix_request_busy = True
-        self._set_autofix_request_controls(False)
-        self._autofix_set_feedback("Request running...", level="info")
-        if status_var is not None:
-            try:
-                status_var.set("AI Assist request running...")
-            except Exception:
-                pass
-
-        def _worker() -> None:
-            rc = 1
-            out = ""
-            err = ""
-            payload: Dict[str, Any] = {}
-            req_file = os.path.join(self.hub_dir, f".autofix_request_{int(time.time() * 1000)}.txt")
-            try:
-                with open(req_file, "w", encoding="utf-8") as f:
-                    f.write(req + "\n")
-                cmd = [sys.executable, self.autofix_script_path, "--request-file", req_file]
-                if bool(request_auto_apply):
-                    cmd.append("--request-auto-apply")
-                    # User explicitly requested direct implementation from chat.
-                    cmd.append("--force-apply")
-                env = os.environ.copy()
-                env["POWERTRADER_HUB_DIR"] = self.hub_dir
-                env["POWERTRADER_PROJECT_DIR"] = self.project_dir
-                settings_path = resolve_settings_path(BASE_DIR) or SETTINGS_PATH or os.path.join(BASE_DIR, SETTINGS_FILE)
-                env["POWERTRADER_GUI_SETTINGS"] = str(settings_path)
-                proc = subprocess.run(
-                    cmd,
-                    cwd=self.project_dir,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=420,
-                    check=False,
-                )
-                rc = int(proc.returncode)
-                out = str(proc.stdout or "").strip()
-                err = str(proc.stderr or "").strip()
-                payload = self._autofix_extract_json_obj(out)
-            except Exception as exc:
-                rc = 1
-                err = f"{type(exc).__name__}: {exc}"
-            finally:
-                try:
-                    if os.path.isfile(req_file):
-                        os.remove(req_file)
-                except Exception:
-                    pass
-
-            def _finish() -> None:
-                self._autofix_request_busy = False
-                self._set_autofix_request_controls(True)
-                self._refresh_autofix_queue(keep_selection=True)
-                ok = bool(payload.get("ok", False)) and (rc == 0)
-                if ok:
-                    tid = str(payload.get("ticket_id", "") or "").strip()
-                    prop_ok = bool(payload.get("proposal_ok", False))
-                    applied = bool(payload.get("applied", False))
-                    apply_reason = str(payload.get("apply_reason", "") or "").strip()
-                    apply_reason_human = self._autofix_human_apply_reason(apply_reason)
-                    llm_error = str(payload.get("llm_error", "") or "").strip()
-                    llm_detail = str(payload.get("llm_detail", "") or "").strip()
-                    msg = (
-                        f"Request accepted. Ticket {tid} created. "
-                        f"Patch proposal={'yes' if prop_ok else 'no'}; "
-                        f"auto-apply={'yes' if applied else 'no'}"
-                    )
-                    if apply_reason:
-                        msg += f" ({apply_reason_human or apply_reason})"
-                    self._append_autofix_chat_line("AI Assist", msg)
-                    if str(payload.get("status", "open") or "open").strip().lower() == "blocked":
-                        blocked_reason = str(payload.get("blocked_reason", "") or apply_reason).strip()
-                        blocked_human = self._autofix_human_apply_reason(blocked_reason)
-                        self._append_autofix_chat_line(
-                            "AI Assist",
-                            f"Ticket closed as BLOCKED ({blocked_human or blocked_reason}). Resolve the root cause and submit again.",
-                        )
-                        self._autofix_set_feedback("Request blocked; resolve root cause and resubmit.", level="warn")
-                    if applied:
-                        self._autofix_set_feedback("Request applied successfully.", level="ok")
-                    elif prop_ok:
-                        self._autofix_set_feedback("Patch proposal created. Awaiting apply path.", level="info")
-                    else:
-                        self._autofix_set_feedback("Request accepted but proposal failed.", level="warn")
-                    if (not applied) and request_auto_apply and str(apply_reason).lower() in {"mode_not_shadow_apply", "awaiting_manual_approval"}:
-                        self._append_autofix_chat_line(
-                            "AI Assist",
-                            "Auto-apply is not active in report_only mode. Switch Autofix mode to manual/shadow_apply for direct implementation.",
-                        )
-                    if str(apply_reason).strip().lower() == "live_guarded_blocked":
-                        self._append_autofix_chat_line(
-                            "AI Assist",
-                            "Auto-apply is blocked in live_guarded mode. Enable autofix_allow_live_apply in Settings or use a non-live rollout stage.",
-                        )
-                    if "_retries_exhausted" in str(apply_reason).strip().lower():
-                        self._append_autofix_chat_line(
-                            "AI Assist",
-                            "Ticket was auto-closed as BLOCKED after retry exhaustion. Submit a new request after resolving the root cause.",
-                        )
-                    if (not prop_ok) and llm_error:
-                        self._append_autofix_chat_line("AI Assist", f"Proposal error: {llm_error}")
-                    if (not prop_ok) and llm_detail:
-                        dt = llm_detail if len(llm_detail) <= 320 else (llm_detail[:320] + "...")
-                        self._append_autofix_chat_line("AI Assist", dt)
-                    if (not prop_ok) and ("missing_openai_api_key" in str(llm_error).lower()):
-                        self._append_autofix_chat_line(
-                            "AI Assist",
-                            "OpenAI API key is missing. Set OPENAI_API_KEY or save it to keys/openai_api_key.txt, then relaunch.",
-                        )
-                    if tid:
-                        self._autofix_queue_ui["selected_id"] = tid
-                        self._refresh_autofix_queue(keep_selection=True)
-                else:
-                    reason = str(payload.get("reason", "") or "").strip() or f"exit_{rc}"
-                    tail = (err or out or "No output returned.").strip()
-                    if len(tail) > 900:
-                        tail = tail[-900:]
-                    self._append_autofix_chat_line("AI Assist", f"Request failed: {reason}")
-                    self._autofix_set_feedback(f"Request failed: {reason}", level="error")
-                    if tail:
-                        self._append_autofix_chat_line("AI Assist", tail)
-                self._autofix_update_input_state()
-
-            try:
-                self.after(0, _finish)
-            except Exception:
-                self._autofix_request_busy = False
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def open_autofix_queue(self) -> None:
-        try:
-            if self._autofix_win is not None and self._autofix_win.winfo_exists():
-                self._autofix_win.lift()
-                self._autofix_win.focus_force()
-                self._refresh_autofix_queue(keep_selection=True)
-                return
-        except Exception:
-            pass
-
-        win = tk.Toplevel(self)
-        win.title("Autofix Queue")
-        win.geometry("1200x760")
-        self._autofix_win = win
-        win.transient(self)
-
-        def _on_close_queue() -> None:
-            self._close_autofix_queue()
-
-        win.protocol("WM_DELETE_WINDOW", _on_close_queue)
-
-        root = ttk.Frame(win)
-        root.pack(fill="both", expand=True, padx=10, pady=10)
-
-        top = ttk.Frame(root)
-        top.pack(fill="x", pady=(0, 8))
-        status_var = tk.StringVar(value="Loading autofix queue...")
-        ttk.Label(top, textvariable=status_var, foreground=DARK_MUTED).pack(side="left", padx=(0, 8))
-        auto_refresh_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(top, text="Auto refresh", variable=auto_refresh_var).pack(side="right", padx=(6, 0))
-        ttk.Button(top, text="Refresh", command=lambda: self._refresh_autofix_queue(keep_selection=True)).pack(side="right", padx=(6, 0))
-        ttk.Button(top, text="Retry Ticket", command=self._retry_selected_autofix_ticket).pack(side="right", padx=(6, 0))
-        apply_btn = ttk.Button(top, text="Approve + Apply", command=lambda: self._apply_selected_autofix_ticket(force_apply=False))
-        apply_btn.pack(side="right")
-        force_apply_btn = ttk.Button(top, text="Force Apply", command=lambda: self._apply_selected_autofix_ticket(force_apply=True))
-        force_apply_btn.pack(side="right", padx=(6, 0))
-
-        tools = ttk.Frame(root)
-        tools.pack(fill="x", pady=(0, 8))
-        ttk.Label(tools, text="Status:").pack(side="left")
-        ticket_status_filter_var = tk.StringVar(value="All")
-        ticket_status_filter = ttk.Combobox(
-            tools,
-            width=10,
-            state="readonly",
-            values=["All", "Open", "Blocked", "Applied"],
-            textvariable=ticket_status_filter_var,
-        )
-        ticket_status_filter.pack(side="left", padx=(4, 8))
-        ttk.Label(tools, text="Type:").pack(side="left")
-        ticket_kind_filter_var = tk.StringVar(value="All")
-        ticket_kind_filter = ttk.Combobox(
-            tools,
-            width=14,
-            state="readonly",
-            values=["All", "user_request", "module_import", "syntax", "type", "attribute", "unknown"],
-            textvariable=ticket_kind_filter_var,
-        )
-        ticket_kind_filter.pack(side="left", padx=(4, 8))
-        ttk.Label(tools, text="Search:").pack(side="left")
-        ticket_search_var = tk.StringVar(value="")
-        ticket_search = ttk.Entry(tools, textvariable=ticket_search_var)
-        ticket_search.pack(side="left", fill="x", expand=True, padx=(4, 8))
-        ttk.Button(tools, text="Clear Filters", command=self._autofix_clear_filters).pack(side="left")
-        ttk.Button(tools, text="Copy Ticket ID", command=self._autofix_copy_selected_ticket_id).pack(side="right")
-        ttk.Button(tools, text="Copy Patch", command=lambda: self._autofix_copy_text_widget("patch_text", "Patch Preview")).pack(
-            side="right", padx=(6, 0)
-        )
-        ttk.Button(tools, text="Copy Details", command=lambda: self._autofix_copy_text_widget("details_text", "Ticket Details")).pack(
-            side="right", padx=(6, 0)
-        )
-
-        chat_frame = ttk.Frame(root)
-        chat_frame.pack(fill="x", pady=(0, 8))
-        ttk.Label(
-            chat_frame,
-            text="AI Assist Chat (describe the change in plain language; supports direct implementation from this panel).",
-            foreground=DARK_ACCENT2,
-        ).pack(anchor="w", pady=(0, 4))
-        chat_mode_hint_var = tk.StringVar(value="Mode hint: loading...")
-        ttk.Label(chat_frame, textvariable=chat_mode_hint_var, foreground=DARK_MUTED).pack(anchor="w", pady=(0, 4))
-        chat_log = tk.Text(
-            chat_frame,
-            height=4,
-            wrap="word",
-            bg=DARK_PANEL,
-            fg=DARK_FG,
-            relief="flat",
-            bd=0,
-            padx=8,
-            pady=6,
-            insertbackground=DARK_ACCENT2,
-            font=self._live_log_font,
-        )
-        chat_log.pack(fill="x")
-        chat_log.configure(state="disabled")
-        template_row = ttk.Frame(chat_frame)
-        template_row.pack(fill="x", pady=(4, 2))
-        ttk.Label(template_row, text="Template:").pack(side="left")
-        chat_template_var = tk.StringVar(value="UI Layout parity")
-        chat_template_combo = ttk.Combobox(
-            template_row,
-            state="readonly",
-            values=list(AUTOFIX_CHAT_TEMPLATES.keys()),
-            textvariable=chat_template_var,
-            width=28,
-        )
-        chat_template_combo.pack(side="left", padx=(6, 6))
-        chat_template_use_btn = ttk.Button(template_row, text="Insert Template", command=self._autofix_insert_template)
-        chat_template_use_btn.pack(side="left")
-        chat_reuse_btn = ttk.Button(template_row, text="Use Selected Ticket Text", command=self._autofix_use_selected_ticket_request)
-        chat_reuse_btn.pack(side="left", padx=(6, 0))
-        chat_clear_btn = ttk.Button(template_row, text="Clear Chat", command=self._autofix_clear_chat_log)
-        chat_clear_btn.pack(side="right")
-        chat_input = tk.Text(
-            chat_frame,
-            height=3,
-            wrap="word",
-            bg=DARK_PANEL2,
-            fg=DARK_FG,
-            relief="flat",
-            bd=0,
-            padx=8,
-            pady=6,
-            insertbackground=DARK_ACCENT2,
-            font=self._live_log_font,
-        )
-        chat_input.pack(fill="x", pady=(4, 4))
-        chat_meta = ttk.Frame(chat_frame)
-        chat_meta.pack(fill="x", pady=(0, 4))
-        chat_chars_var = tk.StringVar(value=f"Length: 0/{AUTOFIX_REQUEST_MAX_CHARS}")
-        ttk.Label(chat_meta, textvariable=chat_chars_var, foreground=DARK_MUTED).pack(side="left")
-        chat_feedback_var = tk.StringVar(value="Ready.")
-        chat_feedback_label = ttk.Label(chat_meta, textvariable=chat_feedback_var, foreground=DARK_MUTED)
-        chat_feedback_label.pack(side="right")
-        chat_btns = ttk.Frame(chat_frame)
-        chat_btns.pack(fill="x")
-        chat_send_btn = ttk.Button(
-            chat_btns,
-            text="Send + Implement (Ctrl/Cmd+Enter)",
-            command=lambda: self._submit_autofix_chat_request(auto_apply=True),
-        )
-        chat_send_btn.pack(side="left")
-        chat_send_apply_btn = ttk.Button(
-            chat_btns,
-            text="Send Ticket Only (Ctrl/Cmd+Shift+Enter)",
-            command=lambda: self._submit_autofix_chat_request(auto_apply=False),
-        )
-        chat_send_apply_btn.pack(side="left", padx=(6, 0))
-        chat_input.bind("<Control-Return>", lambda e: self._on_autofix_chat_shortcut(True, e))
-        chat_input.bind("<Command-Return>", lambda e: self._on_autofix_chat_shortcut(True, e))
-        chat_input.bind("<Control-Shift-Return>", lambda e: self._on_autofix_chat_shortcut(False, e))
-        chat_input.bind("<Command-Shift-Return>", lambda e: self._on_autofix_chat_shortcut(False, e))
-        chat_input.bind("<KeyRelease>", self._autofix_update_input_state)
-        ticket_status_filter.bind("<<ComboboxSelected>>", self._autofix_on_filter_change)
-        ticket_kind_filter.bind("<<ComboboxSelected>>", self._autofix_on_filter_change)
-        ticket_search.bind("<KeyRelease>", self._autofix_on_filter_change)
-
-        body = ttk.Panedwindow(root, orient="horizontal")
-        body.pack(fill="both", expand=True)
-        left = ttk.Frame(body)
-        right = ttk.Frame(body)
-        body.add(left, weight=2)
-        body.add(right, weight=5)
-
-        ttk.Label(left, text="Tickets", foreground=DARK_ACCENT2).pack(anchor="w", pady=(0, 4))
-        list_wrap = ttk.Frame(left)
-        list_wrap.pack(fill="both", expand=True)
-        lb = tk.Listbox(
-            list_wrap,
-            activestyle="none",
-            selectmode="browse",
-            bg=DARK_PANEL2,
-            fg=DARK_FG,
-            selectbackground=DARK_SELECT_BG,
-            selectforeground=DARK_SELECT_FG,
-            highlightbackground=DARK_BORDER,
-            highlightthickness=1,
-            font=self._live_log_font,
-        )
-        lb.pack(side="left", fill="both", expand=True)
-        lb_scroll = ttk.Scrollbar(list_wrap, orient="vertical", command=lb.yview)
-        lb_scroll.pack(side="right", fill="y")
-        lb.configure(yscrollcommand=lb_scroll.set)
-        lb.bind("<<ListboxSelect>>", self._on_autofix_ticket_select)
-
-        right_pane = ttk.Panedwindow(right, orient="vertical")
-        right_pane.pack(fill="both", expand=True)
-
-        details_frame = ttk.Frame(right_pane)
-        patch_frame = ttk.Frame(right_pane)
-        right_pane.add(details_frame, weight=3)
-        right_pane.add(patch_frame, weight=4)
-
-        ttk.Label(details_frame, text="Ticket Details", foreground=DARK_ACCENT2).pack(anchor="w", pady=(0, 4))
-        details_text = tk.Text(
-            details_frame,
-            wrap="none",
-            bg=DARK_PANEL,
-            fg=DARK_FG,
-            relief="flat",
-            bd=0,
-            padx=8,
-            pady=8,
-            insertbackground=DARK_ACCENT2,
-            font=self._live_log_font,
-        )
-        details_text.pack(fill="both", expand=True)
-        details_text.configure(state="disabled")
-
-        ttk.Label(patch_frame, text="Patch Preview", foreground=DARK_ACCENT2).pack(anchor="w", pady=(0, 4))
-        patch_wrap = ttk.Frame(patch_frame)
-        patch_wrap.pack(fill="both", expand=True)
-        patch_text = tk.Text(
-            patch_wrap,
-            wrap="none",
-            bg=DARK_PANEL,
-            fg=DARK_FG,
-            relief="flat",
-            bd=0,
-            padx=8,
-            pady=8,
-            insertbackground=DARK_ACCENT2,
-            font=self._live_log_font,
-        )
-        patch_text.pack(side="left", fill="both", expand=True)
-        patch_text.configure(state="disabled")
-        patch_y = ttk.Scrollbar(patch_wrap, orient="vertical", command=patch_text.yview)
-        patch_y.pack(side="right", fill="y")
-        patch_x = ttk.Scrollbar(patch_frame, orient="horizontal", command=patch_text.xview)
-        patch_x.pack(fill="x")
-        patch_text.configure(yscrollcommand=patch_y.set, xscrollcommand=patch_x.set)
-
-        self._autofix_queue_ui = {
-            "win": win,
-            "status_var": status_var,
-            "auto_refresh_var": auto_refresh_var,
-            "ticket_status_filter_var": ticket_status_filter_var,
-            "ticket_kind_filter_var": ticket_kind_filter_var,
-            "ticket_search_var": ticket_search_var,
-            "listbox": lb,
-            "details_text": details_text,
-            "patch_text": patch_text,
-            "apply_btn": apply_btn,
-            "force_apply_btn": force_apply_btn,
-            "chat_text": chat_log,
-            "chat_input": chat_input,
-            "chat_send_btn": chat_send_btn,
-            "chat_send_apply_btn": chat_send_apply_btn,
-            "chat_template_var": chat_template_var,
-            "chat_template_use_btn": chat_template_use_btn,
-            "chat_reuse_btn": chat_reuse_btn,
-            "chat_clear_btn": chat_clear_btn,
-            "chat_chars_var": chat_chars_var,
-            "chat_mode_hint_var": chat_mode_hint_var,
-            "chat_feedback_var": chat_feedback_var,
-            "chat_feedback_label": chat_feedback_label,
-            "rows": [],
-            "rows_all": [],
-            "selected_id": "",
-            "after_id": None,
-        }
-        self._append_autofix_chat_line(
-            "AI Assist",
-            "Ready. Describe a change request, choose implement or ticket-only, and track results in Tickets.",
-        )
-        self._autofix_update_input_state()
-
-        self._refresh_autofix_queue(keep_selection=False)
-        try:
-            aft = self.after(8000, self._autofix_queue_tick)
-            self._autofix_queue_ui["after_id"] = aft
-        except Exception:
-            pass
-
     def _export_market_chart_png(self, market_key: str) -> None:
         try:
             bundle = load_market_status_bundle(
@@ -6406,6 +5284,7 @@ class PowerTraderHub(tk.Tk):
         self.market_nb.add(self.crypto_market_tab, text="Crypto")
         self.market_nb.add(self.stocks_market_tab, text="Stocks")
         self.market_nb.add(self.forex_market_tab, text="Forex")
+        self.market_nb.bind("<<NotebookTabChanged>>", lambda _e: self._refresh_active_market_context(), add="+")
 
         outer = ttk.Panedwindow(self.crypto_market_tab, orient="horizontal")
         outer.pack(fill="both", expand=True)
@@ -7022,9 +5901,9 @@ class PowerTraderHub(tk.Tk):
         self.logs_nb.pack(fill="both", expand=True, padx=6, pady=6)
 
 
-        # Runner tab
+        # Neural tab (crypto thinker/runner only)
         runner_tab = ttk.Frame(self.logs_nb)
-        self.logs_nb.add(runner_tab, text="Runner")
+        self.logs_nb.add(runner_tab, text="Neural")
         self.runner_text = tk.Text(
             runner_tab,
             height=8,
@@ -7052,6 +5931,38 @@ class PowerTraderHub(tk.Tk):
             self.runner_text.tag_configure("log_warn", foreground="#FFCC66")
             self.runner_text.tag_configure("log_err", foreground="#FF6B57")
             self.runner_text.tag_configure("log_launch", foreground=DARK_ACCENT2)
+        except Exception:
+            pass
+
+        # Supervisor tab (global runner/process log)
+        supervisor_tab = ttk.Frame(self.logs_nb)
+        self.logs_nb.add(supervisor_tab, text="Supervisor")
+        self.supervisor_text = tk.Text(
+            supervisor_tab,
+            height=8,
+            wrap="none",
+            font=self._live_log_font,
+            bg=DARK_PANEL,
+            fg=DARK_FG,
+            padx=8,
+            pady=6,
+            spacing1=1,
+            spacing3=1,
+            insertbackground=DARK_FG,
+            selectbackground=DARK_SELECT_BG,
+            selectforeground=DARK_SELECT_FG,
+            highlightbackground=DARK_BORDER,
+            highlightcolor=DARK_ACCENT,
+        )
+        supervisor_scroll = ttk.Scrollbar(supervisor_tab, orient="vertical", command=self.supervisor_text.yview)
+        self.supervisor_text.configure(yscrollcommand=supervisor_scroll.set)
+        self.supervisor_text.pack(side="left", fill="both", expand=True)
+        supervisor_scroll.pack(side="right", fill="y")
+        try:
+            self.supervisor_text.tag_configure("log_ts", foreground="#8FA5B8")
+            self.supervisor_text.tag_configure("log_warn", foreground="#FFCC66")
+            self.supervisor_text.tag_configure("log_err", foreground="#FF6B57")
+            self.supervisor_text.tag_configure("log_launch", foreground=DARK_ACCENT2)
         except Exception:
             pass
 
@@ -7671,6 +6582,8 @@ class PowerTraderHub(tk.Tk):
             "trail_line": 112,
         }
         self._trades_table_rows = []
+        self._trades_table_sig = None
+        self._trades_table_render_state: Dict[str, Any] = {}
         self._trades_header_height = 28
         self._trades_row_height = 28
 
@@ -8048,18 +6961,132 @@ class PowerTraderHub(tk.Tk):
             ttk.Label(metric_grid, text=label).grid(row=idx, column=0, sticky="w", padx=(0, 10), pady=2)
             ttk.Label(metric_grid, textvariable=portfolio_vars[key]).grid(row=idx, column=1, sticky="e", pady=2)
 
-        notes_box = ttk.LabelFrame(market_dash_body, text="Market Notes")
-        notes_box.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-        notes_hdr = ttk.Frame(notes_box)
-        notes_hdr.pack(fill="x", padx=6, pady=(6, 0))
-        notes_collapsed_var = tk.BooleanVar(value=True)
-        notes_toggle_btn = ttk.Button(notes_hdr, text="Show")
-        notes_toggle_btn.pack(side="right")
-        notes_body = ttk.Frame(notes_box)
-        notes_body.pack(fill="both", expand=True, padx=6, pady=6)
+        live_box = ttk.LabelFrame(market_dash_body, text="Live Output")
+        live_box.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        live_nb = ttk.Notebook(live_box)
+        live_nb.pack(fill="both", expand=True, padx=6, pady=6)
+
+        runner_tab = ttk.Frame(live_nb)
+        live_nb.add(runner_tab, text="Runner")
+        runner_header = ttk.Frame(runner_tab)
+        runner_header.pack(fill="x", padx=6, pady=(6, 0))
+        runner_age_var = tk.StringVar(value="Updated: N/A")
+        ttk.Label(runner_header, textvariable=runner_age_var, foreground=DARK_MUTED).pack(side="left")
+        runner_autoscroll_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(runner_header, text="Auto-scroll", variable=runner_autoscroll_var).pack(side="right")
+        runner_text = tk.Text(
+            runner_tab,
+            height=(6 if compact_mode else 8),
+            wrap="none",
+            font=self._live_log_font,
+            bg=DARK_PANEL,
+            fg=DARK_FG,
+            padx=8,
+            pady=6,
+            spacing1=1,
+            spacing3=1,
+            relief="flat",
+            bd=0,
+            highlightbackground=DARK_BORDER,
+            highlightcolor=DARK_ACCENT,
+        )
+        runner_scroll = ttk.Scrollbar(runner_tab, orient="vertical", command=runner_text.yview)
+        runner_text.configure(yscrollcommand=runner_scroll.set)
+        runner_text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=(4, 6))
+        runner_scroll.pack(side="right", fill="y", padx=(0, 6), pady=(4, 6))
+        runner_text.configure(state="disabled")
+        try:
+            runner_text.tag_configure("log_ts", foreground="#8FA5B8")
+            runner_text.tag_configure("log_warn", foreground="#FFCC66")
+            runner_text.tag_configure("log_err", foreground="#FF6B57")
+            runner_text.tag_configure("log_launch", foreground=DARK_ACCENT2)
+        except Exception:
+            pass
+
+        thinker_tab = ttk.Frame(live_nb)
+        live_nb.add(thinker_tab, text="Thinker")
+        logs_header = ttk.Frame(thinker_tab)
+        logs_header.pack(fill="x", padx=6, pady=(6, 0))
+        logs_age_var = tk.StringVar(value="Updated: N/A")
+        ttk.Label(logs_header, textvariable=logs_age_var, foreground=DARK_MUTED).pack(side="left")
+        log_filter_var = tk.StringVar(value="All")
+        ttk.Label(logs_header, text="Filter:", foreground=DARK_MUTED).pack(side="left", padx=(12, 4))
+        log_filter_combo = ttk.Combobox(logs_header, values=["All", "Thinker", "Trader", "Broker"], state="readonly", width=9, textvariable=log_filter_var)
+        log_filter_combo.pack(side="left")
+        logs_autoscroll_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(logs_header, text="Auto-scroll", variable=logs_autoscroll_var).pack(side="right")
+        log_text = tk.Text(
+            thinker_tab,
+            height=(6 if compact_mode else 8),
+            wrap="none",
+            font=self._live_log_font,
+            bg=DARK_PANEL,
+            fg=DARK_FG,
+            padx=8,
+            pady=6,
+            spacing1=1,
+            spacing3=1,
+            relief="flat",
+            bd=0,
+            highlightbackground=DARK_BORDER,
+            highlightcolor=DARK_ACCENT,
+        )
+        log_scroll = ttk.Scrollbar(thinker_tab, orient="vertical", command=log_text.yview)
+        log_text.configure(yscrollcommand=log_scroll.set)
+        log_text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=(4, 6))
+        log_scroll.pack(side="right", fill="y", padx=(0, 6), pady=(4, 6))
+        log_text.configure(state="disabled")
+        try:
+            log_text.tag_configure("log_ts", foreground="#8FA5B8")
+            log_text.tag_configure("log_warn", foreground="#FFCC66")
+            log_text.tag_configure("log_err", foreground="#FF6B57")
+            log_text.tag_configure("log_launch", foreground=DARK_ACCENT2)
+        except Exception:
+            pass
+        log_filter_combo.bind("<<ComboboxSelected>>", lambda _e, mk=market_key: self._render_market_log(mk))
+
+        training_tab = ttk.Frame(live_nb)
+        live_nb.add(training_tab, text="Training")
+        training_header = ttk.Frame(training_tab)
+        training_header.pack(fill="x", padx=6, pady=(6, 0))
+        training_age_var = tk.StringVar(value="Updated: N/A")
+        ttk.Label(training_header, textvariable=training_age_var, foreground=DARK_MUTED).pack(side="left")
+        training_autoscroll_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(training_header, text="Auto-scroll", variable=training_autoscroll_var).pack(side="right")
+        training_text = tk.Text(
+            training_tab,
+            height=(6 if compact_mode else 8),
+            wrap="none",
+            font=self._live_log_font,
+            bg=DARK_PANEL,
+            fg=DARK_FG,
+            padx=8,
+            pady=6,
+            spacing1=1,
+            spacing3=1,
+            relief="flat",
+            bd=0,
+            highlightbackground=DARK_BORDER,
+            highlightcolor=DARK_ACCENT,
+        )
+        training_scroll = ttk.Scrollbar(training_tab, orient="vertical", command=training_text.yview)
+        training_text.configure(yscrollcommand=training_scroll.set)
+        training_text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=(4, 6))
+        training_scroll.pack(side="right", fill="y", padx=(0, 6), pady=(4, 6))
+        training_text.configure(state="disabled")
+        try:
+            training_text.tag_configure("log_ts", foreground="#8FA5B8")
+            training_text.tag_configure("log_warn", foreground="#FFCC66")
+            training_text.tag_configure("log_err", foreground="#FF6B57")
+            training_text.tag_configure("log_launch", foreground=DARK_ACCENT2)
+        except Exception:
+            pass
+
+        notes_tab = ttk.Frame(live_nb)
+        live_nb.add(notes_tab, text="Notes")
         notes_text = tk.Text(
-            notes_body,
-            height=8,
+            notes_tab,
+            height=(6 if compact_mode else 8),
             wrap="word",
             font=self._live_log_font,
             bg=DARK_PANEL,
@@ -8073,35 +7100,14 @@ class PowerTraderHub(tk.Tk):
             highlightbackground=DARK_BORDER,
             highlightcolor=DARK_ACCENT,
         )
-        notes_text.pack(fill="both", expand=True, padx=6, pady=6)
+        notes_scroll = ttk.Scrollbar(notes_tab, orient="vertical", command=notes_text.yview)
+        notes_text.configure(yscrollcommand=notes_scroll.set)
+        notes_text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=(4, 6))
+        notes_scroll.pack(side="right", fill="y", padx=(0, 6), pady=(4, 6))
         notes_text.insert("1.0", notes)
         notes_text.configure(state="disabled")
-
-        def _toggle_notes() -> None:
-            try:
-                collapsed = bool(notes_collapsed_var.get())
-            except Exception:
-                collapsed = False
-            if collapsed:
-                try:
-                    notes_body.pack(fill="both", expand=True, padx=6, pady=6)
-                except Exception:
-                    pass
-                notes_toggle_btn.configure(text="Hide")
-                notes_collapsed_var.set(False)
-            else:
-                try:
-                    notes_body.pack_forget()
-                except Exception:
-                    pass
-                notes_toggle_btn.configure(text="Show")
-                notes_collapsed_var.set(True)
-
-        notes_toggle_btn.configure(command=_toggle_notes)
-        try:
-            notes_body.pack_forget()
-        except Exception:
-            pass
+        notes_toggle_btn = None
+        notes_collapsed_var = tk.BooleanVar(value=False)
 
         left_split.add(dashboard, weight=1)
 
@@ -8303,7 +7309,7 @@ class PowerTraderHub(tk.Tk):
         history_logs_row.rowconfigure(0, weight=1)
 
         history_box = ttk.LabelFrame(history_logs_row, text=f"{market_name} History")
-        history_box.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        history_box.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=0)
         history_header = ttk.Frame(history_box)
         history_header.pack(fill="x", padx=6, pady=(6, 0))
         history_age_var = tk.StringVar(value="Updated: N/A")
@@ -8333,41 +7339,6 @@ class PowerTraderHub(tk.Tk):
         history_text.insert("1.0", "No trader actions yet.\n")
         history_text.configure(state="disabled")
 
-        logs_box = ttk.LabelFrame(history_logs_row, text=f"{market_name} Logs")
-        logs_box.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
-        logs_header = ttk.Frame(logs_box)
-        logs_header.pack(fill="x", padx=6, pady=(6, 0))
-        logs_age_var = tk.StringVar(value="Updated: N/A")
-        ttk.Label(logs_header, textvariable=logs_age_var, foreground=DARK_MUTED).pack(side="left")
-        log_filter_var = tk.StringVar(value="All")
-        ttk.Label(logs_header, text="Filter:", foreground=DARK_MUTED).pack(side="left", padx=(12, 4))
-        log_filter_combo = ttk.Combobox(logs_header, values=["All", "Thinker", "Trader", "Broker"], state="readonly", width=9, textvariable=log_filter_var)
-        log_filter_combo.pack(side="left")
-        logs_autoscroll_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(logs_header, text="Auto-scroll", variable=logs_autoscroll_var).pack(side="right")
-        log_text = tk.Text(
-            logs_box,
-            height=(6 if compact_mode else 8),
-            wrap="none",
-            font=self._live_log_font,
-            bg=DARK_PANEL,
-            fg=DARK_FG,
-            padx=8,
-            pady=6,
-            spacing1=1,
-            spacing3=1,
-            relief="flat",
-            bd=0,
-            highlightbackground=DARK_BORDER,
-            highlightcolor=DARK_ACCENT,
-        )
-        log_scroll = ttk.Scrollbar(logs_box, orient="vertical", command=log_text.yview)
-        log_text.configure(yscrollcommand=log_scroll.set)
-        log_text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=(4, 6))
-        log_scroll.pack(side="right", fill="y", padx=(0, 6), pady=(4, 6))
-        log_text.configure(state="disabled")
-        log_filter_combo.bind("<<ComboboxSelected>>", lambda _e, mk=market_key: self._render_market_log(mk))
-
         self.market_panels[market_key] = {
             "market_name": market_name,
             "broker_name": broker_name,
@@ -8387,6 +7358,20 @@ class PowerTraderHub(tk.Tk):
             "log_lines": [
                 f"[{market_name.upper()}] UI scaffold initialized",
                 f"[{market_name.upper()}] Waiting for broker credentials and engine wiring",
+            ],
+            "runner_text": runner_text,
+            "runner_age_var": runner_age_var,
+            "runner_autoscroll_var": runner_autoscroll_var,
+            "runner_lines": [
+                f"[{market_name.upper()}] Runner panel initialized",
+                f"[{market_name.upper()}] Waiting for market loop heartbeat",
+            ],
+            "training_text": training_text,
+            "training_age_var": training_age_var,
+            "training_autoscroll_var": training_autoscroll_var,
+            "training_lines": [
+                f"[{market_name.upper()}] Training panel initialized",
+                f"[{market_name.upper()}] Waiting for readiness metrics",
             ],
             "positions_tree": positions_tree,
             "positions_summary_var": positions_summary_var,
@@ -8509,6 +7494,232 @@ class PowerTraderHub(tk.Tk):
                 widget.see("end")
         except Exception:
             pass
+
+    def _record_ui_incident(
+        self,
+        severity: str,
+        event: str,
+        msg: str,
+        details: Optional[Dict[str, Any]] = None,
+        *,
+        cooldown_key: str = "",
+        cooldown_s: float = 120.0,
+    ) -> bool:
+        now_ts = int(time.time())
+        if cooldown_key:
+            cache = self.__dict__.get("_ui_incident_cooldowns", {})
+            if not isinstance(cache, dict):
+                cache = {}
+                self.__dict__["_ui_incident_cooldowns"] = cache
+            try:
+                last_ts = float(cache.get(cooldown_key, 0.0) or 0.0)
+            except Exception:
+                last_ts = 0.0
+            if (time.time() - last_ts) < max(10.0, float(cooldown_s or 120.0)):
+                return False
+            cache[cooldown_key] = time.time()
+
+        hub_dir = str(self.__dict__.get("hub_dir", self.project_dir) or self.project_dir)
+        incidents_path = str(self.__dict__.get("incidents_path", os.path.join(hub_dir, "incidents.jsonl")) or "")
+        runtime_events_path = str(
+            self.__dict__.get("runtime_events_path", os.path.join(hub_dir, "runtime_events.jsonl")) or ""
+        )
+        payload_details = dict(details or {})
+        payload_details.setdefault("component", "ui")
+        try:
+            append_jsonl(
+                incidents_path,
+                {
+                    "ts": int(now_ts),
+                    "date": time.strftime("%Y-%m-%d", time.localtime(now_ts)),
+                    "severity": str(severity or "warning").strip().lower(),
+                    "event": str(event or "ui_event").strip() or "ui_event",
+                    "msg": str(msg or "").strip(),
+                    "details": payload_details,
+                },
+                async_mode=False,
+            )
+        except Exception:
+            pass
+        try:
+            runtime_event(
+                runtime_events_path,
+                component="ui",
+                event=str(event or "ui_event").strip() or "ui_event",
+                level=str(severity or "warning").strip().lower(),
+                msg=str(msg or "").strip(),
+                details=payload_details,
+            )
+        except Exception:
+            pass
+        return True
+
+    def _market_widget_rows(self, widget: Any) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        if widget is None:
+            return rows
+        try:
+            children = list(widget.get_children())
+        except Exception:
+            return rows
+        row_map = getattr(widget, "rows", None)
+        for iid in children:
+            values: Tuple[Any, ...] = ()
+            tags: Tuple[str, ...] = ()
+            try:
+                if hasattr(widget, "item"):
+                    item = widget.item(iid)
+                    if isinstance(item, dict):
+                        values = tuple(item.get("values", ()) or ())
+                        tags = tuple(item.get("tags", ()) or ())
+                elif isinstance(row_map, dict):
+                    item = row_map.get(iid, {}) if isinstance(row_map.get(iid, {}), dict) else {}
+                    values = tuple(item.get("values", ()) or ())
+                    tags = tuple(item.get("tags", ()) or ())
+            except Exception:
+                values = ()
+                tags = ()
+            rows.append({"iid": str(iid), "values": values, "tags": tags})
+        return rows
+
+    def _market_nonplaceholder_row_count(self, widget: Any, placeholders: Tuple[str, ...]) -> int:
+        count = 0
+        placeholder_set = {str(x or "").strip().lower() for x in placeholders if str(x or "").strip()}
+        for row in self._market_widget_rows(widget):
+            values = tuple(row.get("values", ()) or ())
+            tags = {str(x or "").strip().lower() for x in tuple(row.get("tags", ()) or ()) if str(x or "").strip()}
+            first = str(values[0] if values else "").strip().lower()
+            if "placeholder" in tags or first in placeholder_set:
+                continue
+            count += 1
+        return int(count)
+
+    def _market_panel_consistency_issues(
+        self,
+        market_key: str,
+        status_data: Optional[Dict[str, Any]],
+        thinker_data: Optional[Dict[str, Any]],
+        diag_data: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        panel = self.market_panels.get(market_key, {})
+        status = status_data if isinstance(status_data, dict) else {}
+        thinker = thinker_data if isinstance(thinker_data, dict) else {}
+        diag = diag_data if isinstance(diag_data, dict) else {}
+        issues: List[Dict[str, Any]] = []
+
+        raw_positions = list(status.get("raw_positions", []) or []) if isinstance(status.get("raw_positions", []), list) else []
+        position_rows = self._market_nonplaceholder_row_count(panel.get("positions_tree"), ("No open positions",))
+        if raw_positions and position_rows <= 0:
+            issues.append(
+                {
+                    "issue_code": "positions_blank",
+                    "market": market_key,
+                    "view": "Positions",
+                    "expected_rows": int(len(raw_positions)),
+                    "actual_rows": int(position_rows),
+                    "message": (
+                        f"{market_key.title()} positions panel blank despite {len(raw_positions)} broker position"
+                        f"{'' if len(raw_positions) == 1 else 's'} in snapshot."
+                    ),
+                }
+            )
+
+        view_var = panel.get("market_view_var")
+        try:
+            view_name = str((view_var.get() if view_var else "Overview") or "Overview").strip() or "Overview"
+        except Exception:
+            view_name = "Overview"
+        table_rows = self._market_nonplaceholder_row_count(panel.get("chart_table"), ("No data yet",))
+        leaders_total = int(len(list(thinker.get("leaders", []) or [])))
+        scores_total = int(len(list(thinker.get("all_scores", []) or [])))
+        try:
+            leaders_total = max(leaders_total, int(diag.get("leaders_total", 0) or 0))
+        except Exception:
+            pass
+        try:
+            scores_total = max(scores_total, int(diag.get("scores_total", 0) or 0))
+        except Exception:
+            pass
+        if view_name == "Scanner" and scores_total > 0 and table_rows <= 0:
+            issues.append(
+                {
+                    "issue_code": "scanner_blank",
+                    "market": market_key,
+                    "view": view_name,
+                    "expected_rows": int(scores_total),
+                    "actual_rows": int(table_rows),
+                    "message": f"{market_key.title()} scanner view blank despite {scores_total} ranked candidates.",
+                }
+            )
+        if view_name == "Leaders" and leaders_total > 0 and table_rows <= 0:
+            issues.append(
+                {
+                    "issue_code": "leaders_blank",
+                    "market": market_key,
+                    "view": view_name,
+                    "expected_rows": int(leaders_total),
+                    "actual_rows": int(table_rows),
+                    "message": f"{market_key.title()} leaders view blank despite {leaders_total} available leaders.",
+                }
+            )
+        return issues
+
+    def _schedule_market_panel_self_heal(self, market_key: str, delay_ms: int = 180) -> None:
+        if "tk" not in self.__dict__:
+            return
+        panel = self.market_panels.get(market_key, {})
+        prev_id = str(panel.get("panel_self_heal_after_id", "") or "").strip()
+        if prev_id:
+            return
+
+        def _run() -> None:
+            panel["panel_self_heal_after_id"] = ""
+            panel["panel_self_heal_last_ts"] = time.time()
+            try:
+                self._refresh_parallel_market_panels()
+            except Exception:
+                try:
+                    self._refresh_market_overview_fallback()
+                except Exception:
+                    pass
+
+        try:
+            aft = self.after(max(80, int(delay_ms or 180)), _run)
+            panel["panel_self_heal_after_id"] = str(aft)
+        except Exception:
+            panel["panel_self_heal_after_id"] = ""
+
+    def _audit_market_panel_consistency(
+        self,
+        market_key: str,
+        status_data: Optional[Dict[str, Any]],
+        thinker_data: Optional[Dict[str, Any]],
+        diag_data: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        issues = self._market_panel_consistency_issues(market_key, status_data, thinker_data, diag_data)
+        if not issues:
+            return
+        for issue in issues:
+            issue_code = str(issue.get("issue_code", "panel_desync") or "panel_desync").strip().lower()
+            view_name = str(issue.get("view", "") or "").strip()
+            msg = str(issue.get("message", "") or "").strip()
+            emitted = self._record_ui_incident(
+                "warning",
+                "ui_market_panel_desync",
+                msg,
+                {
+                    "market": market_key,
+                    "view": view_name,
+                    "issue_code": issue_code,
+                    "expected_rows": int(issue.get("expected_rows", 0) or 0),
+                    "actual_rows": int(issue.get("actual_rows", 0) or 0),
+                },
+                cooldown_key=f"{market_key}:{issue_code}:{view_name or 'panel'}",
+                cooldown_s=180.0,
+            )
+            if emitted and msg:
+                self._append_market_log(market_key, f"[UI] {msg} | self-heal scheduled")
+        self._schedule_market_panel_self_heal(market_key)
 
     def _market_fmt_num(self, value: Any, digits: int = 2) -> str:
         try:
@@ -9328,6 +8539,52 @@ class PowerTraderHub(tk.Tk):
             widget.configure(state="disabled")
             try:
                 do_scroll = bool(panel.get("history_autoscroll_var").get()) if panel.get("history_autoscroll_var") else True
+            except Exception:
+                do_scroll = True
+            if do_scroll:
+                widget.see("end")
+        except Exception:
+            pass
+
+    def _set_market_runner_output(self, market_key: str, lines: List[str]) -> None:
+        panel = self.market_panels.get(market_key, {})
+        widget = panel.get("runner_text")
+        if not widget:
+            return
+        payload = list(lines or [])
+        if not payload:
+            payload = ["Waiting for market runner output."]
+        try:
+            widget.configure(state="normal")
+            widget.delete("1.0", "end")
+            widget.insert("1.0", "\n".join(str(x) for x in payload[-220:]) + "\n")
+            widget.configure(state="disabled")
+            self._style_log_text_widget(widget)
+            try:
+                do_scroll = bool(panel.get("runner_autoscroll_var").get()) if panel.get("runner_autoscroll_var") else True
+            except Exception:
+                do_scroll = True
+            if do_scroll:
+                widget.see("end")
+        except Exception:
+            pass
+
+    def _set_market_training_output(self, market_key: str, lines: List[str]) -> None:
+        panel = self.market_panels.get(market_key, {})
+        widget = panel.get("training_text")
+        if not widget:
+            return
+        payload = list(lines or [])
+        if not payload:
+            payload = ["Waiting for training/readiness output."]
+        try:
+            widget.configure(state="normal")
+            widget.delete("1.0", "end")
+            widget.insert("1.0", "\n".join(str(x) for x in payload[-220:]) + "\n")
+            widget.configure(state="disabled")
+            self._style_log_text_widget(widget)
+            try:
+                do_scroll = bool(panel.get("training_autoscroll_var").get()) if panel.get("training_autoscroll_var") else True
             except Exception:
                 do_scroll = True
             if do_scroll:
@@ -10476,12 +9733,18 @@ class PowerTraderHub(tk.Tk):
     def _refresh_parallel_market_panels(self) -> None:
         awareness = build_awareness_payload()
         broker_awareness = awareness.get("brokers", {}) if isinstance(awareness.get("brokers", {}), dict) else {}
+        runtime_snapshot = _safe_read_json(self._runtime_state_file_path()) or {}
+        if not isinstance(runtime_snapshot, dict):
+            runtime_snapshot = {}
         loop_status = _safe_read_json(os.path.join(self.hub_dir, "market_loop_status.json")) or {}
         if not isinstance(loop_status, dict):
             loop_status = {}
         trends_payload = _safe_read_json(os.path.join(self.hub_dir, "market_trends.json")) or {}
         if not isinstance(trends_payload, dict):
             trends_payload = {}
+        walkforward_report = runtime_snapshot.get("walkforward_report", {}) if isinstance(runtime_snapshot.get("walkforward_report", {}), dict) else {}
+        confidence_calibration = runtime_snapshot.get("confidence_calibration", {}) if isinstance(runtime_snapshot.get("confidence_calibration", {}), dict) else {}
+        shadow_scorecards = runtime_snapshot.get("shadow_scorecards", {}) if isinstance(runtime_snapshot.get("shadow_scorecards", {}), dict) else {}
         for market_key, panel in self.market_panels.items():
             snap = self._market_settings_snapshot(market_key)
             configured = bool(snap.get("configured"))
@@ -10509,6 +9772,43 @@ class PowerTraderHub(tk.Tk):
             thinker_data = bundle.get("thinker", {}) if isinstance(bundle.get("thinker", {}), dict) else {}
             diag_data = bundle.get("scan_diagnostics", {}) if isinstance(bundle.get("scan_diagnostics", {}), dict) else {}
             trend_row = trends_payload.get(market_key, {}) if isinstance(trends_payload.get(market_key, {}), dict) else {}
+            try:
+                snapshot_every_s = max(
+                    10.0,
+                    float(
+                        self.settings.get(
+                            "market_bg_snapshot_interval_s",
+                            DEFAULT_SETTINGS.get("market_bg_snapshot_interval_s", 15.0),
+                        )
+                        or 15.0
+                    ),
+                )
+            except Exception:
+                snapshot_every_s = 15.0
+            try:
+                snapshot_stale_after_s = max(30.0, snapshot_every_s * 2.0)
+            except Exception:
+                snapshot_stale_after_s = 30.0
+            snapshot_self_heal = bool(
+                configured
+                and needs_market_snapshot_refresh(
+                    status_data,
+                    loop_status,
+                    market_key,
+                    now_ts=time.time(),
+                    stale_after_s=snapshot_stale_after_s,
+                )
+            )
+            if snapshot_self_heal:
+                if not bool(panel.get("snapshot_self_heal_active", False)):
+                    self._append_market_log(
+                        market_key,
+                        "[REFRESH] Broker snapshot missing/stale; refreshing account details locally.",
+                    )
+                panel["snapshot_self_heal_active"] = True
+                self._schedule_market_snapshot_refresh(market_key, every_s=snapshot_every_s)
+            else:
+                panel["snapshot_self_heal_active"] = False
 
             ai_state = str(thinker_data.get("ai_state", status_data.get("ai_state", state_txt)) or state_txt)
             trader_state = str(trader_data.get("trader_state", status_data.get("trader_state", "Idle")) or "Idle")
@@ -10823,13 +10123,43 @@ class PowerTraderHub(tk.Tk):
 
             pvars = panel.get("portfolio_vars", {})
             if isinstance(pvars, dict):
-                bp_val = str(status_data.get("buying_power", "Pending account link") or "Pending account link")
+                bp_raw = (
+                    status_data.get("buying_power")
+                    if status_data.get("buying_power") not in (None, "")
+                    else status_data.get("margin_available", status_data.get("cash", ""))
+                )
+                bp_val = str(bp_raw or "Pending account link")
+                if bp_val.strip().upper() in {"", "N/A", "PENDING ACCOUNT LINK"}:
+                    alt_bp = None
+                    for candidate in (
+                        status_data.get("margin_available"),
+                        status_data.get("cash"),
+                        status_data.get("buying_power"),
+                    ):
+                        if candidate in (None, ""):
+                            continue
+                        alt_bp = candidate
+                        break
+                    if alt_bp not in (None, ""):
+                        bp_val = str(alt_bp)
                 if bp_val.strip().upper() in {"", "N/A", "PENDING ACCOUNT LINK"}:
                     try:
                         acct = float(trader_data.get("account_value_usd", 0.0) or 0.0)
                         expo = float(trader_data.get("exposure_usd", 0.0) or 0.0)
                         if acct > 0.0:
                             bp_val = _fmt_money(max(0.0, acct - expo))
+                    except Exception:
+                        pass
+                if bp_val.strip().upper() in {"", "N/A", "PENDING ACCOUNT LINK"}:
+                    try:
+                        if market_key == "stocks":
+                            equity_val = float(status_data.get("equity", 0.0) or 0.0)
+                            if equity_val > 0.0:
+                                bp_val = _fmt_money(equity_val)
+                        else:
+                            nav_val = float(status_data.get("nav", 0.0) or 0.0)
+                            if nav_val > 0.0:
+                                bp_val = f"{nav_val:.4f} {str(status_data.get('currency', 'USD') or 'USD').strip()}".strip()
                     except Exception:
                         pass
                 pos_val = str(status_data.get("open_positions", "0") or "0")
@@ -10903,6 +10233,156 @@ class PowerTraderHub(tk.Tk):
                 panel["last_history_sig"] = history_sig
                 panel["history_lines"] = list(history_lines[-120:])
                 self._set_market_history(market_key, history_lines)
+
+            scoped_alerts = self._scoped_alert_snapshot(runtime_snapshot, market_key)
+            scoped_items = list(scoped_alerts.get("items", []) or []) if isinstance(scoped_alerts.get("items", []), list) else []
+            runtime_ref_ts = float(runtime_snapshot.get("ts", 0) or time.time())
+            runner_lines: List[str] = []
+            runner_ts_candidates: List[float] = []
+            loop_hb_ts = float(loop_status.get("heartbeat_ts", 0) or 0.0)
+            if loop_hb_ts > 0.0:
+                runner_ts_candidates.append(loop_hb_ts)
+                hb_age = max(0, int(time.time() - loop_hb_ts))
+                loop_phase = str(loop_status.get("phase", "idle") or "idle").strip()
+                phase_detail = str(loop_status.get("phase_detail", "") or "").strip()
+                runner_lines.append(
+                    f"[{self._format_ui_timestamp(loop_hb_ts)}] heartbeat ok | age={hb_age}s | phase={loop_phase}"
+                    + (f" | detail={phase_detail}" if phase_detail else "")
+                )
+            last_scan_ts = float(loop_status.get(f"{market_key}_last_scan_ts", 0) or 0.0)
+            if last_scan_ts > 0.0:
+                runner_ts_candidates.append(last_scan_ts)
+                runner_lines.append(
+                    f"[{self._format_ui_timestamp(last_scan_ts)}] last scan complete | age={max(0, int(time.time() - last_scan_ts))}s"
+                )
+            last_step_ts = float(loop_status.get(f"{market_key}_last_step_ts", 0) or 0.0)
+            if last_step_ts > 0.0:
+                runner_ts_candidates.append(last_step_ts)
+                runner_lines.append(
+                    f"[{self._format_ui_timestamp(last_step_ts)}] last trader step complete | age={max(0, int(time.time() - last_step_ts))}s"
+                )
+            next_scan_ts = float(loop_status.get(f"next_{market_key}_scan_ts", 0) or 0.0)
+            if next_scan_ts > 0.0:
+                runner_lines.append(f"[{self._format_ui_timestamp(next_scan_ts)}] next scan {self._market_eta_or_age(next_scan_ts)}")
+            if cadence_meta:
+                try:
+                    obs_s = float(cadence_meta.get("observed_s", 0.0) or 0.0)
+                    exp_s = float(cadence_meta.get("expected_s", 0.0) or 0.0)
+                    late_pct = float(cadence_meta.get("late_pct", 0.0) or 0.0)
+                    level = str(cadence_meta.get("level", "ok") or "ok").strip().lower()
+                    runner_lines.append(
+                        f"[{self._format_ui_timestamp(runtime_ref_ts)}] cadence {level.upper()} | observed={obs_s:.1f}s | target={exp_s:.1f}s | late={late_pct:.1f}%"
+                    )
+                except Exception:
+                    pass
+            runner_lines.append(
+                f"[{self._format_ui_timestamp(runtime_ref_ts)}] auto scan={'ON' if auto_scan_on else 'OFF'} | auto step={'ON' if auto_step_on else 'OFF'} | "
+                f"scan busy={'YES' if bool(self._market_thinker_busy.get(market_key, False)) else 'NO'} | "
+                f"step busy={'YES' if bool(self._market_trader_busy.get(market_key, False)) else 'NO'}"
+            )
+            for row in scoped_items[:8]:
+                if not isinstance(row, dict):
+                    continue
+                source = str(row.get("source", "") or "").strip().lower()
+                if source not in {"incidents", "runtime_alerts"}:
+                    continue
+                ts_val = float(row.get("ts", 0) or 0.0)
+                if ts_val > 0.0:
+                    runner_ts_candidates.append(ts_val)
+                sev_txt = self._normalize_alert_severity(row.get("severity", "info")).upper()
+                title_txt = str(row.get("title", "") or "event").strip()
+                msg_txt = str(row.get("message", "") or "").strip()
+                runner_lines.append(
+                    f"[{self._format_ui_timestamp(ts_val)}] {sev_txt} {title_txt}"
+                    + (f" | {msg_txt}" if msg_txt else "")
+                )
+            runner_sig = tuple(runner_lines[-80:])
+            if panel.get("last_runner_output_sig") != runner_sig:
+                panel["last_runner_output_sig"] = runner_sig
+                panel["runner_lines"] = list(runner_lines[-220:])
+                self._set_market_runner_output(market_key, runner_lines)
+
+            training_lines: List[str] = []
+            training_ts_candidates: List[float] = []
+            walk_row = walkforward_report.get(market_key, {}) if isinstance(walkforward_report.get(market_key, {}), dict) else {}
+            calib_row = confidence_calibration.get(market_key, {}) if isinstance(confidence_calibration.get(market_key, {}), dict) else {}
+            score_row = shadow_scorecards.get(market_key, {}) if isinstance(shadow_scorecards.get(market_key, {}), dict) else {}
+            if walk_row:
+                walk_ts = float(walk_row.get("ts", 0) or 0.0)
+                if walk_ts > 0.0:
+                    training_ts_candidates.append(walk_ts)
+                agg = walk_row.get("aggregate", {}) if isinstance(walk_row.get("aggregate", {}), dict) else {}
+                training_lines.append(
+                    f"[{self._format_ui_timestamp(walk_ts)}] walkforward {str(walk_row.get('state', 'N/A') or 'N/A').upper()} | "
+                    f"days={int(walk_row.get('days_covered', 0) or 0)} | events={int(walk_row.get('events_considered', 0) or 0)} | "
+                    f"win={float(agg.get('win_rate_pct', 0.0) or 0.0):.2f}% | pnl={float(agg.get('pnl_usd', 0.0) or 0.0):+.2f} | "
+                    f"stability={str(walk_row.get('stability', 'n/a') or 'n/a')}"
+                )
+            if calib_row:
+                calib_ts = float(calib_row.get("ts", 0) or 0.0)
+                if calib_ts > 0.0:
+                    training_ts_candidates.append(calib_ts)
+                rec = calib_row.get("recommendation", {}) if isinstance(calib_row.get("recommendation", {}), dict) else {}
+                training_lines.append(
+                    f"[{self._format_ui_timestamp(calib_ts)}] calibration {str(calib_row.get('state', 'N/A') or 'N/A').upper()} | "
+                    f"samples={int(calib_row.get('samples', 0) or 0)} | wins={int(calib_row.get('wins', 0) or 0)} | "
+                    f"win={float(calib_row.get('win_rate_pct', 0.0) or 0.0):.2f}% | "
+                    f"threshold {float(rec.get('base_threshold', 0.0) or 0.0):.3f}->{float(rec.get('recommended_threshold', 0.0) or 0.0):.3f} | "
+                    f"{str(rec.get('reason', 'n/a') or 'n/a')}"
+                )
+                curve = list(calib_row.get("curve", []) or []) if isinstance(calib_row.get("curve", []), list) else []
+                densest = None
+                for row in curve:
+                    if not isinstance(row, dict):
+                        continue
+                    if densest is None or int(row.get("samples", 0) or 0) > int(densest.get("samples", 0) or 0):
+                        densest = row
+                if isinstance(densest, dict) and int(densest.get("samples", 0) or 0) > 0:
+                    training_lines.append(
+                        f"[{self._format_ui_timestamp(calib_ts)}] densest score bin {str(densest.get('bin', 'n/a') or 'n/a')} | "
+                        f"samples={int(densest.get('samples', 0) or 0)} | success={float(densest.get('success_rate_pct', 0.0) or 0.0):.2f}%"
+                    )
+            if score_row:
+                score_ts = float(score_row.get("ts", 0) or 0.0)
+                if score_ts > 0.0:
+                    training_ts_candidates.append(score_ts)
+                blockers = [str(x or "").strip() for x in list(score_row.get("blockers", []) or []) if str(x or "").strip()]
+                warnings = [str(x or "").strip() for x in list(score_row.get("warnings", []) or []) if str(x or "").strip()]
+                metrics = score_row.get("metrics", {}) if isinstance(score_row.get("metrics", {}), dict) else {}
+                training_lines.append(
+                    f"[{self._format_ui_timestamp(score_ts)}] readiness {str(score_row.get('promotion_gate', 'N/A') or 'N/A').upper()} | "
+                    f"score={float(score_row.get('readiness_score', 0.0) or 0.0):.2f} | "
+                    f"reject={float(metrics.get('reject_rate_pct', 0.0) or 0.0):.1f}% | "
+                    f"reliability={float(metrics.get('data_reliability_score', 0.0) or 0.0):.1f}"
+                )
+                if blockers:
+                    training_lines.append(f"[{self._format_ui_timestamp(score_ts)}] blockers: {', '.join(blockers[:4])}")
+                elif warnings:
+                    training_lines.append(f"[{self._format_ui_timestamp(score_ts)}] warnings: {', '.join(warnings[:4])}")
+            training_lines.append(
+                f"[{self._format_ui_timestamp(runtime_ref_ts)}] thinker universe={uni_n} | leaders={leaders_n} | top={top_ident} {top_side} {top_score}"
+            )
+            if why_reason:
+                training_lines.append(
+                    f"[{self._format_ui_timestamp(runtime_ref_ts)}] why-not-traded ({why_source or 'scanner'}): {why_reason}"
+                )
+            for row in scoped_items[:8]:
+                if not isinstance(row, dict):
+                    continue
+                source = str(row.get("source", "") or "").strip().lower()
+                if source not in {"market_trends", "execution_gate"}:
+                    continue
+                ts_val = float(row.get("ts", 0) or 0.0)
+                if ts_val > 0.0:
+                    training_ts_candidates.append(ts_val)
+                training_lines.append(
+                    f"[{self._format_ui_timestamp(ts_val)}] {str(row.get('title', '') or 'note').strip()} | {str(row.get('message', '') or '').strip()}"
+                )
+            training_sig = tuple(training_lines[-80:])
+            if panel.get("last_training_output_sig") != training_sig:
+                panel["last_training_output_sig"] = training_sig
+                panel["training_lines"] = list(training_lines[-220:])
+                self._set_market_training_output(market_key, training_lines)
 
             extra_note = str(thinker_data.get("pdt_note", "") or status_data.get("pdt_note", "") or "").strip()
             diag_note = ""
@@ -11045,6 +10525,20 @@ class PowerTraderHub(tk.Tk):
                 panel["logs_age_var"].set(age_txt)
             except Exception:
                 pass
+            try:
+                runner_ts = max(runner_ts_candidates) if runner_ts_candidates else source_ts
+                panel["runner_age_var"].set(self._market_age_text(runner_ts))
+            except Exception:
+                pass
+            try:
+                training_ts = max(training_ts_candidates) if training_ts_candidates else source_ts
+                panel["training_age_var"].set(self._market_age_text(training_ts))
+            except Exception:
+                pass
+            try:
+                self._audit_market_panel_consistency(market_key, status_data, thinker_data, diag_data)
+            except Exception:
+                pass
 
             log_sig = (
                 configured,
@@ -11108,6 +10602,195 @@ class PowerTraderHub(tk.Tk):
                     )
             except Exception:
                 pass
+
+    def _refresh_market_overview_fallback(self) -> None:
+        for market_key, panel in self.market_panels.items():
+            try:
+                snap = self._market_settings_snapshot(market_key)
+                broker = str(snap.get("broker", market_key.title()) or market_key.title())
+                mode_txt = str(snap.get("mode", "") or "")
+                endpoint = str(snap.get("endpoint", "") or "").strip()
+                diag_paths = self.__dict__.get("market_scan_diag_paths", {}) or {}
+                state_dirs = self.__dict__.get("market_state_dirs", {}) or {}
+                hub_dir = str(self.__dict__.get("hub_dir", self.project_dir) or self.project_dir)
+                history_path = os.path.join(state_dirs.get(market_key, hub_dir), "execution_audit.jsonl")
+                bundle = load_market_status_bundle(
+                    status_path=str(self.market_status_paths.get(market_key, "") or panel.get("status_path", "") or ""),
+                    trader_path=str(self.market_trader_paths.get(market_key, "") or ""),
+                    thinker_path=str(self.market_thinker_paths.get(market_key, "") or ""),
+                    scan_diag_path=str(diag_paths.get(market_key, "") or ""),
+                    history_path=history_path,
+                    history_limit=40,
+                    market_key=market_key,
+                )
+                status_data = bundle.get("status", {}) if isinstance(bundle.get("status", {}), dict) else {}
+                trader_data = bundle.get("trader", {}) if isinstance(bundle.get("trader", {}), dict) else {}
+                thinker_data = bundle.get("thinker", {}) if isinstance(bundle.get("thinker", {}), dict) else {}
+                diag_data = bundle.get("scan_diagnostics", {}) if isinstance(bundle.get("scan_diagnostics", {}), dict) else {}
+
+                ai_state = str(
+                    thinker_data.get(
+                        "ai_state",
+                        status_data.get("ai_state", "Broker linked" if bool(snap.get("configured", False)) else "not configured"),
+                    )
+                    or "n/a"
+                )
+                trader_state = str(
+                    trader_data.get(
+                        "trader_state",
+                        status_data.get("trader_state", "Idle" if bool(snap.get("configured", False)) else "not configured"),
+                    )
+                    or "n/a"
+                )
+                msg = str(trader_data.get("msg", "") or thinker_data.get("msg", "") or status_data.get("msg", "") or "").strip()
+                panel["ai_var"].set(f"{panel['market_name']} AI: {ai_state}")
+                panel["trader_var"].set(f"{panel['market_name']} Trader: {trader_state}")
+                state_line = f"Trade State: {str(thinker_data.get('state', status_data.get('state', 'UNKNOWN')) or 'UNKNOWN')}"
+                if msg:
+                    state_line += f" | {msg}"
+                panel["state_var"].set(self._format_market_state_line(state_line))
+                panel["endpoint_var"].set(f"Broker: {broker} | {mode_txt or 'N/A'} | {endpoint or 'endpoint not set'}")
+
+                pvars = panel.get("portfolio_vars", {})
+                if isinstance(pvars, dict):
+                    bp_raw = (
+                        status_data.get("buying_power")
+                        if status_data.get("buying_power") not in (None, "")
+                        else status_data.get("margin_available", status_data.get("cash", ""))
+                    )
+                    bp_val = str(bp_raw or "").strip()
+                    if bp_val.upper() in {"", "N/A", "PENDING ACCOUNT LINK"}:
+                        alt_bp = None
+                        for candidate in (
+                            status_data.get("margin_available"),
+                            status_data.get("cash"),
+                            status_data.get("buying_power"),
+                        ):
+                            if candidate in (None, ""):
+                                continue
+                            alt_bp = candidate
+                            break
+                        if alt_bp not in (None, ""):
+                            bp_val = str(alt_bp).strip()
+                    if not bp_val:
+                        try:
+                            acct = float(trader_data.get("account_value_usd", 0.0) or 0.0)
+                            expo = float(trader_data.get("exposure_usd", 0.0) or 0.0)
+                            if acct > 0.0:
+                                bp_val = _fmt_money(max(0.0, acct - expo))
+                        except Exception:
+                            bp_val = ""
+                    if str(bp_val or "").strip().upper() in {"", "N/A", "PENDING ACCOUNT LINK"}:
+                        try:
+                            if market_key == "stocks":
+                                equity_val = float(status_data.get("equity", 0.0) or 0.0)
+                                if equity_val > 0.0:
+                                    bp_val = _fmt_money(equity_val)
+                            else:
+                                nav_val = float(status_data.get("nav", 0.0) or 0.0)
+                                if nav_val > 0.0:
+                                    bp_val = f"{nav_val:.4f} {str(status_data.get('currency', 'USD') or 'USD').strip()}".strip()
+                        except Exception:
+                            pass
+                    pvars["buying_power"].set(bp_val or "Pending account link")
+                    pvars["open_positions"].set(str(status_data.get("open_positions", trader_data.get("open_positions", "0")) or "0"))
+                    pvars["realized_pnl"].set(str(status_data.get("realized_pnl", "N/A") or "N/A"))
+                    pvars["mode"].set(mode_txt or "Paper first")
+
+                try:
+                    self._set_market_positions(
+                        market_key,
+                        list(status_data.get("positions_preview", []) or []),
+                        raw_positions=list(status_data.get("raw_positions", []) or []),
+                    )
+                except Exception:
+                    pass
+
+                history_lines: List[str] = []
+                for row in list(trader_data.get("actions", []) or [])[-12:]:
+                    txt = str(row or "").strip()
+                    if txt:
+                        history_lines.append(txt)
+                if not history_lines:
+                    for row in list(bundle.get("history", []) or [])[-12:]:
+                        if not isinstance(row, dict):
+                            continue
+                        ident = str(row.get("symbol", "") or row.get("instrument", "") or "").strip().upper()
+                        side = str(row.get("side", "") or row.get("event", "") or "").strip().upper()
+                        msg_txt = str(row.get("msg", "") or "").strip()
+                        history_lines.append(" | ".join(x for x in (ident, side, msg_txt) if x))
+                if trader_data.get("msg"):
+                    history_lines.insert(0, str(trader_data.get("msg", "") or "").strip())
+                elif thinker_data.get("msg"):
+                    history_lines.insert(0, f"Thinker: {str(thinker_data.get('msg', '') or '').strip()}")
+                try:
+                    self._set_market_history(market_key, history_lines)
+                except Exception:
+                    pass
+
+                runner_lines: List[str] = []
+                if status_data.get("state"):
+                    runner_lines.append(f"Snapshot state: {str(status_data.get('state', '') or '').strip()}")
+                if thinker_data.get("state"):
+                    runner_lines.append(f"Scanner state: {str(thinker_data.get('state', '') or '').strip()}")
+                if diag_data:
+                    try:
+                        runner_lines.append(
+                            f"Scan health: leaders={int(diag_data.get('leaders_total', 0) or 0)} "
+                            f"scores={int(diag_data.get('scores_total', 0) or 0)}"
+                        )
+                    except Exception:
+                        pass
+                try:
+                    self._set_market_runner_output(market_key, runner_lines)
+                except Exception:
+                    pass
+
+                training_lines: List[str] = []
+                leaders = list(thinker_data.get("leaders", []) or [])
+                if leaders:
+                    top = leaders[0] if isinstance(leaders[0], dict) else {}
+                    ident = str(top.get("pair") or top.get("symbol") or "").strip().upper()
+                    side = str(top.get("side", "watch") or "watch").strip().upper()
+                    score = top.get("score", "")
+                    training_lines.append(f"Top candidate: {ident or 'N/A'} | {side} | {score}")
+                try:
+                    self._set_market_training_output(market_key, training_lines)
+                except Exception:
+                    pass
+
+                try:
+                    self._render_market_canvas(market_key, thinker_data, status_data=status_data, diag_data=diag_data)
+                except Exception:
+                    pass
+
+                source_ts = (
+                    trader_data.get("updated_at")
+                    or thinker_data.get("updated_at")
+                    or thinker_data.get("ts")
+                    or status_data.get("ts")
+                )
+                age_txt = self._market_age_text(source_ts)
+                for age_key in (
+                    "charts_age_var",
+                    "positions_age_var",
+                    "history_age_var",
+                    "logs_age_var",
+                    "runner_age_var",
+                    "training_age_var",
+                ):
+                    try:
+                        age_var = panel.get(age_key)
+                        if age_var is not None:
+                            age_var.set(age_txt)
+                    except Exception:
+                        pass
+                try:
+                    self._audit_market_panel_consistency(market_key, status_data, thinker_data, diag_data)
+                except Exception:
+                    pass
+            except Exception:
+                continue
 
     def _run_market_connection_test(self, market_key: str) -> None:
         if self._market_test_busy.get(market_key):
@@ -11818,7 +11501,7 @@ class PowerTraderHub(tk.Tk):
 
     def _coin_is_trained(self, coin: str) -> bool:
         coin = coin.upper().strip()
-        folder = self.coin_folders.get(coin, "")
+        folder = self.coin_folders.get(coin, "") or self._crypto_coin_folder_path(coin)
         if not folder or not os.path.isdir(folder):
             return False
 
@@ -11843,6 +11526,73 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             return False
 
+    def _crypto_training_candidate_symbols(self) -> List[str]:
+        symbols: List[str] = []
+        seen = set()
+
+        def _add(value: Any) -> None:
+            coin = str(value or "").strip().upper()
+            if (not coin) or coin in seen:
+                return
+            if not re.fullmatch(r"[A-Z0-9_-]{2,16}", coin):
+                return
+            seen.add(coin)
+            symbols.append(coin)
+
+        for coin in self.coins:
+            _add(coin)
+
+        dynamic = _safe_read_json(self.crypto_dynamic_status_path) or {}
+        for coin in list(dynamic.get("current_coins", []) or []):
+            _add(coin)
+        for row in list(dynamic.get("ranked", []) or []):
+            if isinstance(row, dict):
+                _add(row.get("symbol"))
+
+        for coin in self.trainers.keys():
+            _add(coin)
+
+        base = str(self.settings.get("main_neural_dir", self.project_dir) or self.project_dir).strip() or self.project_dir
+        if not os.path.isabs(base):
+            base = os.path.abspath(os.path.join(self.project_dir, base))
+        try:
+            for name in sorted(os.listdir(base)):
+                path = os.path.join(base, name)
+                if not os.path.isdir(path):
+                    continue
+                if not (
+                    os.path.isfile(os.path.join(path, "trainer_status.json"))
+                    or os.path.isfile(os.path.join(path, "trainer_last_training_time.txt"))
+                ):
+                    continue
+                _add(name)
+        except Exception:
+            pass
+        return symbols
+
+    def _sync_crypto_training_selectors(self, symbols: Optional[List[str]] = None) -> None:
+        opts = [str(c or "").strip().upper() for c in list(symbols or []) if str(c or "").strip()]
+        if not opts:
+            opts = [str(c or "").strip().upper() for c in list(self.coins or []) if str(c or "").strip()]
+        if not opts:
+            return
+        try:
+            if hasattr(self, "train_coin_combo") and self.train_coin_combo.winfo_exists():
+                self.train_coin_combo["values"] = opts
+                cur = (self.train_coin_var.get() or "").strip().upper() if hasattr(self, "train_coin_var") else ""
+                if cur not in opts:
+                    self.train_coin_var.set(opts[0])
+            if hasattr(self, "trainer_coin_combo") and self.trainer_coin_combo.winfo_exists():
+                self.trainer_coin_combo["values"] = opts
+                cur = (self.trainer_coin_var.get() or "").strip().upper() if hasattr(self, "trainer_coin_var") else ""
+                if cur not in opts:
+                    self.trainer_coin_var.set(opts[0])
+            if hasattr(self, "train_coin_var") and hasattr(self, "trainer_coin_var"):
+                if (self.train_coin_var.get() or "").strip().upper() in opts:
+                    self.trainer_coin_var.set(self.train_coin_var.get())
+        except Exception:
+            pass
+
     def _running_trainers(self) -> List[str]:
         running: List[str] = []
 
@@ -11855,10 +11605,10 @@ class PowerTraderHub(tk.Tk):
                 pass
 
         # Trainers launched elsewhere: look at per-coin status file
-        for c in self.coins:
+        for c in self._crypto_training_candidate_symbols():
             try:
                 coin = (c or "").strip().upper()
-                folder = self.coin_folders.get(coin, "")
+                folder = self.coin_folders.get(coin, "") or self._crypto_coin_folder_path(coin)
                 if not folder or not os.path.isdir(folder):
                     continue
 
@@ -11889,21 +11639,21 @@ class PowerTraderHub(tk.Tk):
                 out.append(cc)
         return out
 
-
-
-    def _training_status_map(self) -> Dict[str, str]:
+    def _training_status_map(self, coins: Optional[List[str]] = None) -> Dict[str, str]:
         """
         Returns {coin: "TRAINED" | "TRAINING" | "NOT TRAINED"}.
         """
         running = set(self._running_trainers())
         out: Dict[str, str] = {}
-        for c in self.coins:
-            if c in running:
-                out[c] = "TRAINING"
-            elif self._coin_is_trained(c):
-                out[c] = "TRAINED"
+        candidates = [str(c or "").strip().upper() for c in list(coins or self.coins or []) if str(c or "").strip()]
+        for c in candidates:
+            coin = str(c or "").strip().upper()
+            if coin in running:
+                out[coin] = "TRAINING"
+            elif self._coin_is_trained(coin):
+                out[coin] = "TRAINED"
             else:
-                out[c] = "NOT TRAINED"
+                out[coin] = "NOT TRAINED"
         return out
 
     def train_selected_coin(self) -> None:
@@ -11954,7 +11704,8 @@ class PowerTraderHub(tk.Tk):
         # --- IMPORTANT ---
         # Match the trader's folder convention:
         #   every coin (including BTC) runs from <main_neural_dir>/<COIN>
-        coin_cwd = self.coin_folders.get(coin, self.project_dir)
+        coin_cwd = self.coin_folders.get(coin, "") or self._crypto_coin_folder_path(coin)
+        self.coin_folders[coin] = coin_cwd
 
         # Use the trainer script that lives INSIDE that coin's folder so outputs land in the right place.
         trainer_name = os.path.basename(str(self.settings.get("script_neural_trainer", "engines/pt_trainer.py")))
@@ -12267,8 +12018,26 @@ class PowerTraderHub(tk.Tk):
                 pass
         try:
             self._refresh_parallel_market_panels()
-        except Exception:
-            pass
+        except Exception as exc:
+            log_once(
+                f"pt_hub:market_panel_refresh:{type(exc).__name__}:{str(exc)[:120]}",
+                f"[pt_hub] market panel refresh fallback {type(exc).__name__}: {exc}",
+            )
+            try:
+                self._record_ui_incident(
+                    "error",
+                    "market_panel_refresh_failed",
+                    f"{type(exc).__name__}: {exc}",
+                    {"exception": traceback.format_exc(limit=12)[-4000:]},
+                    cooldown_key=f"market_panel_refresh_failed:{type(exc).__name__}:{str(exc)[:160]}",
+                    cooldown_s=180.0,
+                )
+            except Exception:
+                pass
+            try:
+                self._refresh_market_overview_fallback()
+            except Exception:
+                pass
 
         runtime = self._read_runner_status()
         runtime_state = str(runtime.get("state", "STOPPED") or "STOPPED").upper().strip()
@@ -12315,7 +12084,8 @@ class PowerTraderHub(tk.Tk):
             )
             self.lbl_broker_health.config(text=broker_txt)
             checks = runtime_snapshot.get("checks", {}) if isinstance(runtime_snapshot.get("checks", {}), dict) else {}
-            alerts = runtime_snapshot.get("alerts", {}) if isinstance(runtime_snapshot.get("alerts", {}), dict) else {}
+            active_market_key = self._active_market_key()
+            scoped_alerts = self._scoped_alert_snapshot(runtime_snapshot, active_market_key)
             guard = runtime_snapshot.get("execution_guard", {}) if isinstance(runtime_snapshot.get("execution_guard", {}), dict) else {}
             incidents = runtime_snapshot.get("incidents_last_200", {}) if isinstance(runtime_snapshot.get("incidents_last_200", {}), dict) else {}
             drawdown_guard = runtime_snapshot.get("drawdown_guard", {}) if isinstance(runtime_snapshot.get("drawdown_guard", {}), dict) else {}
@@ -12338,13 +12108,28 @@ class PowerTraderHub(tk.Tk):
                     continue
                 if int(row.get("disabled_until", 0) or 0) > ts_now:
                     guard_active += 1
+            scoped_recent_count = 0
+            try:
+                now_ts_f = float(time.time())
+                scoped_items = scoped_alerts.get("items", []) if isinstance(scoped_alerts.get("items", []), list) else []
+                for row in scoped_items:
+                    if not isinstance(row, dict):
+                        continue
+                    sev_txt = self._normalize_alert_severity(row.get("severity", "info"))
+                    if sev_txt not in {"critical", "warning"}:
+                        continue
+                    ts_val = float(row.get("ts", 0) or 0.0)
+                    if ts_val > 0.0 and (now_ts_f - ts_val) <= 3600.0:
+                        scoped_recent_count += 1
+            except Exception:
+                scoped_recent_count = 0
             ck_txt = (
                 "Checklist: "
                 + f"checks={'PASS' if bool(checks.get('ok', False)) else 'FAIL'} | "
-                + f"alerts={str(alerts.get('severity', 'n/a') or 'n/a').upper()} | "
+                + f"alerts={str(scoped_alerts.get('severity', 'ok') or 'ok').upper()} | "
                 + f"quota={str(aq.get('status', 'n/a') or 'n/a').upper()} | "
                 + f"guard={'ON' if guard_active > 0 else 'OFF'} | "
-                + f"inc1h={int(incidents.get('count_1h', 0) or 0)}"
+                + f"inc1h={scoped_recent_count}"
             )
             self.lbl_system_checklist.config(text=ck_txt)
             dd_recent = bool(drawdown_guard.get("triggered_recent", False))
@@ -12420,11 +12205,13 @@ class PowerTraderHub(tk.Tk):
             except Exception:
                 pass
             try:
-                by_sev = notification_center.get("by_severity", {}) if isinstance(notification_center.get("by_severity", {}), dict) else {}
+                by_sev = scoped_alerts.get("by_severity", {}) if isinstance(scoped_alerts.get("by_severity", {}), dict) else {}
                 c = int(by_sev.get("critical", 0) or 0)
                 w = int(by_sev.get("warning", 0) or 0)
                 i = int(by_sev.get("info", 0) or 0)
-                self.lbl_runtime_card_notifications.config(text=f"C{c} | W{w} | I{i}")
+                self.lbl_runtime_card_notifications.config(
+                    text=f"{self._market_display_name(active_market_key)} C{c} | W{w} | I{i}"
+                )
             except Exception:
                 pass
             try:
@@ -12453,7 +12240,8 @@ class PowerTraderHub(tk.Tk):
             pass
 
         # --- flow gating: Train -> Start All ---
-        status_map = self._training_status_map()
+        gate_symbols = [str(c or "").strip().upper() for c in list(self.coins or []) if str(c or "").strip()]
+        status_map = self._training_status_map(gate_symbols)
         all_trained = all(v == "TRAINED" for v in status_map.values()) if status_map else False
         try:
             self._maybe_auto_start_after_training(all_trained, neural_running, trader_running, status_map)
@@ -12501,25 +12289,32 @@ class PowerTraderHub(tk.Tk):
 
         # Training overview + per-coin list
         try:
-            training_running = [c for c, s in status_map.items() if s == "TRAINING"]
+            display_symbols = self._crypto_training_candidate_symbols()
+            display_status_map = self._training_status_map(display_symbols)
+            self._sync_crypto_training_selectors(display_symbols)
+
+            training_running = [c for c, s in display_status_map.items() if s == "TRAINING"]
             not_trained = [c for c, s in status_map.items() if s == "NOT TRAINED"]
+            visible_pending = [c for c, s in display_status_map.items() if s == "NOT TRAINED" and c not in gate_symbols]
             done_tokens = ("DONE", "COMPLETE", "COMPLETED", "FINISHED", "READY")
 
             if training_running:
                 self.lbl_training_overview.config(text=f"Training: RUNNING ({', '.join(training_running)})")
             elif not_trained:
                 self.lbl_training_overview.config(text=f"Training: REQUIRED ({len(not_trained)} not trained)")
+            elif visible_pending:
+                self.lbl_training_overview.config(text=f"Training: Active set ready | watchlist pending {len(visible_pending)}")
             else:
                 self.lbl_training_overview.config(text="Training: Idle (all trained)")
 
             # show each coin status (ONLY redraw the list if it actually changed)
-            sig = tuple((c, status_map.get(c, "N/A")) for c in self.coins)
+            sig = tuple((c, display_status_map.get(c, "N/A")) for c in display_symbols)
             display_lines = []
             for c, st in sig:
                 line_txt = f"{c}: {st}"
                 if str(st).upper() == "TRAINING":
                     try:
-                        folder = self.coin_folders.get(c, "")
+                        folder = self.coin_folders.get(c, "") or self._crypto_coin_folder_path(c)
                         status_path = os.path.join(folder, "trainer_status.json") if folder else ""
                         st_info = _safe_read_json(status_path) if status_path else None
                         pct_val = None
@@ -12541,9 +12336,9 @@ class PowerTraderHub(tk.Tk):
                 for line_txt in display_lines:
                     self.training_list.insert("end", line_txt)
 
-            total_training = len(sig)
+            total_training = len(gate_symbols)
             completed_training = 0
-            for _, st in sig:
+            for _, st in status_map.items():
                 up_st = str(st or "").upper().strip()
                 if up_st == "TRAINED":
                     completed_training += 1
@@ -12556,8 +12351,16 @@ class PowerTraderHub(tk.Tk):
             if completed_training > total_training:
                 completed_training = total_training
             progress_pct = int(round((100.0 * completed_training / total_training), 0)) if total_training > 0 else 0
+            visible_done = 0
+            for _, st in sig:
+                up_st = str(st or "").upper().strip()
+                if up_st == "TRAINED" or any(tok in up_st for tok in done_tokens):
+                    visible_done += 1
             self.lbl_training_progress.config(
-                text=f"Progress: {progress_pct}% ({completed_training} / {total_training})"
+                text=(
+                    f"Progress: {progress_pct}% active ({completed_training} / {total_training})"
+                    + (f" | visible {visible_done} / {len(sig)}" if sig else "")
+                )
             )
 
             # show gating hint for the detached trade supervisor
@@ -12589,11 +12392,11 @@ class PowerTraderHub(tk.Tk):
                 action_hint = "Next: click Start Trades to run thinker + trader."
             try:
                 runtime_snapshot = _safe_read_json(os.path.join(self.hub_dir, "runtime_state.json")) or {}
-                alerts = runtime_snapshot.get("alerts", {}) if isinstance(runtime_snapshot.get("alerts", {}), dict) else {}
-                qf = alerts.get("quickfix_suggestions", []) if isinstance(alerts.get("quickfix_suggestions", []), list) else []
+                scoped_alerts = self._scoped_alert_snapshot(runtime_snapshot, self._active_market_key())
+                qf = scoped_alerts.get("quickfix_suggestions", []) if isinstance(scoped_alerts.get("quickfix_suggestions", []), list) else []
                 if qf:
                     action_hint += f" | Quick fix: {str(qf[0])[:140]}"
-                links = alerts.get("runbook_links", []) if isinstance(alerts.get("runbook_links", []), list) else []
+                links = scoped_alerts.get("runbook_links", []) if isinstance(scoped_alerts.get("runbook_links", []), list) else []
                 if links and isinstance(links[0], dict):
                     action_hint += f" | Runbook: {str(links[0].get('path', '') or '')}"
             except Exception:
@@ -12699,12 +12502,18 @@ class PowerTraderHub(tk.Tk):
             self._last_chart_refresh = now
 
         # drain logs into panes
-        self._drain_queue_to_text(self.runner_log_q, self.runner_text)
+        self._drain_queue_to_text(self.runner_log_q, self.supervisor_text)
         self._drain_queue_to_text(self.trader_log_q, self.trader_text)
         self._refresh_log_file_to_text(
             self.runner_log_path,
             self.runner_text,
             "_last_runner_log_sig",
+            max_lines=500,
+        )
+        self._refresh_log_file_to_text(
+            self.supervisor_log_path,
+            self.supervisor_text,
+            "_last_supervisor_log_sig",
             max_lines=500,
             prefix_path=self.runner_launch_log_path,
         )
@@ -12963,6 +12772,66 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
 
+    def _trade_table_row_key(self, row: Dict[str, Any], row_index: int, seen_keys: Optional[set[str]] = None) -> str:
+        base_key = str(row.get("coin", "") or "").strip().upper()
+        if not base_key:
+            base_key = f"row_{int(row_index)}"
+        if seen_keys is None:
+            return base_key
+        key = base_key
+        suffix = 1
+        while key in seen_keys:
+            suffix += 1
+            key = f"{base_key}__{suffix}"
+        seen_keys.add(key)
+        return key
+
+    def _trade_table_signature(self, rows: List[Dict[str, Any]]) -> Tuple[Any, ...]:
+        cols = tuple(getattr(self, "trades_cols", ()) or ())
+        header_map = getattr(self, "trades_header_labels", {}) if isinstance(getattr(self, "trades_header_labels", {}), dict) else {}
+        header_sig = tuple((col, str(header_map.get(col, col) or col)) for col in cols)
+        row_sig: List[Tuple[str, Tuple[str, ...]]] = []
+        seen_keys: set[str] = set()
+        for row_index, row in enumerate(list(rows or [])):
+            if not isinstance(row, dict):
+                continue
+            key = self._trade_table_row_key(row, row_index, seen_keys)
+            row_sig.append((key, tuple(str(row.get(col, "") or "") for col in cols)))
+        return header_sig, tuple(row_sig)
+
+    def _set_trades_table_rows(self, rows: List[Dict[str, Any]]) -> bool:
+        normalized = [dict(row) for row in list(rows or []) if isinstance(row, dict)]
+        self._trades_table_rows = normalized
+        sig = self._trade_table_signature(normalized)
+        if getattr(self, "_trades_table_sig", None) == sig:
+            return False
+        self._trades_table_sig = sig
+        self._draw_trades_table()
+        return True
+
+    def _trade_table_cell_fg(self, col: str, cell_val: str) -> str:
+        fg = DARK_FG
+        if col in {"unrealized_usd", "realized_usd"}:
+            try:
+                num = float(str(cell_val).replace("$", "").replace(",", ""))
+                return DARK_ACCENT if num > 0 else ("#FF6B57" if num < 0 else DARK_FG)
+            except Exception:
+                return DARK_FG
+        if col == "sell_pnl":
+            try:
+                num = float(str(cell_val).replace("%", "").replace(",", ""))
+                return DARK_ACCENT if num > 0 else ("#FF6B57" if num < 0 else DARK_FG)
+            except Exception:
+                return DARK_FG
+        if col == "coin":
+            fg = DARK_ACCENT2
+        return fg
+
+    @staticmethod
+    def _trade_table_cell_font(col: str) -> Tuple[str, int, str]:
+        weight = "bold" if col in {"coin", "value", "unrealized_usd", "realized_usd", "sell_pnl"} else "normal"
+        return ("TkDefaultFont", 10, weight)
+
     def _draw_trades_table(self) -> None:
         canvas = getattr(self, "trades_canvas", None)
         cols = getattr(self, "trades_cols", ())
@@ -12985,19 +12854,40 @@ class PowerTraderHub(tk.Tk):
         header_h = int(getattr(self, "_trades_header_height", 28) or 28)
         row_h = int(getattr(self, "_trades_row_height", 28) or 28)
         total_h = header_h + (len(rows) * row_h)
+        render_state = getattr(self, "_trades_table_render_state", None)
+        if not isinstance(render_state, dict):
+            render_state = {}
+            self._trades_table_render_state = render_state
+        headers_state = render_state.get("headers")
+        if not isinstance(headers_state, dict):
+            headers_state = {}
+            render_state["headers"] = headers_state
+        row_state_map = render_state.get("rows")
+        if not isinstance(row_state_map, dict):
+            row_state_map = {}
+            render_state["rows"] = row_state_map
+        group_line_state = render_state.get("group_lines")
+        if not isinstance(group_line_state, dict):
+            group_line_state = {}
+            render_state["group_lines"] = group_line_state
+
+        def _safe_delete(item_id: Any) -> None:
+            try:
+                canvas.delete(item_id)
+            except Exception:
+                pass
 
         try:
-            canvas.delete("all")
+            canvas.configure(scrollregion=(0, 0, total_w, max(total_h, view_h)))
         except Exception:
             return
 
-        canvas.configure(scrollregion=(0, 0, total_w, max(total_h, view_h)))
-
         x = 0
         group_break_after = {"value", "realized_usd", "sell_pnl", "dca_24h"}
+        active_headers: set[str] = set()
         for col in cols:
+            active_headers.add(col)
             w = widths[col]
-            canvas.create_rectangle(x, 0, x + w, header_h, fill=DARK_BG2, outline=DARK_BORDER, width=1)
             anchor = "center"
             tx = x + (w / 2)
             if col in getattr(self, "trades_numeric_cols", set()):
@@ -13005,46 +12895,96 @@ class PowerTraderHub(tk.Tk):
                 tx = x + w - 8
             elif col in getattr(self, "trades_center_cols", set()):
                 anchor = "center"
-            canvas.create_text(
-                tx,
-                header_h / 2,
-                text=str(getattr(self, "trades_header_labels", {}).get(col, col)),
-                fill=DARK_ACCENT,
-                font=("TkDefaultFont", 10, "bold"),
-                anchor=anchor,
-            )
+            header_state = headers_state.get(col)
+            if not isinstance(header_state, dict):
+                header_state = {}
+            rect_id = header_state.get("rect_id")
+            if rect_id is None:
+                rect_id = canvas.create_rectangle(x, 0, x + w, header_h, fill=DARK_BG2, outline=DARK_BORDER, width=1)
+            else:
+                canvas.coords(rect_id, x, 0, x + w, header_h)
+            label = str(getattr(self, "trades_header_labels", {}).get(col, col))
+            text_id = header_state.get("text_id")
+            if text_id is None:
+                text_id = canvas.create_text(
+                    tx,
+                    header_h / 2,
+                    text=label,
+                    fill=DARK_ACCENT,
+                    font=("TkDefaultFont", 10, "bold"),
+                    anchor=anchor,
+                )
+            else:
+                canvas.coords(text_id, tx, header_h / 2)
+                header_updates = {}
+                if header_state.get("label") != label:
+                    header_updates["text"] = label
+                if header_state.get("anchor") != anchor:
+                    header_updates["anchor"] = anchor
+                if header_updates:
+                    canvas.itemconfigure(text_id, **header_updates)
+            header_state["rect_id"] = rect_id
+            header_state["text_id"] = text_id
+            header_state["label"] = label
+            header_state["anchor"] = anchor
+            headers_state[col] = header_state
             if col in group_break_after:
-                canvas.create_line(x + w, 0, x + w, total_h, fill=DARK_ACCENT2, width=1)
+                line_id = group_line_state.get(col)
+                if line_id is None:
+                    line_id = canvas.create_line(x + w, 0, x + w, total_h, fill=DARK_ACCENT2, width=1)
+                else:
+                    canvas.coords(line_id, x + w, 0, x + w, total_h)
+                group_line_state[col] = line_id
+            elif col in group_line_state:
+                _safe_delete(group_line_state.pop(col))
             x += w
+        for stale_col in [col for col in list(headers_state.keys()) if col not in active_headers]:
+            stale = headers_state.pop(stale_col, {})
+            if isinstance(stale, dict):
+                _safe_delete(stale.get("rect_id"))
+                _safe_delete(stale.get("text_id"))
+        for stale_col in [col for col in list(group_line_state.keys()) if (col not in active_headers) or (col not in group_break_after)]:
+            _safe_delete(group_line_state.pop(stale_col))
 
-        canvas.create_line(0, header_h, total_w, header_h, fill=DARK_ACCENT2, width=2)
+        divider_id = render_state.get("divider_id")
+        if divider_id is None:
+            divider_id = canvas.create_line(0, header_h, total_w, header_h, fill=DARK_ACCENT2, width=2)
+            render_state["divider_id"] = divider_id
+        else:
+            canvas.coords(divider_id, 0, header_h, total_w, header_h)
 
+        seen_keys: set[str] = set()
+        active_row_keys: List[str] = []
         for row_index, row in enumerate(rows):
+            row_key = self._trade_table_row_key(row, row_index, seen_keys)
+            active_row_keys.append(row_key)
             y0 = header_h + (row_index * row_h)
             y1 = y0 + row_h
             row_bg = DARK_PANEL if (row_index % 2) == 0 else "#0C1827"
-            canvas.create_rectangle(0, y0, total_w, y1, fill=row_bg, outline=DARK_BORDER, width=1)
+            row_state = row_state_map.get(row_key)
+            if not isinstance(row_state, dict):
+                row_state = {}
+            row_bg_id = row_state.get("bg_id")
+            if row_bg_id is None:
+                row_bg_id = canvas.create_rectangle(0, y0, total_w, y1, fill=row_bg, outline=DARK_BORDER, width=1)
+            else:
+                canvas.coords(row_bg_id, 0, y0, total_w, y1)
+                if row_state.get("row_bg") != row_bg:
+                    canvas.itemconfigure(row_bg_id, fill=row_bg)
+            row_state["bg_id"] = row_bg_id
+            row_state["row_bg"] = row_bg
+            cells_state = row_state.get("cells")
+            if not isinstance(cells_state, dict):
+                cells_state = {}
+            seps_state = row_state.get("group_lines")
+            if not isinstance(seps_state, dict):
+                seps_state = {}
 
             x = 0
             for col in cols:
                 w = widths[col]
                 cell_val = str(row.get(col, ""))
-                fg = DARK_FG
-                if col in {"unrealized_usd", "realized_usd"}:
-                    try:
-                        num = float(str(cell_val).replace("$", "").replace(",", ""))
-                        fg = DARK_ACCENT if num > 0 else ("#FF6B57" if num < 0 else DARK_FG)
-                    except Exception:
-                        fg = DARK_FG
-                elif col == "sell_pnl":
-                    try:
-                        raw = str(cell_val).replace("%", "").replace(",", "")
-                        num = float(raw)
-                        fg = DARK_ACCENT if num > 0 else ("#FF6B57" if num < 0 else DARK_FG)
-                    except Exception:
-                        fg = DARK_FG
-                elif col == "coin":
-                    fg = DARK_ACCENT2
+                fg = self._trade_table_cell_fg(col, cell_val)
 
                 anchor = "w"
                 tx = x + 8
@@ -13054,18 +12994,69 @@ class PowerTraderHub(tk.Tk):
                 elif col in getattr(self, "trades_center_cols", set()):
                     anchor = "center"
                     tx = x + (w / 2)
-
-                canvas.create_text(
-                    tx,
-                    y0 + (row_h / 2),
-                    text=cell_val,
-                    fill=fg,
-                    font=("TkDefaultFont", 10, "bold" if col in {"coin", "value", "unrealized_usd", "realized_usd", "sell_pnl"} else "normal"),
-                    anchor=anchor,
-                )
+                font = self._trade_table_cell_font(col)
+                cell_state = cells_state.get(col)
+                if not isinstance(cell_state, dict):
+                    cell_state = {}
+                text_id = cell_state.get("text_id")
+                if text_id is None:
+                    text_id = canvas.create_text(
+                        tx,
+                        y0 + (row_h / 2),
+                        text=cell_val,
+                        fill=fg,
+                        font=font,
+                        anchor=anchor,
+                    )
+                else:
+                    canvas.coords(text_id, tx, y0 + (row_h / 2))
+                    updates = {}
+                    if cell_state.get("text") != cell_val:
+                        updates["text"] = cell_val
+                    if cell_state.get("fg") != fg:
+                        updates["fill"] = fg
+                    if cell_state.get("font") != font:
+                        updates["font"] = font
+                    if cell_state.get("anchor") != anchor:
+                        updates["anchor"] = anchor
+                    if updates:
+                        canvas.itemconfigure(text_id, **updates)
+                cell_state["text_id"] = text_id
+                cell_state["text"] = cell_val
+                cell_state["fg"] = fg
+                cell_state["font"] = font
+                cell_state["anchor"] = anchor
+                cells_state[col] = cell_state
                 if col in group_break_after:
-                    canvas.create_line(x + w, y0, x + w, y1, fill=DARK_BORDER, width=1)
+                    sep_id = seps_state.get(col)
+                    if sep_id is None:
+                        sep_id = canvas.create_line(x + w, y0, x + w, y1, fill=DARK_BORDER, width=1)
+                    else:
+                        canvas.coords(sep_id, x + w, y0, x + w, y1)
+                    seps_state[col] = sep_id
+                elif col in seps_state:
+                    _safe_delete(seps_state.pop(col))
                 x += w
+            for stale_col in [col for col in list(cells_state.keys()) if col not in cols]:
+                stale_state = cells_state.pop(stale_col, {})
+                if isinstance(stale_state, dict):
+                    _safe_delete(stale_state.get("text_id"))
+            for stale_col in [col for col in list(seps_state.keys()) if (col not in cols) or (col not in group_break_after)]:
+                _safe_delete(seps_state.pop(stale_col))
+            row_state["cells"] = cells_state
+            row_state["group_lines"] = seps_state
+            row_state_map[row_key] = row_state
+        active_set = set(active_row_keys)
+        for stale_key in [key for key in list(row_state_map.keys()) if key not in active_set]:
+            stale_state = row_state_map.pop(stale_key, {})
+            if not isinstance(stale_state, dict):
+                continue
+            _safe_delete(stale_state.get("bg_id"))
+            for cell_state in list((stale_state.get("cells", {}) or {}).values()):
+                if isinstance(cell_state, dict):
+                    _safe_delete(cell_state.get("text_id"))
+            for sep_id in list((stale_state.get("group_lines", {}) or {}).values()):
+                _safe_delete(sep_id)
 
     def _set_manual_sell_status(self, text: str, level: str = "info") -> None:
         lbl = getattr(self, "lbl_manual_sell_status", None)
@@ -13983,8 +13974,7 @@ class PowerTraderHub(tk.Tk):
                 pass
 
             # clear tree (once; subsequent ticks are mtime-short-circuited)
-            self._trades_table_rows = []
-            self._draw_trades_table()
+            self._set_trades_table_rows([])
             self._sync_manual_sell_coin_choices({})
             return
 
@@ -14067,8 +14057,7 @@ class PowerTraderHub(tk.Tk):
             except Exception:
                 pass
             self._last_positions = {}
-            self._trades_table_rows = []
-            self._draw_trades_table()
+            self._set_trades_table_rows([])
             self._sync_manual_sell_coin_choices({})
             return
 
@@ -14363,8 +14352,7 @@ class PowerTraderHub(tk.Tk):
             })
             visible_row_index += 1
 
-        self._trades_table_rows = table_rows
-        self._draw_trades_table()
+        self._set_trades_table_rows(table_rows)
 
 
 
@@ -14505,24 +14493,7 @@ class PowerTraderHub(tk.Tk):
 
         # Refresh coin dropdowns (they don't auto-update)
         try:
-            # Training pane dropdown
-            if hasattr(self, "train_coin_combo") and self.train_coin_combo.winfo_exists():
-                self.train_coin_combo["values"] = self.coins
-                cur = (self.train_coin_var.get() or "").strip().upper() if hasattr(self, "train_coin_var") else ""
-                if self.coins and cur not in self.coins:
-                    self.train_coin_var.set(self.coins[0])
-
-            # Trainers tab dropdown
-            if hasattr(self, "trainer_coin_combo") and self.trainer_coin_combo.winfo_exists():
-                self.trainer_coin_combo["values"] = self.coins
-                cur = (self.trainer_coin_var.get() or "").strip().upper() if hasattr(self, "trainer_coin_var") else ""
-                if self.coins and cur not in self.coins:
-                    self.trainer_coin_var.set(self.coins[0])
-
-            # Keep both selectors aligned if both exist
-            if hasattr(self, "train_coin_var") and hasattr(self, "trainer_coin_var"):
-                if self.train_coin_var.get():
-                    self.trainer_coin_var.set(self.train_coin_var.get())
+            self._sync_crypto_training_selectors(self._crypto_training_candidate_symbols())
             if hasattr(self, "chart_search_combo") and self.chart_search_combo.winfo_exists():
                 self.chart_search_combo["values"] = ["ACCOUNT"] + list(self.coins)
         except Exception:
@@ -17037,6 +17008,15 @@ class PowerTraderHub(tk.Tk):
                 if req_live_markets:
                     runtime_snapshot = _safe_read_json(os.path.join(self.hub_dir, "runtime_state.json")) or {}
                     checklist = evaluate_live_mode_checklist(runtime_snapshot)
+                    requested_stage = _normalize_rollout_stage(
+                        str(rollout_stage_var.get() or "").strip().lower(),
+                        str(DEFAULT_SETTINGS.get("market_rollout_stage", "legacy")),
+                    )
+                    effective_stage, rollout_stage_note = _resolve_rollout_stage_for_broker_modes(
+                        requested_stage,
+                        bool(alpaca_paper_var.get()),
+                        bool(oanda_practice_var.get()),
+                    )
                     if paper_guard_enabled and (not bool(checklist.get("ok", False))):
                         reasons = ", ".join([str(x) for x in list(checklist.get("reasons", []) or [])[:5]]) or "checklist_not_green"
                         messagebox.showerror(
@@ -17051,6 +17031,7 @@ class PowerTraderHub(tk.Tk):
                         ("You are switching to LIVE execution for:\n"
                         + "".join([f"  - {m}\n" for m in req_live_markets])
                         + "\nThis can place real orders with real funds.\n"
+                        + (f"{rollout_stage_note}\n" if rollout_stage_note else "")
                         + "Continue?"),
                     ):
                         return
@@ -17203,9 +17184,15 @@ class PowerTraderHub(tk.Tk):
                 self.settings["alpaca_base_url"] = str(alpaca_base_url_txt or alpaca_base_default)
                 self.settings["alpaca_data_url"] = str(alpaca_data_url_txt or f"https://{ALPACA_DATA_HOST}")
                 self.settings["alpaca_paper_mode"] = bool(alpaca_paper_mode)
-                stage = str(rollout_stage_var.get() or "").strip().lower()
-                if stage not in {"legacy", "scan_expanded", "risk_caps", "execution_v2", "shadow_only", "live_guarded"}:
-                    stage = str(DEFAULT_SETTINGS.get("market_rollout_stage", "legacy"))
+                stage = _normalize_rollout_stage(
+                    str(rollout_stage_var.get() or "").strip().lower(),
+                    str(DEFAULT_SETTINGS.get("market_rollout_stage", "legacy")),
+                )
+                stage, rollout_stage_note = _resolve_rollout_stage_for_broker_modes(
+                    stage,
+                    bool(alpaca_paper_mode),
+                    bool(oanda_practice_mode),
+                )
                 self.settings["market_rollout_stage"] = stage
                 mode = str(stock_universe_mode_var.get() or "").strip().lower()
                 if mode not in {"core", "watchlist", "all_tradable_filtered"}:
@@ -17625,7 +17612,10 @@ class PowerTraderHub(tk.Tk):
                 # Refresh all coin-driven UI (dropdowns + chart tabs)
                 self._refresh_coin_dependent_ui(prev_coins)
 
-                messagebox.showinfo("Saved", "Settings saved.")
+                saved_msg = "Settings saved."
+                if rollout_stage_note:
+                    saved_msg += f"\n\n{rollout_stage_note}"
+                messagebox.showinfo("Saved", saved_msg)
                 _close_settings()
 
 
@@ -17653,10 +17643,6 @@ class PowerTraderHub(tk.Tk):
             pass
         try:
             self._audit_operator_action("app_close", {})
-        except Exception:
-            pass
-        try:
-            self._close_autofix_queue()
         except Exception:
             pass
         self.destroy()

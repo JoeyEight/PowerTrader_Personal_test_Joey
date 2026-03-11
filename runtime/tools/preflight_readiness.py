@@ -17,7 +17,6 @@ from app.api_endpoint_validation import validate_alpaca_endpoints, validate_oand
 from app.credential_utils import (
     get_alpaca_creds,
     get_oanda_creds,
-    get_openai_api_key,
     get_robinhood_creds_from_env,
     get_robinhood_creds_from_files,
     key_file_permission_issues,
@@ -120,7 +119,6 @@ def build_preflight_report(project_dir: str, now_ts: int | None = None) -> Dict[
         "script_trader",
         "script_markets_runner",
         "script_autopilot",
-        "script_autofix",
     )
     scripts: Dict[str, Dict[str, Any]] = {}
     for key in script_keys:
@@ -150,10 +148,8 @@ def build_preflight_report(project_dir: str, now_ts: int | None = None) -> Dict[
 
     alpaca_key, alpaca_secret = get_alpaca_creds(settings, base_dir=base_dir)
     oanda_account, oanda_token = get_oanda_creds(settings, base_dir=base_dir)
-    openai_api_key = get_openai_api_key(settings=settings, base_dir=base_dir)
     alpaca_ok = bool(alpaca_key and alpaca_secret)
     oanda_ok = bool(oanda_account and oanda_token)
-    openai_ok = bool(str(openai_api_key or "").strip())
     alpaca_endpoint_check = validate_alpaca_endpoints(
         settings.get("alpaca_base_url", "https://paper-api.alpaca.markets"),
         settings.get("alpaca_data_url", "https://data.alpaca.markets"),
@@ -177,15 +173,6 @@ def build_preflight_report(project_dir: str, now_ts: int | None = None) -> Dict[
         issues.append(_issue("critical", "oanda_creds_missing", "Forex auto-trade is enabled but OANDA credentials are missing."))
     if not rh_ok:
         issues.append(_issue("warning", "robinhood_creds_missing", "Crypto credentials were not found in env or keys files."))
-    if bool(settings.get("autofix_enabled", True)) and (not openai_ok):
-        issues.append(
-            _issue(
-                "warning",
-                "autofix_openai_key_missing",
-                "AI Assist (autofix) is enabled but OpenAI API key is missing; chat requests can create tickets but cannot generate patches.",
-            )
-        )
-
     runner_pid_path = os.path.join(hub_dir, "runner.pid")
     runner_pid = 0
     runner_alive = False
@@ -376,7 +363,6 @@ def build_preflight_report(project_dir: str, now_ts: int | None = None) -> Dict[
     summary_lines: List[str] = []
     summary_lines.append(f"stage={rollout_stage} | stock_auto={stock_auto} | forex_auto={forex_auto}")
     summary_lines.append(f"alpaca={'OK' if alpaca_ok else 'MISSING'} | oanda={'OK' if oanda_ok else 'MISSING'} | crypto_keys={'OK' if rh_ok else 'MISSING'}")
-    summary_lines.append(f"ai_assist_key={'OK' if openai_ok else 'MISSING'}")
     summary_lines.append(
         "alpaca_endpoint="
         + str(alpaca_endpoint_check.get("normalized_base_url", "") or "")
@@ -427,7 +413,6 @@ def build_preflight_report(project_dir: str, now_ts: int | None = None) -> Dict[
             "crypto_robinhood_ok": bool(rh_ok),
             "stocks_alpaca_ok": bool(alpaca_ok),
             "forex_oanda_ok": bool(oanda_ok),
-            "ai_assist_openai_ok": bool(openai_ok),
             "key_permission_issues": list(perm_issues),
             "key_rotation_issues": list(rotation_issues),
         },

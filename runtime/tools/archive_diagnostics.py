@@ -15,8 +15,6 @@ def _collect_files(hub_dir: str) -> List[str]:
         "market_sla_metrics.json",
         "market_trends.json",
         "autopilot_status.json",
-        "autofix_status.json",
-        "autofix_state.json",
         "incidents.jsonl",
         "runtime_events.jsonl",
     ]
@@ -31,13 +29,6 @@ def _collect_files(hub_dir: str) -> List[str]:
             p = os.path.join(logs_dir, name)
             if os.path.isfile(p):
                 out.append(p)
-    autofix_dir = os.path.join(hub_dir, "autofix")
-    if os.path.isdir(autofix_dir):
-        for root, _dirs, files in os.walk(autofix_dir):
-            for name in files:
-                p = os.path.join(root, name)
-                if os.path.isfile(p):
-                    out.append(p)
     return out
 
 

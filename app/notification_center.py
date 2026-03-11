@@ -5,6 +5,30 @@ import os
 import time
 from typing import Any, Dict, Iterable, List
 
+_TRANSIENT_INCIDENT_TTL_S: Dict[str, int] = {
+    "ui_market_panel_desync": 300,
+    "market_panel_refresh_failed": 300,
+    "runner_watchdog_restart": 600,
+    "runner_child_exit": 600,
+    "runner_script_path_changed": 600,
+    "runner_script_hot_reload": 600,
+    "runner_forced_shutdown": 600,
+    "runner_child_start_failed": 900,
+    "runner_child_crash_loop": 900,
+    "runner_missing_script": 900,
+    "stocks_snapshot_failed": 900,
+    "forex_snapshot_failed": 900,
+    "stocks_thinker_error": 900,
+    "stocks_thinker_failed": 900,
+    "stocks_trader_error": 900,
+    "stocks_trader_failed": 900,
+    "forex_thinker_error": 900,
+    "forex_thinker_failed": 900,
+    "forex_trader_error": 900,
+    "forex_trader_failed": 900,
+    "market_trends_update_failed": 900,
+}
+
 
 def _safe_read_json(path: str) -> Dict[str, Any]:
     try:
@@ -41,6 +65,17 @@ def _sev(v: str) -> str:
     return "info"
 
 
+def _severity_rank(v: str) -> int:
+    sev = _sev(v)
+    if sev == "critical":
+        return 3
+    if sev == "warning":
+        return 2
+    if sev == "ok":
+        return 0
+    return 1
+
+
 def _market_from_incident(row: Dict[str, Any]) -> str:
     details = row.get("details", {}) if isinstance(row.get("details", {}), dict) else {}
     market = str(details.get("market", "") or "").strip().lower()
@@ -53,9 +88,107 @@ def _market_from_incident(row: Dict[str, Any]) -> str:
         return "forex"
     if "kucoin" in evt or "crypto" in evt:
         return "crypto"
-    if "autofix" in evt:
-        return "ai_assist"
     return "global"
+
+
+def _runtime_now_ts(runtime_state: Dict[str, Any]) -> int:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    try:
+        ts = int(rs.get("ts", 0) or 0)
+    except Exception:
+        ts = 0
+    return ts if ts > 0 else int(time.time())
+
+
+def _incident_is_recent(row: Dict[str, Any], runtime_state: Dict[str, Any], ttl_s: int) -> bool:
+    try:
+        ts = int(float(row.get("ts", 0) or 0))
+    except Exception:
+        ts = 0
+    if ts <= 0:
+        return False
+    return (_runtime_now_ts(runtime_state) - ts) <= max(30, int(ttl_s or 0))
+
+
+def _runtime_alert_reasons(runtime_state: Dict[str, Any]) -> set[str]:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    alerts = rs.get("alerts", {}) if isinstance(rs.get("alerts", {}), dict) else {}
+    out: set[str] = set()
+    for row in list(alerts.get("reasons", []) or []):
+        key = str(row or "").strip().lower()
+        if key:
+            out.add(key)
+    return out
+
+
+def _active_cadence_markets(runtime_state: Dict[str, Any]) -> set[str]:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    out: set[str] = set()
+    scan_cadence = rs.get("scan_cadence", {}) if isinstance(rs.get("scan_cadence", {}), dict) else {}
+    for row in list(scan_cadence.get("active", []) or []):
+        if not isinstance(row, dict):
+            continue
+        market = str(row.get("market", "") or "").strip().lower()
+        if market in {"stocks", "forex", "crypto"}:
+            out.add(market)
+    return out
+
+
+def _startup_checks_active(runtime_state: Dict[str, Any]) -> bool:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    checks = rs.get("checks", {}) if isinstance(rs.get("checks", {}), dict) else {}
+    if not bool(checks.get("ok", False)):
+        return True
+    warnings = list(checks.get("warnings", []) or []) if isinstance(checks.get("warnings", []), list) else []
+    errors = list(checks.get("errors", []) or []) if isinstance(checks.get("errors", []), list) else []
+    return bool(warnings or errors)
+
+
+def _market_loop_issue_active(runtime_state: Dict[str, Any]) -> bool:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    if "market_loop_stale" in _runtime_alert_reasons(rs):
+        return True
+    alerts = rs.get("alerts", {}) if isinstance(rs.get("alerts", {}), dict) else {}
+    metrics = alerts.get("metrics", {}) if isinstance(alerts.get("metrics", {}), dict) else {}
+    return bool(metrics.get("market_loop_stale", False))
+
+
+def _incident_is_active(row: Dict[str, Any], runtime_state: Dict[str, Any]) -> bool:
+    evt = str(row.get("event", "") or "").strip().lower()
+    market = _market_from_incident(row)
+    if evt == "scanner_cadence_drift":
+        return market in _active_cadence_markets(runtime_state)
+    if evt == "runner_startup_check":
+        return _startup_checks_active(runtime_state)
+    if evt in {"runner_market_loop_status_stale", "runner_market_loop_restart"}:
+        return _market_loop_issue_active(runtime_state)
+    ttl_s = int(_TRANSIENT_INCIDENT_TTL_S.get(evt, 0) or 0)
+    if ttl_s > 0:
+        return _incident_is_recent(row, runtime_state, ttl_s)
+    return True
+
+
+def _dedupe_notification_rows(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    keep: Dict[tuple[str, str, str, str, str], Dict[str, Any]] = {}
+    for row in list(rows or []):
+        if not isinstance(row, dict):
+            continue
+        key = (
+            str(row.get("market", "global") or "global").strip().lower(),
+            str(row.get("source", "") or "").strip().lower(),
+            _sev(str(row.get("severity", "info") or "info")),
+            str(row.get("title", "") or "").strip(),
+            str(row.get("message", "") or "").strip(),
+        )
+        prev = keep.get(key)
+        if prev is None:
+            keep[key] = row
+            continue
+        prev_key = (int(prev.get("ts", 0) or 0), _severity_rank(str(prev.get("severity", "info") or "info")))
+        next_key = (int(row.get("ts", 0) or 0), _severity_rank(str(row.get("severity", "info") or "info")))
+        if next_key >= prev_key:
+            keep[key] = row
+    return list(keep.values())
 
 
 def build_notification_center_payload(
@@ -134,6 +267,8 @@ def build_notification_center_payload(
     for row in list(incidents_rows or []):
         if not isinstance(row, dict):
             continue
+        if not _incident_is_active(row, rs):
+            continue
         ts = int(float(row.get("ts", 0) or 0))
         if ts <= 0:
             continue
@@ -154,7 +289,15 @@ def build_notification_center_payload(
             }
         )
 
-    out_rows = sorted(out_rows, key=lambda r: (int(r.get("ts", 0) or 0), str(r.get("severity", ""))), reverse=True)
+    out_rows = _dedupe_notification_rows(out_rows)
+    out_rows = sorted(
+        out_rows,
+        key=lambda r: (
+            int(r.get("ts", 0) or 0),
+            _severity_rank(str(r.get("severity", "info") or "info")),
+        ),
+        reverse=True,
+    )
     out_rows = out_rows[: max(10, int(max_items))]
 
     by_market: Dict[str, Dict[str, int]] = {}

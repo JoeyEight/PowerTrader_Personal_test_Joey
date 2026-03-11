@@ -7,8 +7,9 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/python3</string>
-    <string>/Users/joeydelestre/PowerTrader_AI/runtime/pt_runner.py</string>
+    <string>/Users/joeydelestre/PowerTrader_AI/venv/bin/python3</string>
+    <string>-m</string>
+    <string>runtime.pt_runner</string>
   </array>
 
   <key>WorkingDirectory</key>
@@ -26,6 +27,12 @@
     <string>/Users/joeydelestre/PowerTrader_AI/gui_settings.json</string>
     <key>POWERTRADER_PROJECT_DIR</key>
     <string>/Users/joeydelestre/PowerTrader_AI</string>
+    <key>POWERTRADER_HUB_DIR</key>
+    <string>/Users/joeydelestre/PowerTrader_AI/hub_data</string>
+    <key>PYTHONPATH</key>
+    <string>/Users/joeydelestre/PowerTrader_AI</string>
+    <key>MPLCONFIGDIR</key>
+    <string>/Users/joeydelestre/PowerTrader_AI/hub_data/.mplconfig</string>
   </dict>
 
   <key>StandardOutPath</key>

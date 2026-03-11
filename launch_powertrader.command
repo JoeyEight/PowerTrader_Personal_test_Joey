@@ -7,9 +7,7 @@ cd "$PROJECT_DIR" || exit 1
 # Ensure runtime directories exist.
 mkdir -p \
   "$PROJECT_DIR/hub_data/logs" \
-  "$PROJECT_DIR/hub_data/.mplconfig" \
-  "$PROJECT_DIR/hub_data/autofix/tickets" \
-  "$PROJECT_DIR/hub_data/autofix/patches"
+  "$PROJECT_DIR/hub_data/.mplconfig"
 
 # Resolve settings and runtime paths for hub + children.
 export POWERTRADER_PROJECT_DIR="$PROJECT_DIR"
@@ -19,12 +17,6 @@ export MPLCONFIGDIR="$PROJECT_DIR/hub_data/.mplconfig"
 
 # Keep package imports stable when launching from Finder/Terminal.
 export PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}"
-
-# Optional: load OpenAI key used by runtime/pt_autofix.py.
-# Priority: existing env var, then project key file.
-if [[ -z "${OPENAI_API_KEY:-}" && -f "$PROJECT_DIR/keys/openai_api_key.txt" ]]; then
-  export OPENAI_API_KEY="$(tr -d '\r\n' < "$PROJECT_DIR/keys/openai_api_key.txt")"
-fi
 
 VENV_DIR="$PROJECT_DIR/venv"
 PY_BIN="$VENV_DIR/bin/python3"

@@ -170,20 +170,6 @@ SANITIZER_DEFAULTS: Dict[str, Any] = {
     "broker_failure_disable_threshold": 4,
     "broker_failure_disable_cooldown_s": 900,
     "broker_order_retry_after_cap_s": 300.0,
-    "autofix_enabled": True,
-    "autofix_mode": "report_only",
-    "autofix_allow_live_apply": False,
-    "autofix_poll_interval_s": 45.0,
-    "autofix_max_fixes_per_day": 2,
-    "autofix_model": "gpt-5-mini",
-    "autofix_api_base": "https://api.openai.com/v1",
-    "autofix_request_timeout_s": 25.0,
-    "autofix_test_command": "python -m unittest tests.test_settings_sanitize tests.test_runner_watchdog",
-    "autofix_request_block_on_quota": True,
-    "autofix_request_block_on_missing_key": True,
-    "autofix_request_block_on_bad_request": True,
-    "autofix_request_block_on_invalid_output": True,
-    "autofix_request_block_on_no_patch": True,
     "adaptive_confidence_min_samples": 18,
     "adaptive_confidence_target_success_pct": 55.0,
     "replay_target_entries_stocks": 3,
@@ -211,7 +197,24 @@ SANITIZER_DEFAULTS: Dict[str, Any] = {
     "script_trader": "engines/pt_trader.py",
     "script_markets_runner": "runtime/pt_markets.py",
     "script_autopilot": "runtime/pt_autopilot.py",
-    "script_autofix": "runtime/pt_autofix.py",
+}
+
+_REMOVED_LEGACY_KEYS = {
+    "autofix_enabled",
+    "autofix_mode",
+    "autofix_allow_live_apply",
+    "autofix_poll_interval_s",
+    "autofix_max_fixes_per_day",
+    "autofix_model",
+    "autofix_api_base",
+    "autofix_request_timeout_s",
+    "autofix_test_command",
+    "autofix_request_block_on_quota",
+    "autofix_request_block_on_missing_key",
+    "autofix_request_block_on_bad_request",
+    "autofix_request_block_on_invalid_output",
+    "autofix_request_block_on_no_patch",
+    "script_autofix",
 }
 
 _BOOL_KEYS = {
@@ -237,13 +240,6 @@ _BOOL_KEYS = {
     "forex_show_rejected_rows",
     "forex_session_weight_enabled",
     "forex_event_risk_enabled",
-    "autofix_enabled",
-    "autofix_allow_live_apply",
-    "autofix_request_block_on_quota",
-    "autofix_request_block_on_missing_key",
-    "autofix_request_block_on_bad_request",
-    "autofix_request_block_on_invalid_output",
-    "autofix_request_block_on_no_patch",
     "paper_only_unless_checklist_green",
     "market_panel_compact_mode",
     "global_drawdown_auto_resume_enabled",
@@ -347,8 +343,6 @@ _FLOAT_BOUNDS: Dict[str, Tuple[float, float, float]] = {
     "global_max_drawdown_pct": (0.0, 0.0, 100.0),
     "global_drawdown_resume_recovery_buffer_pct": (0.25, 0.0, 50.0),
     "broker_order_retry_after_cap_s": (300.0, 1.0, 3600.0),
-    "autofix_poll_interval_s": (45.0, 5.0, 1800.0),
-    "autofix_request_timeout_s": (25.0, 5.0, 120.0),
     "adaptive_confidence_target_success_pct": (55.0, 30.0, 90.0),
 }
 
@@ -406,7 +400,6 @@ _INT_BOUNDS: Dict[str, Tuple[int, int, int]] = {
     "runtime_events_max_lines": (50000, 2000, 1000000),
     "broker_failure_disable_threshold": (4, 2, 50),
     "broker_failure_disable_cooldown_s": (900, 60, 86400),
-    "autofix_max_fixes_per_day": (2, 0, 50),
     "adaptive_confidence_min_samples": (18, 6, 5000),
     "replay_target_entries_stocks": (3, 1, 20),
     "replay_target_entries_forex": (4, 1, 20),
@@ -431,7 +424,6 @@ _ENUMS: Dict[str, Iterable[str]] = {
     "ui_layout_preset": ("auto", "compact", "normal", "wide"),
     "stock_universe_mode": ("core", "watchlist", "all_tradable_filtered"),
     "forex_session_mode": ("all", "london_ny", "london", "ny", "asia"),
-    "autofix_mode": ("report_only", "manual", "shadow_apply"),
 }
 
 
@@ -530,6 +522,8 @@ def sanitize_settings(raw: Dict[str, Any] | None, defaults: Dict[str, Any] | Non
         base.update(defaults)
     out = dict(base)
     out.update(source)
+    for key in _REMOVED_LEGACY_KEYS:
+        out.pop(key, None)
 
     out["coins"] = _sanitize_coins(out.get("coins"), base.get("coins", []))
     out["dca_levels"] = _sanitize_dca_levels(out.get("dca_levels"), base.get("dca_levels", [-2.5, -5.0, -10.0, -20.0]))
@@ -562,7 +556,6 @@ def sanitize_settings(raw: Dict[str, Any] | None, defaults: Dict[str, Any] | Non
         "script_trader": str(base.get("script_trader", "engines/pt_trader.py")),
         "script_markets_runner": str(base.get("script_markets_runner", "runtime/pt_markets.py")),
         "script_autopilot": str(base.get("script_autopilot", "runtime/pt_autopilot.py")),
-        "script_autofix": str(base.get("script_autofix", "runtime/pt_autofix.py")),
     }
     for key, dval in script_defaults.items():
         out[key] = _sanitize_script(out.get(key), dval)
@@ -593,22 +586,6 @@ def sanitize_settings(raw: Dict[str, Any] | None, defaults: Dict[str, Any] | Non
 
     for pct_key in ("stock_max_total_exposure_pct", "forex_max_total_exposure_pct", "market_max_total_exposure_pct"):
         out[pct_key] = _bounded_float(out.get(pct_key), float(base.get(pct_key, 0.0)), 0.0, 100.0)
-
-    out["autofix_model"] = str(out.get("autofix_model", base.get("autofix_model", "gpt-5-mini")) or "gpt-5-mini").strip() or "gpt-5-mini"
-    out["autofix_api_base"] = (
-        str(out.get("autofix_api_base", base.get("autofix_api_base", "https://api.openai.com/v1")) or "https://api.openai.com/v1").strip()
-        or "https://api.openai.com/v1"
-    )
-    out["autofix_test_command"] = (
-        str(
-            out.get(
-                "autofix_test_command",
-                base.get("autofix_test_command", "python -m unittest tests.test_settings_sanitize tests.test_runner_watchdog"),
-            )
-            or "python -m unittest tests.test_settings_sanitize tests.test_runner_watchdog"
-        ).strip()
-        or "python -m unittest tests.test_settings_sanitize tests.test_runner_watchdog"
-    )
 
     out["settings_schema_version"] = int(CURRENT_SETTINGS_VERSION)
     if notes:

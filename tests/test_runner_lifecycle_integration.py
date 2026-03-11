@@ -15,6 +15,10 @@ def _write_script(path: str, body: str) -> None:
         f.write(body)
 
 
+def _scripts(path: str) -> dict[str, str]:
+    return {"thinker": path, "trader": path, "markets": path, "autopilot": path}
+
+
 class TestRunnerLifecycleIntegration(unittest.TestCase):
     def test_start_and_graceful_shutdown_child(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -33,7 +37,7 @@ class TestRunnerLifecycleIntegration(unittest.TestCase):
                 "    time.sleep(0.25)\n",
             )
 
-            scripts = {"thinker": sleeper, "trader": sleeper, "markets": sleeper, "autopilot": sleeper, "autofix": sleeper}
+            scripts = _scripts(sleeper)
             with ExitStack() as stack:
                 stack.enter_context(patch.object(pt_runner, "BASE_DIR", td))
                 stack.enter_context(patch.object(pt_runner, "HUB_DATA_DIR", hub))
@@ -42,7 +46,6 @@ class TestRunnerLifecycleIntegration(unittest.TestCase):
                 stack.enter_context(patch.object(pt_runner, "TRADER_LOG_PATH", os.path.join(logs, "trader.log")))
                 stack.enter_context(patch.object(pt_runner, "MARKETS_LOG_PATH", os.path.join(logs, "markets.log")))
                 stack.enter_context(patch.object(pt_runner, "AUTOPILOT_LOG_PATH", os.path.join(logs, "autopilot.log")))
-                stack.enter_context(patch.object(pt_runner, "AUTOFIX_LOG_PATH", os.path.join(logs, "autofix.log")))
                 stack.enter_context(patch.object(pt_runner, "RUNNER_LOG_PATH", os.path.join(logs, "runner.log")))
                 stack.enter_context(patch.object(pt_runner, "TRADER_STATUS_PATH", os.path.join(hub, "trader_status.json")))
                 stack.enter_context(patch.object(pt_runner, "RUNTIME_EVENTS_PATH", os.path.join(hub, "runtime_events.jsonl")))
@@ -89,7 +92,7 @@ class TestRunnerLifecycleIntegration(unittest.TestCase):
 
             crasher = os.path.join(td, "crasher.py")
             _write_script(crasher, "raise SystemExit(7)\n")
-            scripts = {"thinker": crasher, "trader": crasher, "markets": crasher, "autopilot": crasher, "autofix": crasher}
+            scripts = _scripts(crasher)
 
             with ExitStack() as stack:
                 stack.enter_context(patch.object(pt_runner, "BASE_DIR", td))
@@ -99,7 +102,6 @@ class TestRunnerLifecycleIntegration(unittest.TestCase):
                 stack.enter_context(patch.object(pt_runner, "TRADER_LOG_PATH", os.path.join(logs, "trader.log")))
                 stack.enter_context(patch.object(pt_runner, "MARKETS_LOG_PATH", os.path.join(logs, "markets.log")))
                 stack.enter_context(patch.object(pt_runner, "AUTOPILOT_LOG_PATH", os.path.join(logs, "autopilot.log")))
-                stack.enter_context(patch.object(pt_runner, "AUTOFIX_LOG_PATH", os.path.join(logs, "autofix.log")))
                 stack.enter_context(patch.object(pt_runner, "RUNNER_LOG_PATH", os.path.join(logs, "runner.log")))
                 stack.enter_context(patch.object(pt_runner, "TRADER_STATUS_PATH", os.path.join(hub, "trader_status.json")))
                 stack.enter_context(patch.object(pt_runner, "RUNTIME_EVENTS_PATH", os.path.join(hub, "runtime_events.jsonl")))

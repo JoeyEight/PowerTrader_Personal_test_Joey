@@ -202,6 +202,67 @@ class TestHealthRules(unittest.TestCase):
         self.assertEqual(out["severity"], "critical")
         self.assertIn("stop_flag_active", out["reasons"])
 
+    def test_shadow_scorecard_blocked_is_suppressed_in_live_guarded(self) -> None:
+        state = {
+            "checks": {"ok": True, "warnings": []},
+            "scan_health": {"stocks": {"reject_rate_pct": 0.0}, "forex": {"reject_rate_pct": 0.0}},
+            "incidents_last_200": {"count": 0, "by_severity": {"error": 0}},
+            "autopilot": {"api_unstable": False},
+            "shadow_scorecards": {
+                "stocks": {"promotion_gate": "BLOCK"},
+                "forex": {"promotion_gate": "BLOCK"},
+            },
+        }
+        out = evaluate_runtime_alerts(state, {"market_rollout_stage": "live_guarded"})
+        self.assertNotIn("shadow_scorecard_blocked", out["reasons"])
+        self.assertEqual(out["severity"], "ok")
+
+    def test_notification_center_critical_does_not_self_promote_alerts(self) -> None:
+        state = {
+            "checks": {"ok": True, "warnings": []},
+            "scan_health": {"stocks": {"reject_rate_pct": 0.0}, "forex": {"reject_rate_pct": 0.0}},
+            "incidents_last_200": {"count": 0, "by_severity": {"error": 0}},
+            "autopilot": {"api_unstable": False},
+            "notification_center": {"by_severity": {"critical": 4}},
+        }
+        out = evaluate_runtime_alerts(state, {})
+        self.assertNotIn("notification_center_critical", out["reasons"])
+        self.assertEqual(out["severity"], "ok")
+
+    def test_resolved_startup_incidents_do_not_count_as_runtime_warning(self) -> None:
+        state = {
+            "checks": {"ok": True, "warnings": [], "errors": []},
+            "scan_health": {"stocks": {"reject_rate_pct": 0.0}, "forex": {"reject_rate_pct": 0.0}},
+            "incidents_last_200": {
+                "count": 2,
+                "by_severity_1h": {"warning": 2, "error": 0},
+                "by_event_severity_1h": {"runner_startup_check": {"warning": 2}},
+            },
+            "autopilot": {"api_unstable": False},
+        }
+        out = evaluate_runtime_alerts(state, {"runtime_alert_incident_warn_count": 1})
+        self.assertEqual(out["severity"], "ok")
+        self.assertNotIn("startup_warnings", out["reasons"])
+
+    def test_resolved_market_loop_incidents_do_not_count_as_runtime_warning(self) -> None:
+        state = {
+            "checks": {"ok": True, "warnings": [], "errors": []},
+            "scan_health": {"stocks": {"reject_rate_pct": 0.0}, "forex": {"reject_rate_pct": 0.0}},
+            "incidents_last_200": {
+                "count": 2,
+                "by_severity_1h": {"warning": 2, "error": 0},
+                "by_event_severity_1h": {
+                    "runner_market_loop_status_stale": {"warning": 1},
+                    "runner_market_loop_restart": {"warning": 1},
+                },
+            },
+            "autopilot": {"api_unstable": False},
+            "market_loop": {"age_s": 10},
+        }
+        out = evaluate_runtime_alerts(state, {"runtime_alert_incident_warn_count": 1, "runtime_alert_market_loop_stale_s": 90.0})
+        self.assertEqual(out["severity"], "ok")
+        self.assertNotIn("market_loop_stale", out["reasons"])
+
 
 if __name__ == "__main__":
     unittest.main()

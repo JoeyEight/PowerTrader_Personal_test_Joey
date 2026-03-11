@@ -140,7 +140,6 @@ class TestSettingsSanitize(unittest.TestCase):
         self.assertTrue(isinstance(out["coins"], list))
         self.assertGreaterEqual(int(out["candles_limit"]), 20)
         self.assertTrue(str(out["script_trader"]).endswith("pt_trader.py"))
-        self.assertTrue(str(out["script_autofix"]).endswith("pt_autofix.py"))
         self.assertEqual(str(out.get("settings_control_mode", "")), "self_managed")
         self.assertEqual(str(out.get("settings_profile", "")), "balanced")
 

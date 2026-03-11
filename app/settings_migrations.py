@@ -13,9 +13,8 @@ def _migrate_v1_to_v2(data: Dict[str, Any], notes: List[str]) -> None:
         "pt_trainer.py": "engines/pt_trainer.py",
         "pt_markets.py": "runtime/pt_markets.py",
         "pt_autopilot.py": "runtime/pt_autopilot.py",
-        "pt_autofix.py": "runtime/pt_autofix.py",
     }
-    for key in ("script_neural_runner2", "script_trader", "script_neural_trainer", "script_markets_runner", "script_autopilot", "script_autofix"):
+    for key in ("script_neural_runner2", "script_trader", "script_neural_trainer", "script_markets_runner", "script_autopilot"):
         cur = str(data.get(key, "") or "").strip().replace("\\", "/")
         if cur in mapping:
             data[key] = mapping[cur]

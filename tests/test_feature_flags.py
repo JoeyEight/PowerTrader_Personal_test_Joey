@@ -13,13 +13,12 @@ class TestFeatureFlags(unittest.TestCase):
             "forex_block_entries_on_cached_scan": True,
             "stock_require_data_quality_ok_for_entries": True,
             "forex_require_data_quality_ok_for_entries": False,
-            "autofix_allow_live_apply": False,
             "stock_auto_trade_enabled": True,
             "forex_auto_trade_enabled": False,
         }
         out = build_feature_flag_snapshot(settings)
         self.assertIn("flags", out)
-        self.assertGreaterEqual(int(out.get("total_count", 0) or 0), 8)
+        self.assertGreaterEqual(int(out.get("total_count", 0) or 0), 7)
         rows = list(out.get("flags", []) or [])
         self.assertEqual(int(out.get("enabled_count", 0) or 0), sum(1 for row in rows if bool(row.get("enabled", False))))
 

@@ -80,6 +80,8 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
     market_loop_stale_s = float(settings.get("runtime_alert_market_loop_stale_s", 90.0) or 90.0)
     exposure_warn_pct = float(settings.get("runtime_alert_exposure_concentration_warn_pct", 55.0) or 55.0)
     exposure_crit_pct = float(settings.get("runtime_alert_exposure_concentration_crit_pct", 75.0) or 75.0)
+    rollout_stage = str(settings.get("market_rollout_stage", "legacy") or "legacy").strip().lower()
+    shadow_scorecard_gate_relevant = rollout_stage in {"legacy", "scan_expanded", "risk_caps", "shadow_only"}
 
     s_reject_raw = float(stocks.get("reject_rate_pct", 0.0) or 0.0)
     f_reject_raw = float(forex.get("reject_rate_pct", 0.0) or 0.0)
@@ -155,6 +157,37 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
     if startup_age_s > 0 and startup_age_s < startup_grace_s:
         loop_stale = False
         loop_crit = False
+
+    def _event_severity_count(event_map: Dict[str, Dict[str, Any]], event: str, severities: List[str]) -> int:
+        row = event_map.get(event, {}) if isinstance(event_map.get(event, {}), dict) else {}
+        total = 0
+        for sev_key in severities:
+            total += int(row.get(sev_key, 0) or 0)
+        return int(total)
+
+    startup_errors = len(list(checks.get("errors", []) or []))
+    startup_checks_active = (not checks_ok) or warns > 0 or startup_errors > 0
+    inactive_warn_sub = 0
+    inactive_err_sub = 0
+    inactive_cadence_err_sub = 0
+    if not startup_checks_active:
+        inactive_warn_sub += _event_severity_count(evt_src, "runner_startup_check", ["warning", "warn"])
+        inactive_err_sub += _event_severity_count(evt_src, "runner_startup_check", ["critical", "error", "high"])
+    if cadence_count <= 0:
+        inactive_warn_sub += _event_severity_count(evt_src, "scanner_cadence_drift", ["warning", "warn"])
+        inactive_cadence_err_sub += _event_severity_count(evt_src, "scanner_cadence_drift", ["critical", "error", "high"])
+        inactive_err_sub += inactive_cadence_err_sub
+    if not loop_stale:
+        for event_name in ("runner_market_loop_status_stale", "runner_market_loop_restart"):
+            inactive_warn_sub += _event_severity_count(evt_src, event_name, ["warning", "warn"])
+            inactive_err_sub += _event_severity_count(evt_src, event_name, ["critical", "error", "high"])
+
+    warn_count = max(0, int(warn_count - inactive_warn_sub))
+    err_count_raw = max(0, int(err_count_raw - inactive_err_sub))
+    cadence_err_count = max(0, int(cadence_err_count - inactive_cadence_err_sub))
+    # Cadence drift already contributes through scan_cadence metrics; avoid double-counting it as generic runtime errors.
+    err_count = max(0, int(err_count_raw - cadence_err_count))
+    incident_count = int(warn_count + err_count)
     cadence_critical_effective = int(cadence_critical)
     cadence_critical_suppressed = False
     # Cadence alerts can stay high when scanners are intentionally configured faster than the
@@ -178,6 +211,7 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
     forex_score_gate = str((shadow_scorecards.get("forex", {}) if isinstance(shadow_scorecards.get("forex", {}), dict) else {}).get("promotion_gate", "") or "").strip().upper()
     notif_by_sev = notification_center.get("by_severity", {}) if isinstance(notification_center.get("by_severity", {}), dict) else {}
     notif_critical = int(notif_by_sev.get("critical", 0) or 0)
+    shadow_scorecard_blocked = shadow_scorecard_gate_relevant and (stocks_score_gate == "BLOCK" or forex_score_gate == "BLOCK")
 
     reasons: List[str] = []
     hints: List[str] = []
@@ -197,13 +231,12 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
         or cadence_critical_effective >= cadence_crit
         or loop_crit
         or top_exposure_pct >= exposure_crit_pct
-        or stocks_score_gate == "BLOCK"
-        or forex_score_gate == "BLOCK"
+        or shadow_scorecard_blocked
     ):
         bump("critical")
     if bool(drawdown_guard.get("triggered_recent", False)) or bool(stop_flag.get("active", False)):
         bump("critical")
-    if warns >= startup_warn or err_count >= error_warn or incident_count >= incident_warn or max_reject >= reject_warn or api_unstable or drift_count >= drift_warn or cadence_count >= cadence_warn or loop_stale or top_exposure_pct >= exposure_warn_pct or guard_active > 0 or notif_critical > 0:
+    if warns >= startup_warn or err_count >= error_warn or incident_count >= incident_warn or max_reject >= reject_warn or api_unstable or drift_count >= drift_warn or cadence_count >= cadence_warn or loop_stale or top_exposure_pct >= exposure_warn_pct or guard_active > 0:
         bump("warn")
 
     if not checks_ok:
@@ -245,12 +278,9 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
     if bool(stop_flag.get("active", False)):
         reasons.append("stop_flag_active")
         hints.append("Stop flag file is present; trading should remain paused until reviewed.")
-    if stocks_score_gate == "BLOCK" or forex_score_gate == "BLOCK":
+    if shadow_scorecard_blocked:
         reasons.append("shadow_scorecard_blocked")
         hints.append("Shadow scorecard gate is BLOCK for at least one market; keep rollout in shadow mode.")
-    if notif_critical > 0:
-        reasons.append("notification_center_critical")
-        hints.append("Notification center has active critical items; review Alerts panel.")
 
     quickfix: List[str] = []
     for r in reasons:

@@ -8,6 +8,11 @@ import sys
 import time
 from typing import Any, Dict, Optional, TextIO
 
+if __package__ in (None, ""):
+    _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _ROOT not in sys.path:
+        sys.path.insert(0, _ROOT)
+
 from app.api_quota import summarize_quota_events
 from app.cache_maintenance import prune_data_cache, prune_scanner_quality_artifacts
 from app.credential_utils import (
@@ -46,7 +51,6 @@ THINKER_LOG_PATH = os.path.join(LOG_DIR, "thinker.log")
 TRADER_LOG_PATH = os.path.join(LOG_DIR, "trader.log")
 MARKETS_LOG_PATH = os.path.join(LOG_DIR, "markets.log")
 AUTOPILOT_LOG_PATH = os.path.join(LOG_DIR, "autopilot.log")
-AUTOFIX_LOG_PATH = os.path.join(LOG_DIR, "autofix.log")
 RUNTIME_CHECKS_PATH = os.path.join(HUB_DATA_DIR, "runtime_startup_checks.json")
 KEY_ROTATION_STATUS_PATH = os.path.join(HUB_DATA_DIR, "key_rotation_status.json")
 INCIDENTS_PATH = os.path.join(HUB_DATA_DIR, "incidents.jsonl")
@@ -432,13 +436,11 @@ def _settings_scripts() -> Dict[str, str]:
     trader_name = str(data.get("script_trader", "engines/pt_trader.py") or "engines/pt_trader.py").strip()
     markets_name = str(data.get("script_markets_runner", "runtime/pt_markets.py") or "runtime/pt_markets.py").strip()
     autopilot_name = str(data.get("script_autopilot", "runtime/pt_autopilot.py") or "runtime/pt_autopilot.py").strip()
-    autofix_name = str(data.get("script_autofix", "runtime/pt_autofix.py") or "runtime/pt_autofix.py").strip()
     return {
         "thinker": os.path.abspath(os.path.join(BASE_DIR, thinker_name)),
         "trader": os.path.abspath(os.path.join(BASE_DIR, trader_name)),
         "markets": os.path.abspath(os.path.join(BASE_DIR, markets_name)),
         "autopilot": os.path.abspath(os.path.join(BASE_DIR, autopilot_name)),
-        "autofix": os.path.abspath(os.path.join(BASE_DIR, autofix_name)),
     }
 
 
@@ -492,7 +494,6 @@ class Runner:
             "trader": ChildSpec("trader", scripts["trader"], TRADER_LOG_PATH),
             "markets": ChildSpec("markets", scripts["markets"], MARKETS_LOG_PATH),
             "autopilot": ChildSpec("autopilot", scripts["autopilot"], AUTOPILOT_LOG_PATH),
-            "autofix": ChildSpec("autofix", scripts["autofix"], AUTOFIX_LOG_PATH),
         }
         self.state = "RUNNING"
         self.msg = "Supervisor starting"
@@ -513,20 +514,17 @@ class Runner:
             "trader_pid": self.children["trader"].pid(),
             "markets_pid": self.children["markets"].pid(),
             "autopilot_pid": self.children["autopilot"].pid(),
-            "autofix_pid": self.children["autofix"].pid(),
             "restarts": {
                 "thinker": int(self.children["thinker"].restarts),
                 "trader": int(self.children["trader"].restarts),
                 "markets": int(self.children["markets"].restarts),
                 "autopilot": int(self.children["autopilot"].restarts),
-                "autofix": int(self.children["autofix"].restarts),
             },
             "last_exit": {
                 "thinker": self.children["thinker"].last_exit or None,
                 "trader": self.children["trader"].last_exit or None,
                 "markets": self.children["markets"].last_exit or None,
                 "autopilot": self.children["autopilot"].last_exit or None,
-                "autofix": self.children["autofix"].last_exit or None,
             },
             "backoff_s": float(self.current_backoff_s),
             "msg": self.msg,
@@ -629,7 +627,6 @@ class Runner:
             except Exception:
                 pass
         autopilot = _safe_read_json(os.path.join(HUB_DATA_DIR, "autopilot_status.json"))
-        autofix = _safe_read_json(os.path.join(HUB_DATA_DIR, "autofix_status.json"))
         stock_broker = _safe_read_json(os.path.join(HUB_DATA_DIR, "stocks", "alpaca_status.json"))
         forex_broker = _safe_read_json(os.path.join(HUB_DATA_DIR, "forex", "oanda_status.json"))
         status = _safe_read_json(TRADER_STATUS_PATH)
@@ -720,7 +717,6 @@ class Runner:
                     "trader": status.get("trader_pid"),
                     "markets": status.get("markets_pid"),
                     "autopilot": status.get("autopilot_pid"),
-                    "autofix": status.get("autofix_pid"),
                 },
                 "restarts": dict(heartbeat_payload.get("restarts", {}) or {}),
                 "last_exit": dict(heartbeat_payload.get("last_exit", {}) or {}),
@@ -839,15 +835,6 @@ class Runner:
                 "markets_healthy": bool(autopilot.get("markets_healthy", False)),
                 "issue_open": bool(autopilot.get("issue_open", False)),
             },
-            "autofix": {
-                "enabled": bool(autofix.get("enabled", False)),
-                "mode": str(autofix.get("mode", "") or ""),
-                "tickets_created": int(autofix.get("tickets_created", 0) or 0),
-                "applied_ok": int(autofix.get("applied_ok", 0) or 0),
-                "applied_count_day": int(autofix.get("applied_count_day", 0) or 0),
-                "last_ticket_id": str(autofix.get("last_ticket_id", "") or ""),
-                "api_key_configured": bool(autofix.get("api_key_configured", False)),
-            },
             "api_quota": api_quota,
             "broker_backoff": broker_backoff,
             "broker_latency_histogram": latency_hist,
@@ -872,6 +859,120 @@ class Runner:
             return age > float(max_age_s)
         except Exception:
             return True
+
+    def _market_loop_watchdog_stale_after(self, settings: Dict[str, Any], floor_s: float = 150.0) -> float:
+        try:
+            configured_s = float(settings.get("runner_market_loop_watchdog_stale_after_s", 0.0) or 0.0)
+        except Exception:
+            configured_s = 0.0
+        try:
+            snapshot_interval_s = max(5.0, float(settings.get("market_bg_snapshot_interval_s", 15.0) or 15.0))
+        except Exception:
+            snapshot_interval_s = 15.0
+        try:
+            stock_interval_s = max(8.0, float(settings.get("market_bg_stocks_interval_s", 18.0) or 18.0))
+        except Exception:
+            stock_interval_s = 18.0
+        try:
+            forex_interval_s = max(6.0, float(settings.get("market_bg_forex_interval_s", 12.0) or 12.0))
+        except Exception:
+            forex_interval_s = 12.0
+
+        derived_s = snapshot_interval_s + stock_interval_s + forex_interval_s + 10.0
+        runtime_state = _safe_read_json(RUNTIME_STATE_PATH)
+        sla_metrics = runtime_state.get("sla_metrics", {}) if isinstance(runtime_state.get("sla_metrics", {}), dict) else {}
+        phase_budget_s = 0.0
+        for key in (
+            "stocks_snapshot",
+            "forex_snapshot",
+            "stocks_scan",
+            "forex_scan",
+            "stocks_trader_step",
+            "forex_trader_step",
+        ):
+            row = sla_metrics.get(key, {}) if isinstance(sla_metrics, dict) else {}
+            if not isinstance(row, dict):
+                continue
+            samples_ms: list[float] = []
+            for field in ("p95_ms", "last_ms"):
+                try:
+                    val = float(row.get(field, 0.0) or 0.0)
+                except Exception:
+                    val = 0.0
+                if val > 0.0:
+                    samples_ms.append(val)
+            if not samples_ms:
+                continue
+            phase_budget_s += min(max(samples_ms) / 1000.0, 180.0)
+        if phase_budget_s > 0.0:
+            derived_s = max(derived_s, phase_budget_s + 10.0)
+
+        base_s = max(
+            float(floor_s or 0.0),
+            forex_interval_s * MARKETS_STALE_MULT,
+            float(configured_s if configured_s > 0.0 else 0.0),
+            float(derived_s),
+        )
+        return min(max(30.0, base_s), 600.0)
+
+    def _market_loop_phase_timeout_s(
+        self,
+        phase: str,
+        runtime_state: Dict[str, Any],
+        base_stale_after: float,
+    ) -> float:
+        phase_key = str(phase or "").strip().lower()
+        metric_map = {
+            "snapshots": ("stocks_snapshot", "forex_snapshot"),
+            "stocks_scan": ("stocks_scan",),
+            "stocks_step": ("stocks_trader_step",),
+            "forex_scan": ("forex_scan",),
+            "forex_step": ("forex_trader_step",),
+            "intelligence": (),
+        }
+        metrics = runtime_state.get("sla_metrics", {}) if isinstance(runtime_state.get("sla_metrics", {}), dict) else {}
+        phase_budget_s = 0.0
+        for metric_key in metric_map.get(phase_key, ()):
+            row = metrics.get(metric_key, {}) if isinstance(metrics, dict) else {}
+            if not isinstance(row, dict):
+                continue
+            samples_ms: list[float] = []
+            for field in ("p95_ms", "last_ms"):
+                try:
+                    val = float(row.get(field, 0.0) or 0.0)
+                except Exception:
+                    val = 0.0
+                if val > 0.0:
+                    samples_ms.append(val)
+            if samples_ms:
+                phase_budget_s += min(max(samples_ms) / 1000.0, 300.0)
+        if phase_key == "intelligence":
+            phase_budget_s = max(phase_budget_s, 120.0)
+        if phase_budget_s <= 0.0:
+            return min(max(float(base_stale_after or 0.0), 240.0), 900.0)
+        return min(max(float(base_stale_after or 0.0), (phase_budget_s * 2.0) + 30.0), 900.0)
+
+    def _market_loop_watchdog_state(
+        self,
+        settings: Dict[str, Any],
+        now: float,
+        base_stale_after: float,
+    ) -> tuple[bool, float, str, str]:
+        loop_status = _safe_read_json(MARKET_LOOP_STATUS_PATH)
+        phase = str(loop_status.get("phase", "idle") or "idle").strip().lower() if isinstance(loop_status, dict) else "idle"
+        if self._status_file_stale(MARKET_LOOP_STATUS_PATH, base_stale_after):
+            return True, float(base_stale_after), phase, "heartbeat_stale"
+        if not isinstance(loop_status, dict) or not loop_status:
+            return False, float(base_stale_after), phase, "ok"
+        phase_started_ts = int(loop_status.get("phase_started_ts", 0) or 0)
+        if phase in {"", "idle"} or phase_started_ts <= 0:
+            return False, float(base_stale_after), phase, "ok"
+        runtime_state = _safe_read_json(RUNTIME_STATE_PATH)
+        phase_timeout_s = self._market_loop_phase_timeout_s(phase, runtime_state, base_stale_after)
+        phase_age_s = max(0.0, float(now) - float(phase_started_ts))
+        if phase_age_s >= phase_timeout_s:
+            return True, float(phase_timeout_s), phase, "phase_timeout"
+        return False, float(phase_timeout_s), phase, "ok"
 
     def _child_uptime_s(self, child: Optional[ChildSpec], now: float) -> float:
         if child is None or child.proc is None or child.proc.poll() is not None:
@@ -911,13 +1012,9 @@ class Runner:
             )
         except Exception:
             market_loop_startup_grace_s = max(market_startup_grace_s, 150.0)
+        market_loop_stale_after = self._market_loop_watchdog_stale_after(settings, floor_s=market_loop_startup_grace_s)
 
         targets = [
-            (
-                "markets",
-                os.path.join(HUB_DATA_DIR, "stocks", "stock_trader_status.json"),
-                market_interval * MARKETS_STALE_MULT,
-            ),
             (
                 "autopilot",
                 os.path.join(HUB_DATA_DIR, "autopilot_status.json"),
@@ -943,15 +1040,20 @@ class Runner:
         # Extra signal: markets loop heartbeat is stale even if process has not yet been restarted.
         markets_child = self.children.get("markets")
         if markets_child and markets_child.proc and markets_child.proc.poll() is None:
-            loop_stale_after = market_interval * MARKETS_STALE_MULT
+            loop_stale_after = market_loop_stale_after
             if self._child_uptime_s(markets_child, now) < market_loop_startup_grace_s:
                 return
             if (not os.path.isfile(MARKET_LOOP_STATUS_PATH)) and self._child_uptime_s(markets_child, now) < (
                 market_loop_startup_grace_s + loop_stale_after
             ):
                 return
-            if self._status_file_stale(MARKET_LOOP_STATUS_PATH, loop_stale_after):
-                stale_msg = f"market loop status stale>{int(loop_stale_after)}s (markets child alive)"
+            stale, loop_limit_s, phase, stale_reason = self._market_loop_watchdog_state(settings, now, loop_stale_after)
+            if stale:
+                phase_txt = f" phase={phase}" if phase and phase != "idle" else ""
+                if stale_reason == "phase_timeout" and phase_txt:
+                    stale_msg = f"market loop phase timeout>{int(loop_limit_s)}s ({phase_txt.strip()}; markets child alive)"
+                else:
+                    stale_msg = f"market loop status stale>{int(loop_limit_s)}s ({phase_txt.strip() + '; ' if phase_txt else ''}markets child alive)"
                 if (now - self._last_market_loop_stale_note_at) >= 60.0:
                     self._last_market_loop_stale_note_at = now
                     _runner_log(stale_msg)
@@ -959,15 +1061,22 @@ class Runner:
                         "warning",
                         "runner_market_loop_status_stale",
                         stale_msg,
-                        {"status_path": MARKET_LOOP_STATUS_PATH, "stale_after_s": int(loop_stale_after)},
+                        {
+                            "status_path": MARKET_LOOP_STATUS_PATH,
+                            "stale_after_s": int(loop_limit_s),
+                            "phase": phase,
+                            "reason": stale_reason,
+                        },
                     )
                 restart_cooldown_s = max(float(MARKET_LOOP_RESTART_COOLDOWN_S), float(market_interval) * 3.0)
                 if (now - self._last_market_loop_restart_at) >= restart_cooldown_s:
                     self._last_market_loop_restart_at = now
                     restart_msg = (
-                        f"market loop stale>{int(loop_stale_after)}s; restarting markets child "
+                        f"market loop stale>{int(loop_limit_s)}s; restarting markets child "
                         f"(cooldown {int(restart_cooldown_s)}s)"
                     )
+                    if phase and phase != "idle":
+                        restart_msg = restart_msg[:-1] + f" | phase={phase})"
                     self.msg = restart_msg
                     _runner_log(restart_msg)
                     _append_incident(
@@ -976,8 +1085,10 @@ class Runner:
                         restart_msg,
                         {
                             "status_path": MARKET_LOOP_STATUS_PATH,
-                            "stale_after_s": int(loop_stale_after),
+                            "stale_after_s": int(loop_limit_s),
                             "cooldown_s": int(restart_cooldown_s),
+                            "phase": phase,
+                            "reason": stale_reason,
                         },
                     )
                     _terminate_process(markets_child.proc, "markets", force=False)
@@ -990,7 +1101,7 @@ class Runner:
         settings = sanitize_settings(read_settings_file(settings_path, module_name="pt_runner") or {})
         stats = cleanup_logs(
             LOG_DIR,
-            keep_patterns=("runner.log", "thinker.log", "trader.log", "markets.log", "autopilot.log", "autofix.log"),
+            keep_patterns=("runner.log", "thinker.log", "trader.log", "markets.log", "autopilot.log"),
             max_age_days=LOG_RETENTION_AGE_DAYS,
             max_total_bytes=LOG_RETENTION_MAX_TOTAL_BYTES,
         )
