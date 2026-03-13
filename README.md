@@ -9,8 +9,7 @@ The desktop hub UI is in [ui/pt_hub.py](/Users/joeydelestre/PowerTrader_AI/ui/pt
 
 ## Safety First
 - This software can place real orders when configured for live mode.
-- Run paper/practice/shadow validation first.
-- Keep `paper_only_unless_checklist_green=true` unless you explicitly accept live risk.
+- Keep `paper_only_unless_checklist_green=true` until checklist is green.
 - Review all broker credentials, risk caps, and exposure controls before enabling auto-trade.
 
 ## Current Repo Layout
@@ -64,7 +63,7 @@ Important runtime behavior:
 ./venv/bin/python -m runtime.pt_autopilot --once
 ```
 
-## Preflight (Run Before Shadow/Live)
+## Preflight (Run Before Live)
 Use the readiness checker before testing:
 ```bash
 python3 runtime/tools/preflight_readiness.py
@@ -87,43 +86,6 @@ Optional strict gates:
 ```bash
 python3 runtime/tools/run_quality_suite.py --require-artifacts --require-stability --require-preflight
 ```
-
-## Rollout Stages
-`market_rollout_stage`:
-1. `legacy`
-2. `scan_expanded`
-3. `risk_caps`
-4. `execution_v2`
-5. `shadow_only`
-6. `live_guarded`
-
-Set this in Hub Settings -> Advanced.
-
-When a live Alpaca or live OANDA broker mode is saved in Settings, the hub will auto-promote non-executable rollout stages to `live_guarded`.
-
-## Recommended Validation Path
-### 1) Shadow validation
-- Keep:
-  - `alpaca_paper_mode=true`
-  - `oanda_practice_mode=true`
-  - `market_rollout_stage=shadow_only`
-- Enable:
-  - `stock_auto_trade_enabled=true`
-  - `forex_auto_trade_enabled=true`
-- Run runner/hub and verify:
-  - scanners produce leaders
-  - trader messages show simulated/shadow behavior
-  - no stale fallback lockouts or health regressions
-
-### 2) Controlled execution (paper/practice)
-- Set `market_rollout_stage=execution_v2`
-- Keep paper/practice modes enabled
-- Verify entry/exit lifecycle and risk caps in logs/status
-
-### 3) Live-guarded rollout
-- Set `market_rollout_stage=live_guarded`
-- Only after checklist is green, disable broker paper/practice mode if intended
-- Keep strict risk controls enabled (cached-scan gates, data-quality gates, reject-pressure gates, exposure caps)
 
 ## Key Runtime Files
 ### Core status

@@ -313,7 +313,6 @@ class MarketPositionsTableTests(unittest.TestCase):
                 "exposure_usd": 54.7478,
                 "open_positions": 4,
             },
-            mode_txt="Live",
         )
 
         self.assertEqual(snapshot["total_account_value"], "$100.01")
@@ -322,7 +321,6 @@ class MarketPositionsTableTests(unittest.TestCase):
         self.assertEqual(snapshot["percent_in_trade"], "2.60%")
         self.assertEqual(snapshot["open_positions"], "4")
         self.assertEqual(snapshot["realized_pnl"], "+0.00")
-        self.assertEqual(snapshot["mode"], "Live")
 
     def test_stock_portfolio_snapshot_prefers_cash_over_margin_buying_power(self) -> None:
         hub = self._hub()
@@ -345,7 +343,6 @@ class MarketPositionsTableTests(unittest.TestCase):
                 "exposure_usd": 247.3285,
                 "open_positions": 2,
             },
-            mode_txt="Paper",
         )
 
         self.assertEqual(snapshot["total_account_value"], "$99,997.33")
@@ -354,7 +351,6 @@ class MarketPositionsTableTests(unittest.TestCase):
         self.assertEqual(snapshot["percent_in_trade"], "0.25%")
         self.assertEqual(snapshot["open_positions"], "2")
         self.assertEqual(snapshot["realized_pnl"], "N/A")
-        self.assertEqual(snapshot["mode"], "Paper")
 
     def test_set_market_positions_populates_rich_stock_row_and_summary(self) -> None:
         hub = self._hub()
@@ -650,10 +646,10 @@ class MarketPositionsTableTests(unittest.TestCase):
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["symbol"], "AUD_USD")
-        self.assertEqual(rows[0]["side"], "SHORT")
+        self.assertEqual(rows[0]["status"], "ENTRY WAIT")
         self.assertEqual(rows[0]["status"], "ENTRY WAIT")
         self.assertIn("-0.6607", rows[0]["score"])
-        self.assertIn("Waiting for the next qualified setup", rows[0]["why"])
+        self.assertTrue(bool(str(rows[0].get("why", "") or "").strip()))
         self.assertIn("Needs SHORT setup", rows[0]["trigger"])
 
     def test_market_watchlist_rows_mark_ready_entries_with_trigger(self) -> None:

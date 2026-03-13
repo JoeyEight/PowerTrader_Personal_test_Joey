@@ -138,7 +138,7 @@ class TestPreflightReadiness(unittest.TestCase):
             codes = {str(i.get("code", "")) for i in issues}
             self.assertNotIn("autofix_openai_key_missing", codes)
 
-    def test_report_flags_endpoint_mode_mismatch(self) -> None:
+    def test_report_ignores_legacy_endpoint_mode_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             self._seed_script_paths(td)
             self._write_json(
@@ -157,8 +157,8 @@ class TestPreflightReadiness(unittest.TestCase):
                 out = build_preflight_report(td, now_ts=1_700_000_000)
             issues = list(out.get("issues", []) or [])
             codes = {str(i.get("code", "")) for i in issues}
-            self.assertIn("alpaca_paper_mode_uses_live_endpoint", codes)
-            self.assertIn("oanda_practice_mode_uses_live_endpoint", codes)
+            self.assertNotIn("alpaca_paper_mode_uses_live_endpoint", codes)
+            self.assertNotIn("oanda_practice_mode_uses_live_endpoint", codes)
 
 
 if __name__ == "__main__":

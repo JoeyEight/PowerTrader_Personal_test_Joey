@@ -114,6 +114,7 @@ class TestStockThinkerFallback(unittest.TestCase):
                 "stock_scan_watch_leaders_count": 4,
                 "stock_scan_max_symbols": 20,
                 "stock_scan_use_daily_when_closed": True,
+                "stock_scan_closed_pause_hours": 0,
             }
             with (
                 patch.object(stock_thinker, "get_alpaca_creds", return_value=("abc", "xyz")),
@@ -186,6 +187,7 @@ class TestStockThinkerFallback(unittest.TestCase):
                 "stock_scan_max_symbols": 20,
                 "stock_leader_stability_margin_pct": 20.0,
                 "stock_scan_use_daily_when_closed": True,
+                "stock_scan_closed_pause_hours": 0,
             }
 
             def _score(symbol: str, bars: list[dict], spread_bps: float = 0.0) -> dict:
@@ -227,6 +229,7 @@ class TestStockThinkerFallback(unittest.TestCase):
                 "stock_min_calib_prob_live_guarded": 0.50,
                 "stock_scan_max_symbols": 20,
                 "stock_scan_use_daily_when_closed": True,
+                "stock_scan_closed_pause_hours": 0,
             }
 
             def _score(symbol: str, bars: list[dict], spread_bps: float = 0.0) -> dict:
@@ -271,6 +274,7 @@ class TestStockThinkerFallback(unittest.TestCase):
                 "stock_min_calib_prob_live_guarded": 0.50,
                 "stock_scan_max_symbols": 20,
                 "stock_scan_use_daily_when_closed": True,
+                "stock_scan_closed_pause_hours": 0,
             }
 
             def _score(symbol: str, bars: list[dict], spread_bps: float = 0.0) -> dict:

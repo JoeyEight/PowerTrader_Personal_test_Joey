@@ -141,6 +141,10 @@ def _scan_diag_path(hub_dir: str) -> str:
     return os.path.join(hub_dir, "stocks", "scan_diagnostics.json")
 
 
+def _scan_pause_path(hub_dir: str) -> str:
+    return os.path.join(hub_dir, "stocks", "scan_pause.json")
+
+
 def _feed_health_path(hub_dir: str) -> str:
     return os.path.join(hub_dir, "stocks", "feed_health.json")
 
@@ -1208,6 +1212,84 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         }
 
     market_open = _market_open_now()
+    pause_setting = settings.get("stock_scan_closed_pause_hours", 2.0)
+    try:
+        pause_hours = max(0.0, float(pause_setting))
+    except Exception:
+        pause_hours = 2.0
+    pause_state = _load_json_map(_scan_pause_path(hub_dir))
+    pause_until = int(pause_state.get("pause_until_ts", 0) or 0)
+    if market_open and pause_until > 0:
+        _save_json_map(
+            _scan_pause_path(hub_dir),
+            {"ts": ts_now, "pause_until_ts": 0, "reason": "market_open"},
+        )
+        pause_until = 0
+    if (not market_open) and pause_hours > 0:
+        if pause_until <= ts_now:
+            pause_until = ts_now + int(pause_hours * 3600)
+            _save_json_map(
+                _scan_pause_path(hub_dir),
+                {
+                    "ts": ts_now,
+                    "pause_until_ts": int(pause_until),
+                    "pause_hours": float(pause_hours),
+                    "reason": "market_closed",
+                    "market_open": False,
+                },
+            )
+        remaining_s = max(0, int(pause_until - ts_now))
+        msg = f"Market closed; scan paused ({max(0, int(remaining_s / 60))}m remaining)"
+        paused_payload = {
+            "state": "PAUSED",
+            "ai_state": "Scan paused",
+            "msg": msg,
+            "universe": list(prev_candidates or DEFAULT_STOCK_UNIVERSE),
+            "leaders": [],
+            "all_scores": [],
+            "top_pick": None,
+            "top_chart": [],
+            "top_chart_map": {},
+            "updated_at": ts_now,
+            "market_open": False,
+            "pause_until_ts": int(pause_until),
+            "pause_remaining_s": int(remaining_s),
+            "reject_summary": {
+                "total_rejected": 0,
+                "total_rejected_events": 0,
+                "reject_rate_pct": 0.0,
+                "dominant_reason": "market_closed",
+                "dominant_ratio_pct": 0.0,
+                "counts": {},
+            },
+            "health": {"data_ok": False, "broker_ok": True, "orders_ok": True, "drift_warning": False},
+        }
+        _save_scan_diagnostics(
+            hub_dir,
+            {
+                "ts": ts_now,
+                "state": "PAUSED",
+                "mode": "closed_pause",
+                "market_open": False,
+                "universe_total": int(len(list(prev_candidates or DEFAULT_STOCK_UNIVERSE))),
+                "candidates_total": 0,
+                "scores_total": 0,
+                "leaders_total": 0,
+                "top_symbol": "",
+                "top_score": 0.0,
+                "msg": msg,
+                "reject_summary": dict(paused_payload["reject_summary"]),
+                "candidate_symbols": [],
+                "leader_symbols": [],
+                "leader_mode": "none",
+                "leader_stability_applied": False,
+                "leader_stability_prev_symbol": str(prev_top_symbol),
+                "candidate_churn_pct": 0.0,
+                "leader_churn_pct": 0.0,
+                "quality_summary": "Market closed; scan paused.",
+            },
+        )
+        return paused_payload
     headers = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret}
     now_utc = datetime.now(timezone.utc)
     start_utc = now_utc - timedelta(days=10)
@@ -1284,6 +1366,21 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 "universe_total": len(universe),
             },
         )
+    allow_missing_liquidity = False
+    liquidity_missing_ratio_pct = 0.0
+    try:
+        if universe:
+            missing = sum(
+                1
+                for sym in universe
+                if _float((snap.get(sym, {}) or {}).get("dollar_vol", 0.0), 0.0) <= 0.0
+            )
+            liquidity_missing_ratio_pct = (float(missing) / float(len(universe))) * 100.0
+            allow_missing_liquidity = liquidity_missing_ratio_pct >= 65.0
+    except Exception:
+        allow_missing_liquidity = False
+    if market_open:
+        allow_missing_liquidity = False
     min_price = max(0.0, float(settings.get("stock_min_price", 2.0) or 2.0))
     max_price = max(min_price, float(settings.get("stock_max_price", 500.0) or 500.0))
     min_dollar_vol = max(0.0, float(settings.get("stock_min_dollar_volume", 2_000_000.0) or 2_000_000.0))
@@ -1389,7 +1486,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             add_rejected({"symbol": sym, "reason": "spread", "spread_bps": spread_bps})
             _apply_symbol_cooldown(cooldown_map, sym, "spread", settings, now_ts)
             continue
-        if market_open and dollar_vol <= 0.0:
+        if market_open and dollar_vol <= 0.0 and (not allow_missing_liquidity):
             add_rejected({"symbol": sym, "reason": "liquidity", "dollar_vol": dollar_vol})
             _apply_symbol_cooldown(cooldown_map, sym, "liquidity", settings, now_ts)
             continue
@@ -1417,6 +1514,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             for symbol in candidates:
                 symbol_bars: List[Dict[str, Any]] = []
                 data_source = ""
+                open_daily_fallback = False
                 if market_open or (not use_daily_when_closed):
                     symbol_bars = list(bars_by_symbol.get(symbol, []) or [])
                     data_source = "batch_1h"
@@ -1456,7 +1554,18 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 if len(symbol_bars) < min_bars_required:
                     # Last resort for thin symbols / feed limitations: daily bars.
                     try:
-                        if (not market_open) and data_source != "symbol_1d":
+                        if market_open:
+                            symbol_bars = client.get_stock_bars(
+                                symbol,
+                                timeframe="1Day",
+                                limit=120,
+                                feed=feed,
+                                start_iso=daily_start_iso,
+                                end_iso=daily_end_iso,
+                            )
+                            data_source = "symbol_1d_open"
+                            open_daily_fallback = True
+                        elif data_source != "symbol_1d":
                             symbol_bars = client.get_stock_bars(
                                 symbol,
                                 timeframe="1Day",
@@ -1466,9 +1575,6 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                                 end_iso=daily_end_iso,
                             )
                             data_source = "symbol_1d"
-                        elif market_open:
-                            symbol_bars = client.get_stock_bars(symbol, timeframe="1Hour", limit=160, feed=feed)
-                            data_source = "symbol_1h"
                     except Exception:
                         symbol_bars = list(symbol_bars or [])
                 bars_count = int(len(symbol_bars or []))
@@ -1501,6 +1607,8 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 row["dollar_vol"] = round(_float((snap.get(symbol, {}) or {}).get("dollar_vol", 0.0), 0.0), 2)
                 row["bars_count"] = bars_count
                 row["data_source"] = f"{data_source}:{feed}"
+                if open_daily_fallback:
+                    row["open_daily_fallback"] = True
                 q = _bar_quality(symbol_bars)
                 row["valid_ratio"] = round(float(q.get("valid_ratio", 0.0)), 4)
                 row["stale_hours"] = round(float(q.get("stale_hours", 9999.0)), 3)
@@ -1661,6 +1769,8 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 "candidate_churn_pct": float(candidate_churn_pct),
                 "leader_churn_pct": float(leader_churn_pct),
                 "quality_summary": str(quality_report.get("summary", "") or ""),
+                "liquidity_missing_ratio_pct": round(float(liquidity_missing_ratio_pct), 3),
+                "liquidity_missing_allowed": bool(allow_missing_liquidity),
             },
         )
         hints = _market_hints_from_rejects(
@@ -1714,6 +1824,8 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     "candidate_churn_pct": float(fallback.get("candidate_churn_pct", candidate_churn_pct) or candidate_churn_pct),
                     "leader_churn_pct": float(fallback.get("leader_churn_pct", leader_churn_pct) or leader_churn_pct),
                     "quality_summary": str((dict(fallback.get("universe_quality", {})).get("summary", "") if isinstance(fallback.get("universe_quality", {}), dict) else "") or ""),
+                    "liquidity_missing_ratio_pct": round(float(liquidity_missing_ratio_pct), 3),
+                    "liquidity_missing_allowed": bool(allow_missing_liquidity),
                     "fallback_cached": True,
                 },
             )
@@ -1767,6 +1879,16 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     for row in scored:
         row["entry_gate_reason"] = ""
         row["eligible_for_entry"] = str(row.get("symbol", "")).strip().upper() in exec_bucket
+        if market_open and bool(row.get("open_daily_fallback", False)):
+            row["eligible_for_entry"] = False
+            row["entry_gate_reason"] = "Daily bars fallback during market open"
+            if str(row.get("side", "watch")).lower() == "long":
+                row["side"] = "watch"
+            _append_reason_parts(
+                row,
+                logic="Daily bars fallback during market open; hold as watch",
+                data="open session daily fallback",
+            )
         if (not row["eligible_for_entry"]) and (str(row.get("side", "watch")).lower() == "long"):
             _append_reason_parts(
                 row,
@@ -1953,6 +2075,8 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "candidate_churn_pct": float(candidate_churn_pct),
             "leader_churn_pct": float(leader_churn_pct),
             "quality_summary": str(quality_report.get("summary", "") or ""),
+            "liquidity_missing_ratio_pct": round(float(liquidity_missing_ratio_pct), 3),
+            "liquidity_missing_allowed": bool(allow_missing_liquidity),
             "adaptive_threshold_base": float(base_thr),
             "adaptive_threshold_volatility": float(round(volatility_threshold, 6)),
             "adaptive_threshold_replay_recommended": float(round(replay_recommended, 6)),

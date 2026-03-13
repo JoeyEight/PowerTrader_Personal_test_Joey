@@ -9,7 +9,9 @@ SANITIZER_DEFAULTS: Dict[str, Any] = {
     "settings_schema_version": CURRENT_SETTINGS_VERSION,
     "settings_upgrade_notes": [],
     "coins": ["BTC", "ETH", "XRP", "BNB", "DOGE"],
-    "market_rollout_stage": "legacy",
+    "market_rollout_stage": "live_guarded",
+    "alpaca_paper_mode": False,
+    "oanda_practice_mode": False,
     "settings_control_mode": "self_managed",
     "settings_profile": "balanced",
     "ui_role_mode": "basic",
@@ -59,6 +61,7 @@ SANITIZER_DEFAULTS: Dict[str, Any] = {
     "stock_max_stale_hours": 6.0,
     "stock_scan_open_cooldown_minutes": 15,
     "stock_scan_close_cooldown_minutes": 15,
+    "stock_scan_closed_pause_hours": 2.0,
     "stock_scan_open_score_mult": 0.85,
     "stock_scan_close_score_mult": 0.90,
     "stock_scan_publish_watch_leaders": True,
@@ -279,6 +282,7 @@ _FLOAT_BOUNDS: Dict[str, Tuple[float, float, float]] = {
     "stock_max_spread_bps": (40.0, 0.0, 5000.0),
     "stock_min_valid_bars_ratio": (0.7, 0.0, 1.0),
     "stock_max_stale_hours": (6.0, 0.5, 720.0),
+    "stock_scan_closed_pause_hours": (2.0, 0.0, 48.0),
     "stock_scan_open_score_mult": (0.85, 0.5, 1.0),
     "stock_scan_close_score_mult": (0.90, 0.5, 1.0),
     "stock_leader_stability_margin_pct": (10.0, 0.0, 100.0),
@@ -838,5 +842,10 @@ def sanitize_settings(raw: Dict[str, Any] | None, defaults: Dict[str, Any] | Non
         out["settings_upgrade_notes"] = list(notes[-20:])
     elif not isinstance(out.get("settings_upgrade_notes", []), list):
         out["settings_upgrade_notes"] = []
+
+    # Live-only configuration: disable legacy modes and lock rollout to live.
+    out["alpaca_paper_mode"] = False
+    out["oanda_practice_mode"] = False
+    out["market_rollout_stage"] = "live_guarded"
 
     return out
