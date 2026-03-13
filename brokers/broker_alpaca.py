@@ -249,6 +249,8 @@ class AlpacaBrokerClient:
                 quote = row.get("latestQuote", {}) or {}
                 trade = row.get("latestTrade", {}) or {}
                 daily = row.get("dailyBar", {}) or {}
+                prev_daily = row.get("prevDailyBar", {}) or {}
+                minute = row.get("minuteBar", {}) or {}
                 try:
                     bid = float(quote.get("bp", 0.0) or 0.0)
                 except Exception:
@@ -296,6 +298,16 @@ class AlpacaBrokerClient:
                     vol = float(daily.get("v", 0.0) or 0.0)
                 except Exception:
                     vol = 0.0
+                if vol <= 0.0:
+                    try:
+                        vol = float(prev_daily.get("v", 0.0) or 0.0)
+                    except Exception:
+                        vol = vol
+                if vol <= 0.0:
+                    try:
+                        vol = float(minute.get("v", 0.0) or 0.0)
+                    except Exception:
+                        vol = vol
                 dollar_vol = vol * mid if mid > 0 else 0.0
                 out[sym] = {
                     "bid": bid,

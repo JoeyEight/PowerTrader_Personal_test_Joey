@@ -150,7 +150,7 @@ class HubMarketOverviewFallbackTests(unittest.TestCase):
             self.assertEqual(panel["portfolio_vars"]["open_positions"].get(), "0")
             self.assertEqual(
                 panel["endpoint_var"].get(),
-                "Broker: OANDA | Live | https://api-fxtrade.oanda.com",
+                "Broker: OANDA | https://api-fxtrade.oanda.com",
             )
 
     def test_stocks_fallback_uses_equity_when_buying_power_is_placeholder(self) -> None:
@@ -196,7 +196,7 @@ class HubMarketOverviewFallbackTests(unittest.TestCase):
             self.assertEqual(panel["portfolio_vars"]["open_positions"].get(), "1")
             self.assertEqual(
                 panel["endpoint_var"].get(),
-                "Broker: Alpaca | Paper | https://paper-api.alpaca.markets",
+                "Broker: Alpaca | https://paper-api.alpaca.markets",
             )
 
     def test_stocks_fallback_hydrates_positions_and_scan_canvas(self) -> None:

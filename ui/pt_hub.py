@@ -456,10 +456,10 @@ DEFAULT_SETTINGS = {
     "market_fallback_snapshot_max_age_s": 1800.0,
     "alpaca_api_key_id": "",
     "alpaca_secret_key": "",
-    "alpaca_base_url": "https://paper-api.alpaca.markets",
+    "alpaca_base_url": "https://api.alpaca.markets",
     "alpaca_data_url": "https://data.alpaca.markets",
-    "alpaca_paper_mode": True,
-    "market_rollout_stage": "legacy",  # legacy | scan_expanded | risk_caps | execution_v2 | shadow_only | live_guarded
+    "alpaca_paper_mode": False,
+    "market_rollout_stage": "live_guarded",  # internal rollout stage (locked to live)
     "settings_control_mode": "self_managed",  # preset_managed | self_managed
     "settings_profile": "balanced",  # guarded | balanced | performance
     "ui_role_mode": "basic",  # basic | advanced | admin
@@ -523,9 +523,9 @@ DEFAULT_SETTINGS = {
     "stock_symbol_cooldown_reject_reasons": "data_quality,insufficient_bars",
     "oanda_account_id": "",
     "oanda_api_token": "",
-    "oanda_rest_url": "https://api-fxpractice.oanda.com",
-    "oanda_stream_url": "https://stream-fxpractice.oanda.com",
-    "oanda_practice_mode": True,
+    "oanda_rest_url": "https://api-fxtrade.oanda.com",
+    "oanda_stream_url": "https://stream-fxtrade.oanda.com",
+    "oanda_practice_mode": False,
     "forex_auto_trade_enabled": False,
     "forex_universe_pairs": "",
     "forex_scan_max_pairs": 32,
@@ -2564,6 +2564,8 @@ class PowerTraderHub(tk.Tk):
 
         self.settings = self._load_settings()
         self._apply_font_scale_preset(str(self.settings.get("ui_font_scale_preset", "normal") or "normal"), persist=False)
+        self._last_profile_autotune_ts = 0.0
+        self._profile_autotune_interval_s = 20.0
 
         self.project_dir = BASE_DIR
 
@@ -2825,7 +2827,7 @@ class PowerTraderHub(tk.Tk):
         frame.pack(fill="both", expand=True, padx=12, pady=12)
         ttk.Label(frame, text="PowerTrader Quick Start", foreground=DARK_ACCENT2).pack(anchor="w", pady=(0, 8))
         msg = (
-            "1. Open Settings and add broker credentials (paper/practice first).\n"
+            "1. Open Settings and add broker credentials.\n"
             "2. Test broker connections from Stocks and Forex tabs.\n"
             "3. Run scans and confirm leaders/health.\n"
             "4. Keep live-mode guard enabled until checklist is green.\n"
@@ -3179,6 +3181,47 @@ class PowerTraderHub(tk.Tk):
             resolved.update(tuned)
         return resolved
 
+    def _maybe_apply_profile_autotune(self, now_ts: Optional[float] = None) -> None:
+        try:
+            mode_key = str(self.settings.get("settings_control_mode", "self_managed") or "self_managed").strip().lower()
+        except Exception:
+            mode_key = "self_managed"
+        if mode_key != "preset_managed":
+            return
+        try:
+            profile_key = str(self.settings.get("settings_profile", "balanced") or "balanced").strip().lower()
+        except Exception:
+            profile_key = "balanced"
+        if profile_key not in {"guarded", "balanced", "performance"}:
+            profile_key = "balanced"
+        now = float(time.time() if now_ts is None else now_ts)
+        interval_s = float(getattr(self, "_profile_autotune_interval_s", 20.0) or 20.0)
+        last_ts = float(getattr(self, "_last_profile_autotune_ts", 0.0) or 0.0)
+        if (now - last_ts) < interval_s:
+            return
+        self._last_profile_autotune_ts = now
+        tuned = self._resolve_account_aware_profile_overrides(profile_key, settings_source=self.settings)
+        if not isinstance(tuned, dict) or not tuned:
+            return
+
+        def _equivalent(left: Any, right: Any) -> bool:
+            if isinstance(left, bool) or isinstance(right, bool):
+                return bool(left) == bool(right)
+            try:
+                return abs(float(left) - float(right)) < 1e-6
+            except Exception:
+                return str(left or "").strip() == str(right or "").strip()
+
+        changes: Dict[str, Any] = {}
+        for key, value in tuned.items():
+            if _equivalent(self.settings.get(key), value):
+                continue
+            changes[key] = value
+        if not changes:
+            return
+        self.settings.update(changes)
+        self._save_settings()
+
     def _save_market_max_open_positions(self, market_key: str, value: Any) -> Tuple[bool, str]:
         mk = str(market_key or "").strip().lower()
         if mk not in {"stocks", "forex"}:
@@ -3263,7 +3306,6 @@ class PowerTraderHub(tk.Tk):
         *,
         status_data: Optional[Dict[str, Any]] = None,
         trader_data: Optional[Dict[str, Any]] = None,
-        mode_txt: str = "",
     ) -> Dict[str, str]:
         mk = str(market_key or "").strip().lower()
         status = status_data if isinstance(status_data, dict) else {}
@@ -3378,7 +3420,6 @@ class PowerTraderHub(tk.Tk):
             "percent_in_trade": percent_in_trade_text,
             "open_positions": open_positions_text,
             "realized_pnl": realized_text,
-            "mode": mode_txt or "Paper first",
         }
 
     def _market_daily_guard_text(self, market_key: str, trader_data: Optional[Dict[str, Any]] = None) -> str:
@@ -3860,6 +3901,10 @@ class PowerTraderHub(tk.Tk):
                 runtime_snapshot=runtime_snapshot,
                 can_toggle=can_toggle_all,
             )
+            try:
+                self._apply_shared_left_pane_width()
+            except Exception:
+                pass
             ui = getattr(self, "_notification_ui", {}) if isinstance(getattr(self, "_notification_ui", {}), dict) else {}
             market_var = ui.get("market_var")
             refresh_fn = ui.get("refresh")
@@ -4561,7 +4606,7 @@ class PowerTraderHub(tk.Tk):
         self._set_badge_style(self.lbl_toolbar_checks_badge, checks_txt, tone=checks_tone)
 
         subtitle = (
-            f"Stage={str(self.settings.get('market_rollout_stage', 'legacy') or 'legacy')} | "
+            f"Auto Crypto={'ON' if bool(self.settings.get('auto_start_trading_when_all_trained', True)) else 'OFF'} | "
             f"Auto Stocks={'ON' if bool(self.settings.get('stock_auto_trade_enabled', False)) else 'OFF'} | "
             f"Auto Forex={'ON' if bool(self.settings.get('forex_auto_trade_enabled', False)) else 'OFF'}"
         )
@@ -5620,6 +5665,12 @@ class PowerTraderHub(tk.Tk):
 
         outer = ttk.Panedwindow(self.crypto_market_tab, orient="horizontal")
         outer.pack(fill="both", expand=True)
+        try:
+            if not isinstance(getattr(self, "_market_outer_panes", None), dict):
+                self._market_outer_panes = {}
+            self._market_outer_panes["crypto"] = outer
+        except Exception:
+            pass
 
         # LEFT + RIGHT panes
         left = ttk.Frame(outer)
@@ -5654,6 +5705,7 @@ class PowerTraderHub(tk.Tk):
         outer.bind("<ButtonRelease-1>", lambda e: (
             setattr(self, "_user_moved_outer", True),
             self._schedule_paned_clamp(self._pw_outer),
+            self._capture_shared_left_pane_width(self._pw_outer),
             self._persist_ui_layout_state(),
         ))
 
@@ -5692,6 +5744,10 @@ class PowerTraderHub(tk.Tk):
                 desired_left = 470  # ~matches your screenshot
                 target = max(min_left, min(total - min_right, desired_left))
                 outer.sashpos(0, int(target))
+                try:
+                    self._capture_shared_left_pane_width(outer)
+                except Exception:
+                    pass
 
                 self._did_init_outer_sash = True
             except Exception:
@@ -6041,7 +6097,6 @@ class PowerTraderHub(tk.Tk):
             self.lbl_runtime_card_stale = _add_runtime_metric(4, "History freshness")
             self.lbl_runtime_card_flags = _add_runtime_metric(5, "Feature flags")
             self.lbl_runtime_card_notifications = _add_runtime_metric(6, "Notifications")
-            self.lbl_runtime_card_shadow = _add_runtime_metric(7, "Shadow scorecards")
 
         acct_box = ttk.LabelFrame(controls_left, text="Portfolio")
         acct_box.pack(fill="x", padx=6, pady=6)
@@ -7084,12 +7139,12 @@ class PowerTraderHub(tk.Tk):
             market_key="stocks",
             market_name="Stocks",
             broker_name="Alpaca",
-            subtitle="Alpaca-backed stock AI (paper/live later)",
+            subtitle="Alpaca-backed stock AI",
             notes=(
                 "Status: UI scaffold ready\n"
-                "Broker: Alpaca (paper-first)\n"
+                "Broker: Alpaca\n"
                 "Focus: small equity trades, profit target, trailing exits\n"
-                "Next: account auth, market hours, stock scanner, paper executor"
+                "Next: account auth, market hours, stock scanner, executor"
             ),
         )
         self._build_parallel_market_placeholder(
@@ -7097,12 +7152,12 @@ class PowerTraderHub(tk.Tk):
             market_key="forex",
             market_name="Forex",
             broker_name="OANDA",
-            subtitle="OANDA-backed forex AI (practice/live later)",
+            subtitle="OANDA-backed forex AI",
             notes=(
                 "Status: UI scaffold ready\n"
-                "Broker: OANDA (practice-first)\n"
+                "Broker: OANDA\n"
                 "Focus: short-horizon FX trades, profit target, trailing exits\n"
-                "Next: account auth, pair universe, pricing feed, practice executor"
+                "Next: account auth, pair universe, pricing feed, executor"
             ),
         )
 
@@ -7125,6 +7180,12 @@ class PowerTraderHub(tk.Tk):
         compact_mode = bool(self.settings.get("market_panel_compact_mode", False))
         outer = ttk.Panedwindow(parent, orient="horizontal")
         outer.pack(fill="both", expand=True, padx=8, pady=8)
+        try:
+            if not isinstance(getattr(self, "_market_outer_panes", None), dict):
+                self._market_outer_panes = {}
+            self._market_outer_panes[str(market_key or "").strip().lower() or market_key] = outer
+        except Exception:
+            pass
 
         left = ttk.Frame(outer)
         right = ttk.Frame(outer)
@@ -7138,7 +7199,15 @@ class PowerTraderHub(tk.Tk):
         market_outer_user_resized = {"value": False}
         try:
             outer.bind("<Configure>", lambda _e, pw=outer: self._schedule_paned_clamp(pw), add="+")
-            outer.bind("<ButtonRelease-1>", lambda _e: market_outer_user_resized.__setitem__("value", True), add="+")
+            outer.bind(
+                "<ButtonRelease-1>",
+                lambda _e, pw=outer: (
+                    market_outer_user_resized.__setitem__("value", True),
+                    self._capture_shared_left_pane_width(pw),
+                    self._persist_ui_layout_state(),
+                ),
+                add="+",
+            )
         except Exception:
             pass
 
@@ -7154,9 +7223,14 @@ class PowerTraderHub(tk.Tk):
                 if not bounds:
                     return
                 min_pos, max_pos, _ = bounds
-                target = int(round(total * 0.38))
+                shared = int(getattr(self, "_shared_left_pane_width", 0) or 0)
+                target = shared if shared > 0 else int(round(total * 0.38))
                 target = max(min_pos, min(max_pos, max(320, target)))
                 outer.sashpos(0, target)
+                try:
+                    self._capture_shared_left_pane_width(outer)
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -7340,8 +7414,6 @@ class PowerTraderHub(tk.Tk):
         trader_step_market_key = market_key
 
         action_status_var = tk.StringVar(value="Next: configure broker credentials, then test connection.")
-        action_status_lbl = ttk.Label(action_box, textvariable=action_status_var, foreground=DARK_MUTED, wraplength=500, justify="left")
-        action_status_lbl.pack(anchor="w", padx=6, pady=(0, 6), fill="x")
         action_auto_row = ttk.Frame(action_box)
         action_auto_row.pack(fill="x", padx=6, pady=(0, 6))
         auto_scan_var = tk.BooleanVar(value=True)
@@ -7361,7 +7433,6 @@ class PowerTraderHub(tk.Tk):
             "percent_in_trade": tk.StringVar(value="N/A"),
             "open_positions": tk.StringVar(value="0"),
             "realized_pnl": tk.StringVar(value="N/A"),
-            "mode": tk.StringVar(value="Paper first"),
             "daily_guard": tk.StringVar(value="Armed"),
         }
         max_open_positions_var = tk.StringVar(value=str(self._market_max_open_positions_setting_value(market_key)))
@@ -7377,7 +7448,6 @@ class PowerTraderHub(tk.Tk):
             ("Open Positions", "open_positions"),
             ("Max Open Positions", "max_open_positions"),
             ("Realized PnL", "realized_pnl"),
-            ("Mode", "mode"),
             ("Daily Loss Guardrail", "daily_guard"),
         )
         for idx, (label, key) in enumerate(metric_rows):
@@ -7474,7 +7544,7 @@ class PowerTraderHub(tk.Tk):
             except Exception:
                 width = 260
             detail_wrap = max(220, width - 28)
-            for label_widget in (state_lbl, endpoint_lbl, action_status_lbl, quick_setting_lbl):
+            for label_widget in (state_lbl, endpoint_lbl, quick_setting_lbl):
                 try:
                     label_widget.configure(wraplength=detail_wrap)
                 except Exception:
@@ -7616,6 +7686,19 @@ class PowerTraderHub(tk.Tk):
             training_text.tag_configure("log_launch", foreground=DARK_ACCENT2)
         except Exception:
             pass
+
+        status_tab = ttk.Frame(live_nb)
+        live_nb.add(status_tab, text="Status")
+        status_wrap = ttk.Frame(status_tab)
+        status_wrap.pack(fill="both", expand=True, padx=6, pady=6)
+        action_status_lbl = ttk.Label(
+            status_wrap,
+            textvariable=action_status_var,
+            foreground=DARK_MUTED,
+            justify="left",
+            wraplength=500,
+        )
+        action_status_lbl.pack(fill="both", expand=True)
 
         notes_text = None
         notes_toggle_btn = None
@@ -7766,18 +7849,29 @@ class PowerTraderHub(tk.Tk):
         watch_wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         watch_wrap.columnconfigure(0, weight=1)
         watch_wrap.rowconfigure(0, weight=1)
-        watch_cols = ("rank", "symbol", "side", "score", "status", "why", "logic", "trigger")
+        watch_cols = ("symbol", "score", "entry", "exit", "gain", "status", "why", "logic", "trigger")
         watch_headings = {
-            "rank": "#",
             "symbol": ("Pair" if market_key == "forex" else "Symbol"),
-            "side": "Side",
             "score": "Score",
+            "entry": "Proj Entry",
+            "exit": "Proj Exit",
+            "gain": "Proj Gain",
             "status": "Status",
             "why": "Why Not Traded",
             "logic": "Logic",
             "trigger": "Trade Trigger",
         }
-        watch_widths = {"rank": 48, "symbol": 110, "side": 86, "score": 96, "status": 106, "why": 280, "logic": 320, "trigger": 360}
+        watch_widths = {
+            "symbol": 92,
+            "score": 92,
+            "entry": 110,
+            "exit": 110,
+            "gain": 96,
+            "status": 100,
+            "why": 320,
+            "logic": 320,
+            "trigger": 320,
+        }
         watch_canvas = tk.Canvas(
             watch_wrap,
             background=DARK_PANEL2,
@@ -8769,7 +8863,7 @@ class PowerTraderHub(tk.Tk):
         if key in {"score", "entry", "exit", "gain"}:
             return (88, 128)
         if key in {"why", "logic", "trigger"}:
-            return (220, 520)
+            return (220, 900)
         return (88, 220)
 
     def _watchlist_autofit_widths(
@@ -8790,8 +8884,6 @@ class PowerTraderHub(tk.Tk):
             px = max(px, self._measure_table_text_px(headings.get(col, col.title()), header_font) + 20)
             for row in sample_rows:
                 raw_txt = " ".join(str(row.get(col, "") or "").splitlines())
-                if col in {"why", "logic", "trigger"} and len(raw_txt) > 88:
-                    raw_txt = raw_txt[:85] + "..."
                 px = max(px, self._measure_table_text_px(raw_txt, body_font) + 18)
             widths[col] = max(lo, min(hi, px))
 
@@ -8920,13 +9012,8 @@ class PowerTraderHub(tk.Tk):
             max_lines = 1
             for col in columns:
                 raw_val = str(row.get(col, "") or "")
-                font_spec = body_bold_font if col in {"coin", "symbol", "side", "status", "score", "gain"} else body_font
-                if col in text_cols:
-                    txt = self._wrap_table_text(raw_val, max(80, int(widths.get(col, 100) or 100) - (pad_x * 2)), font_spec)
-                else:
-                    txt = raw_val
-                wrapped[col] = txt
-                max_lines = max(max_lines, max(1, len([ln for ln in txt.splitlines() if ln.strip()]) or 1))
+                wrapped[col] = raw_val
+                max_lines = max(max_lines, max(1, len([ln for ln in raw_val.splitlines() if ln.strip()]) or 1))
             row_h = max(28, (max_lines * line_h) + (pad_y * 2))
             row_bg = "#13304A" if row_idx == int(selected_idx) else (DARK_PANEL if (row_idx % 2) == 0 else "#0C1827")
             x = 0
@@ -8935,9 +9022,9 @@ class PowerTraderHub(tk.Tk):
                 cell_txt = wrapped.get(col, "")
                 canvas.create_rectangle(x, y, x + w, y + row_h, fill=row_bg, outline=DARK_BORDER, width=1)
                 if col in text_cols:
-                    anchor = "nw"
+                    anchor = "w"
                     tx = x + pad_x
-                    ty = y + pad_y
+                    ty = y + (row_h / 2)
                 elif col in {"score", "entry", "exit", "gain"}:
                     anchor = "e"
                     tx = x + w - pad_x
@@ -8957,7 +9044,7 @@ class PowerTraderHub(tk.Tk):
                     fill=self._watchlist_cell_fg(kind, col, str(row.get(col, "") or "")),
                     font=(body_bold_font if col in {"coin", "symbol", "side", "status", "score", "gain"} else body_font),
                     anchor=anchor,
-                    width=(max(40, w - (pad_x * 2)) if col in text_cols else 0),
+                    width=(0),
                 )
                 x += w
             row_regions.append({"index": row_idx, "y0": y, "y1": y + row_h, "row": row})
@@ -9024,7 +9111,7 @@ class PowerTraderHub(tk.Tk):
                 anchor=anchor,
             )
             if col in group_break_after:
-                canvas.create_line(x + w, 0, x + w, max(total_h, view_h), fill=DARK_ACCENT2, width=1)
+                canvas.create_line(x + w, 0, x + w, total_h, fill=DARK_ACCENT2, width=1)
             x += w
         canvas.create_line(0, header_h, total_w, header_h, fill=DARK_ACCENT2, width=2)
 
@@ -9170,6 +9257,11 @@ class PowerTraderHub(tk.Tk):
         mk = str(market_key or "").strip().lower()
         thinker = thinker_data if isinstance(thinker_data, dict) else {}
         rows: List[Dict[str, str]] = []
+        profit_key = "stock_profit_target_pct" if mk == "stocks" else "forex_profit_target_pct"
+        try:
+            profit_target_pct = float(self.settings.get(profit_key, 0.0) or 0.0)
+        except Exception:
+            profit_target_pct = 0.0
         for idx, row in enumerate(list(thinker.get("leaders", []) or [])[: max(1, int(limit or 20))], start=1):
             if not isinstance(row, dict):
                 continue
@@ -9184,7 +9276,7 @@ class PowerTraderHub(tk.Tk):
             eligible = bool(row.get("eligible_for_entry", False)) and side in {"LONG", "SHORT"}
             gate_reason = str(row.get("entry_gate_reason", "") or "").strip()
             note_logic, note_data = self._market_reason_parts(mk, row)
-            why_txt = gate_reason or str(note_data or "").strip()
+            why_txt = gate_reason or str(note_logic or "").strip()
             if not why_txt:
                 why_txt = ("Eligible now; waiting for next trader cycle." if eligible else "Waiting for the next qualified setup.")
             logic_txt = str(note_logic or row.get("reason", "") or "").strip()
@@ -9214,12 +9306,27 @@ class PowerTraderHub(tk.Tk):
                 trigger_txt = f"Needs {side} setup to stay qualified through the next trader cycle{trigger_suffix}."
             else:
                 trigger_txt = f"Needs scanner promotion from WATCH to a tradable side before entry can start{trigger_suffix}."
+            entry_val = last_price if last_price > 0.0 else 0.0
+            exit_val = 0.0
+            if entry_val > 0.0 and profit_target_pct > 0.0:
+                pct = profit_target_pct / 100.0
+                if side == "SHORT":
+                    exit_val = entry_val * (1.0 - pct)
+                else:
+                    exit_val = entry_val * (1.0 + pct)
+            gain_pct = 0.0
+            if entry_val > 0.0 and exit_val > 0.0:
+                if side == "SHORT":
+                    gain_pct = ((entry_val / exit_val) - 1.0) * 100.0
+                else:
+                    gain_pct = ((exit_val / entry_val) - 1.0) * 100.0
             rows.append(
                 {
-                    "rank": str(idx),
                     "symbol": ident,
-                    "side": side,
                     "score": score_txt,
+                    "entry": _fmt_price(entry_val) if entry_val > 0.0 else "N/A",
+                    "exit": _fmt_price(exit_val) if exit_val > 0.0 else "N/A",
+                    "gain": f"{gain_pct:+.2f}%" if (entry_val > 0.0 and exit_val > 0.0) else "N/A",
                     "status": status_txt,
                     "why": why_txt,
                     "logic": logic_txt,
@@ -11309,7 +11416,6 @@ class PowerTraderHub(tk.Tk):
             market_key,
             status_data=status,
             trader_data=trader,
-            mode_txt=str(status.get("mode", trader.get("mode", "")) or ""),
         )
         canvas.create_text(
             18,
@@ -12445,7 +12551,6 @@ class PowerTraderHub(tk.Tk):
             return {
                 "broker": "Alpaca",
                 "configured": bool(key_ok and secret_ok),
-                "mode": ("Paper" if bool(self.settings.get("alpaca_paper_mode", True)) else "Live"),
                 "endpoint": str(self.settings.get("alpaca_base_url", DEFAULT_SETTINGS.get("alpaca_base_url", "")) or "").strip(),
                 "detail": detail,
             }
@@ -12462,7 +12567,6 @@ class PowerTraderHub(tk.Tk):
         return {
             "broker": "OANDA",
             "configured": bool(account_ok and token_ok),
-            "mode": ("Practice" if bool(self.settings.get("oanda_practice_mode", True)) else "Live"),
             "endpoint": str(self.settings.get("oanda_rest_url", DEFAULT_SETTINGS.get("oanda_rest_url", "")) or "").strip(),
             "detail": oanda_detail,
         }
@@ -12485,7 +12589,6 @@ class PowerTraderHub(tk.Tk):
         for market_key, panel in self.market_panels.items():
             snap = self._market_settings_snapshot(market_key)
             configured = bool(snap.get("configured"))
-            mode_txt = str(snap.get("mode", "") or "")
             endpoint = str(snap.get("endpoint", "") or "").strip()
             broker = str(snap.get("broker", market_key.title()) or market_key.title())
             state_txt = "Configured" if configured else "Credentials missing"
@@ -12701,7 +12804,7 @@ class PowerTraderHub(tk.Tk):
                 except Exception:
                     pass
             self._set_badge_style(panel.get("chip_cycle"), cycle_txt, tone=cyc_tone)
-            panel["endpoint_var"].set(f"Broker: {broker} | {mode_txt} | {endpoint or 'endpoint not set'}")
+            panel["endpoint_var"].set(f"Broker: {broker} | {endpoint or 'endpoint not set'}")
             top_pick = thinker_data.get("top_pick", {}) or {}
             if not isinstance(top_pick, dict):
                 top_pick = {}
@@ -12847,7 +12950,7 @@ class PowerTraderHub(tk.Tk):
             if why_reason:
                 src_txt = {
                     "trader_entry_gate": "entry gate",
-                    "shadow_divergence": "shadow divergence",
+                    "shadow_divergence": "execution divergence",
                 }.get(why_source, why_source or "scanner")
                 action_hint += f" | Why-not ({src_txt}): {why_reason[:84]}"
             action_hint += f" | Auto scan={'ON' if auto_scan_on else 'OFF'} step={'ON' if auto_step_on else 'OFF'}"
@@ -12863,7 +12966,6 @@ class PowerTraderHub(tk.Tk):
                     market_key,
                     status_data=status_data,
                     trader_data=trader_data,
-                    mode_txt=mode_txt,
                 )
                 for key, value in portfolio_snapshot.items():
                     target_var = pvars.get(key)
@@ -13099,7 +13201,7 @@ class PowerTraderHub(tk.Tk):
                 if disc:
                     try:
                         diag_note += (
-                            f"Live/paper discrepancy: {int(disc.get('shadow_divergence_24h', 0) or 0)} events | "
+                            f"Execution discrepancy: {int(disc.get('shadow_divergence_24h', 0) or 0)} events | "
                             f"pressure={float(disc.get('divergence_pressure_pct', 0.0) or 0.0):.1f}% "
                             f"({str(disc.get('level', 'n/a') or 'n/a')})\n"
                         )
@@ -13139,7 +13241,6 @@ class PowerTraderHub(tk.Tk):
                     [
                         f"Status: {'ready to connect' if configured else 'credentials required'}\n",
                         f"Broker: {broker}\n",
-                        f"Mode: {mode_txt}\n",
                         f"{snap.get('detail', '')}\n",
                         f"Endpoint: {endpoint or 'not set'}\n",
                         (f"Broker maintenance note: {str(broker_awareness.get('alpaca' if market_key == 'stocks' else 'oanda', 'Normal'))}\n"),
@@ -13208,7 +13309,6 @@ class PowerTraderHub(tk.Tk):
 
             log_sig = (
                 configured,
-                mode_txt,
                 endpoint,
                 str(snap.get("detail", "")),
                 str(thinker_data.get("state", "")),
@@ -13237,7 +13337,7 @@ class PowerTraderHub(tk.Tk):
                 panel["last_log_sig"] = log_sig
                 self._append_market_log(
                     market_key,
-                    f"[{broker.upper()}] {state_txt} | mode={mode_txt} | endpoint={endpoint or 'not set'}",
+                    f"[{broker.upper()}] {state_txt} | endpoint={endpoint or 'not set'}",
                 )
 
             try:
@@ -13274,7 +13374,6 @@ class PowerTraderHub(tk.Tk):
             try:
                 snap = self._market_settings_snapshot(market_key)
                 broker = str(snap.get("broker", market_key.title()) or market_key.title())
-                mode_txt = str(snap.get("mode", "") or "")
                 endpoint = str(snap.get("endpoint", "") or "").strip()
                 diag_paths = self.__dict__.get("market_scan_diag_paths", {}) or {}
                 state_dirs = self.__dict__.get("market_state_dirs", {}) or {}
@@ -13324,7 +13423,7 @@ class PowerTraderHub(tk.Tk):
                 if msg:
                     state_line += f" | {msg}"
                 panel["state_var"].set(self._format_market_state_line(state_line))
-                panel["endpoint_var"].set(f"Broker: {broker} | {mode_txt or 'N/A'} | {endpoint or 'endpoint not set'}")
+                panel["endpoint_var"].set(f"Broker: {broker} | {endpoint or 'endpoint not set'}")
                 try:
                     focus_combo = panel.get("instrument_combo")
                     focus_var = panel.get("instrument_var")
@@ -13348,7 +13447,6 @@ class PowerTraderHub(tk.Tk):
                         market_key,
                         status_data=status_data,
                         trader_data=trader_data,
-                        mode_txt=mode_txt,
                     )
                     for key, value in portfolio_snapshot.items():
                         target_var = pvars.get(key)
@@ -13695,6 +13793,45 @@ class PowerTraderHub(tk.Tk):
             return min_pos, max_pos, total
         except Exception:
             return None
+
+    def _capture_shared_left_pane_width(self, pw: Optional[ttk.Panedwindow] = None) -> None:
+        pane = pw
+        if pane is None:
+            try:
+                pane = self._market_outer_panes.get(self._active_market_key(), None)  # type: ignore[attr-defined]
+            except Exception:
+                pane = None
+        if pane is None:
+            pane = getattr(self, "_pw_outer", None)
+        if pane is None:
+            return
+        try:
+            pos = int(pane.sashpos(0))
+        except Exception:
+            return
+        if pos > 0:
+            self._shared_left_pane_width = int(pos)
+
+    def _apply_shared_left_pane_width(self, pw: Optional[ttk.Panedwindow] = None) -> None:
+        pane = pw
+        if pane is None:
+            try:
+                pane = self._market_outer_panes.get(self._active_market_key(), None)  # type: ignore[attr-defined]
+            except Exception:
+                pane = None
+        if pane is None:
+            return
+        target = int(getattr(self, "_shared_left_pane_width", 0) or 0)
+        if target <= 0:
+            return
+        bounds = self._paned_sash_bounds(pane, 0)
+        if not bounds:
+            return
+        min_pos, max_pos, _total = bounds
+        try:
+            pane.sashpos(0, max(min_pos, min(max_pos, int(target))))
+        except Exception:
+            pass
 
     def _persist_ui_layout_state(self) -> None:
         try:
@@ -14631,6 +14768,7 @@ class PowerTraderHub(tk.Tk):
         runner_pid_early = runtime_early.get("runner_pid", None)
         runner_ts_early = float(runtime_early.get("ts", 0.0) or 0.0)
         runner_live = bool(runner_pid_early) and ((time.time() - runner_ts_early) <= 12.0) and runner_state_early in {"RUNNING", "ERROR", "STOPPING"}
+        self._maybe_apply_profile_autotune()
         if not runner_live:
             try:
                 stocks_scan_s = max(5.0, float(self.settings.get("market_bg_stocks_interval_s", DEFAULT_SETTINGS.get("market_bg_stocks_interval_s", 15.0)) or 15.0))
@@ -14878,18 +15016,6 @@ class PowerTraderHub(tk.Tk):
                 self.lbl_runtime_card_notifications.config(
                     text=f"{self._market_display_name(active_market_key)} C{c} | W{w} | I{i}"
                 )
-            except Exception:
-                pass
-            try:
-                st = shadow_scorecards.get("stocks", {}) if isinstance(shadow_scorecards.get("stocks", {}), dict) else {}
-                fx = shadow_scorecards.get("forex", {}) if isinstance(shadow_scorecards.get("forex", {}), dict) else {}
-                rg_st = market_regimes.get("stocks", {}) if isinstance(market_regimes.get("stocks", {}), dict) else {}
-                rg_fx = market_regimes.get("forex", {}) if isinstance(market_regimes.get("forex", {}), dict) else {}
-                g_st = str(st.get("promotion_gate", "N/A") or "N/A").upper()
-                g_fx = str(fx.get("promotion_gate", "N/A") or "N/A").upper()
-                d_st = str(rg_st.get("dominant_regime", "unknown") or "unknown")
-                d_fx = str(rg_fx.get("dominant_regime", "unknown") or "unknown")
-                self.lbl_runtime_card_shadow.config(text=f"S {g_st}/{d_st} | F {g_fx}/{d_fx}")
             except Exception:
                 pass
         except Exception:
@@ -17739,6 +17865,82 @@ class PowerTraderHub(tk.Tk):
             widget.bind("<Leave>", _hide, add="+")
             widget.bind("<ButtonPress>", _hide, add="+")
 
+        settings_tab_roots: Dict[str, Optional[ttk.Frame]] = {"crypto": None, "stocks": None, "forex": None}
+        settings_search_index: Dict[str, List[Tuple[tk.Widget, str]]] = {"crypto": [], "stocks": [], "forex": []}
+        settings_search_vars: Dict[str, tk.StringVar] = {}
+
+        def _settings_tab_for_parent(widget: Optional[tk.Widget]) -> str:
+            cur = widget
+            while cur is not None:
+                for key, root in settings_tab_roots.items():
+                    if root is not None and cur is root:
+                        return key
+                cur = getattr(cur, "master", None)
+            return ""
+
+        def _clean_settings_label(label: str, parent: Optional[tk.Widget]) -> str:
+            tab_key = _settings_tab_for_parent(parent)
+            prefixes: List[str] = []
+            if tab_key == "forex":
+                prefixes = ["Forex "]
+            elif tab_key == "stocks":
+                prefixes = ["Stock ", "Stocks "]
+            elif tab_key == "crypto":
+                prefixes = ["Crypto "]
+            for prefix in prefixes:
+                if label.startswith(prefix):
+                    return label[len(prefix):]
+            return label
+
+        def _register_settings_search_label(parent: Optional[tk.Widget], widget: tk.Widget, label_text: str) -> None:
+            tab_key = _settings_tab_for_parent(parent)
+            if not tab_key:
+                return
+            settings_search_index.setdefault(tab_key, []).append((widget, label_text))
+
+        def _scroll_settings_to_widget(widget: tk.Widget) -> None:
+            try:
+                settings_canvas.update_idletasks()
+                widget.update_idletasks()
+                bbox = settings_canvas.bbox(settings_window)
+                if not bbox:
+                    return
+                canvas_y = settings_canvas.winfo_rooty()
+                widget_y = widget.winfo_rooty()
+                offset = max(0, int(widget_y - canvas_y))
+                total_h = int(bbox[3] - bbox[1])
+                view_h = max(1, int(settings_canvas.winfo_height()))
+                if total_h <= view_h:
+                    return
+                frac = max(0.0, min(1.0, float(offset) / float(max(1, total_h - view_h))))
+                settings_canvas.yview_moveto(frac)
+            except Exception:
+                pass
+
+        def _apply_settings_search(tab_key: str) -> None:
+            var = settings_search_vars.get(tab_key)
+            if var is None:
+                return
+            query = str(var.get() or "").strip().lower()
+            entries = list(settings_search_index.get(tab_key, []) or [])
+            first_match = None
+            for lbl, txt in entries:
+                try:
+                    if not lbl.winfo_exists():
+                        continue
+                except Exception:
+                    continue
+                hay = str(txt or "").strip().lower()
+                matched = bool(query and query in hay)
+                try:
+                    lbl.configure(foreground=(DARK_ACCENT if matched else DARK_FG))
+                except Exception:
+                    pass
+                if matched and first_match is None:
+                    first_match = lbl
+            if query and first_match is not None:
+                _scroll_settings_to_widget(first_match)
+
         setting_help: Dict[str, str] = {
             "Configuration mode:": "Preset Managed auto-fills and locks configurable fields. Self Managed lets you edit each setting manually.",
             "Preset profile:": "Guarded prioritizes safety, Balanced is default, Performance increases aggressiveness and opportunity capture.",
@@ -17758,10 +17960,9 @@ class PowerTraderHub(tk.Tk):
             "Thinker script path:": "Process used to score/scan opportunities. Change only if you intentionally swap engine implementations.",
             "Trainer script path:": "Model training entrypoint for crypto. Wrong path prevents background/Train All jobs from running.",
             "Trader script path:": "Execution loop entrypoint. Wrong path means Start Trades launches nothing.",
-            "Market rollout stage:": "Feature gate level for stocks/forex logic. Higher stages enable stricter safety and execution controls.",
             "Alpaca API key ID:": "Stocks credential. Keep in env/secrets manager for production; this field is only for runtime injection.",
             "Alpaca secret key:": "Stocks secret credential. Never share this value.",
-            "Alpaca base URL:": "Trading endpoint. Paper uses paper-api; live endpoint sends real orders.",
+            "Alpaca base URL:": "Trading endpoint for live Alpaca orders.",
             "Alpaca data URL:": "Market data endpoint used by stock scanner.",
             "Key rotation warn days:": "Warn when API credentials have aged past this many days so keys get rotated before expiry/incident.",
             "KuCoin unsupported cooldown sec:": "Backoff after unsupported/blocked symbol responses. Higher values reduce repeated API lockouts.",
@@ -17795,10 +17996,10 @@ class PowerTraderHub(tk.Tk):
             "Stock profit target %:": "Profit level where take-profit/trailing logic begins.",
             "Stock trailing gap %:": "Allowed pullback from peak before exit.",
             "Stock max day trades / day:": "Caps intraday round trips to manage compliance/risk.",
-            "Stock max position USD/symbol (risk_caps):": "Per-symbol hard cap when risk_caps rollout is active.",
-            "Stock max total exposure % (risk_caps):": "Total stock exposure cap when risk_caps rollout is active.",
-            "Stock live_guarded score multiplier:": "Raises required score in live_guarded mode for safer live execution.",
-            "Stock live_guarded min calibrated prob:": "Minimum calibrated probability in live_guarded mode.",
+            "Stock max position USD/symbol:": "Per-symbol hard exposure cap for stock entries.",
+            "Stock max total exposure %:": "Total stock exposure cap across open positions.",
+            "Stock score multiplier:": "Raises required score threshold for entries.",
+            "Stock min calibrated prob:": "Minimum calibrated probability required for entries.",
             "Stock max slippage bps:": "Maximum tolerated entry slippage before order is skipped.",
             "Stock order retry count:": "Number of retry attempts for transient broker/order failures.",
             "Stock max loss streak:": "Consecutive losing trades before defensive throttling activates.",
@@ -17807,7 +18008,7 @@ class PowerTraderHub(tk.Tk):
             "Stock loss cooldown seconds:": "Pause duration after streak/loss guard triggers.",
             "Stock max daily loss USD (0=off):": "Absolute daily loss stop; entries pause after breach.",
             "Stock max daily loss % (0=off):": "Percent daily loss stop; entries pause after breach.",
-            "Stock min calibration samples (live_guarded):": "Minimum calibration sample count before live_guarded entries are allowed.",
+            "Stock min calibration samples:": "Minimum calibration sample count before entries are allowed.",
             "Stock max signal age seconds:": "Signals older than this are considered stale and skipped.",
             "Stock reject drift warn %:": "Warn threshold for sudden scanner reject-rate drift.",
             "Stock block mins to close:": "No-new-entry window before market close.",
@@ -17828,17 +18029,17 @@ class PowerTraderHub(tk.Tk):
             "Forex max reject rate % for entries:": "Blocks entries when scanner reject rate indicates unstable market-data quality.",
             "Forex trade units:": "Base unit size per FX order.",
             "Forex max open positions:": "Concurrent forex positions cap.",
-            "Forex max position USD/pair (risk_caps):": "Per-pair dollar cap when risk caps are active.",
+            "Forex max position USD/pair:": "Per-pair dollar cap for forex entries.",
             "Forex score threshold:": "Minimum model score needed for forex entries.",
             "Forex replay adaptive tuning:": "When enabled, scanner replay analysis nudges the live threshold toward target entry flow.",
             "Forex replay adaptive weight (0-1):": "Blend ratio for replay recommendation. 0 keeps volatility-only threshold; 1 uses replay-only (clamped).",
             "Forex replay adaptive step cap %:": "Maximum per-cycle threshold shift allowed from replay, as % of current volatility-based threshold.",
             "Forex profit target %:": "Profit threshold before trailing logic engages.",
             "Forex trailing gap %:": "Allowed pullback from peak profit before exit.",
-            "Forex max exposure % (risk_caps proxy):": "Total forex exposure cap.",
+            "Forex max exposure %:": "Total forex exposure cap.",
             "Forex session mode (all/london_ny/london/ny/asia):": "Restricts entries to sessions with desired liquidity/behavior.",
-            "Forex live_guarded score multiplier:": "Raises score bar during live_guarded stage.",
-            "Forex live_guarded min calibrated prob:": "Minimum calibrated probability required in live_guarded mode.",
+            "Forex score multiplier:": "Raises score bar required for entries.",
+            "Forex min calibrated prob:": "Minimum calibrated probability required for entries.",
             "Forex max slippage bps:": "Maximum allowed slippage at execution time.",
             "Forex order retry count:": "Retries for temporary order failures.",
             "Forex max loss streak:": "Consecutive losses before defensive throttling.",
@@ -17847,7 +18048,7 @@ class PowerTraderHub(tk.Tk):
             "Forex loss cooldown seconds:": "Pause duration after streak/loss guard trips.",
             "Forex max daily loss USD (0=off):": "Absolute daily stop for forex.",
             "Forex max daily loss % (0=off):": "Percent daily stop for forex.",
-            "Forex min calibration samples (live_guarded):": "Minimum calibration history needed for live_guarded forex entries.",
+            "Forex min calibration samples:": "Minimum calibration history needed before entries.",
             "Forex max signal age seconds:": "Rejects stale forex signals older than this.",
             "Forex reject drift warn %:": "Warn threshold for forex scanner reject-rate spikes.",
             "Forex background scan interval seconds:": "How often the background forex scanner runs. Higher values reduce request pressure and cadence drift.",
@@ -17865,7 +18066,7 @@ class PowerTraderHub(tk.Tk):
             "Drawdown manual acknowledgment:": "Require operator click on Safety Acknowledge before auto-resume.",
             "OANDA account ID:": "Forex account identifier used with OANDA REST calls.",
             "OANDA API token:": "Forex secret credential. Never share this value.",
-            "OANDA REST URL:": "Forex trading endpoint; practice uses fxpractice URL.",
+            "OANDA REST URL:": "Forex trading endpoint for live orders.",
             "OANDA stream URL:": "Streaming/pricing endpoint for OANDA.",
         }
 
@@ -17894,8 +18095,10 @@ class PowerTraderHub(tk.Tk):
             browse: "dir" to attach a directory chooser, else None.
             """
             target = parent or frm
-            lbl = ttk.Label(target, text=label)
+            display_label = _clean_settings_label(label, target)
+            lbl = ttk.Label(target, text=display_label)
             lbl.grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
+            _register_settings_search_label(target, lbl, display_label)
 
             ent = ttk.Entry(target, textvariable=var)
             ent.grid(row=r, column=1, sticky="ew", pady=6)
@@ -17926,8 +18129,10 @@ class PowerTraderHub(tk.Tk):
             managed: bool = True,
         ):
             target = parent or frm
-            lbl = ttk.Label(target, text=label)
+            display_label = _clean_settings_label(label, target)
+            lbl = ttk.Label(target, text=display_label)
             lbl.grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
+            _register_settings_search_label(target, lbl, display_label)
             ent = ttk.Entry(target, textvariable=var, show="*")
             ent.grid(row=r, column=1, sticky="ew", pady=6)
             _register_managed_control(ent, "normal", managed=managed)
@@ -17947,8 +18152,10 @@ class PowerTraderHub(tk.Tk):
             managed: bool = True,
         ) -> None:
             target = parent or frm
-            lbl = ttk.Label(target, text=label)
+            display_label = _clean_settings_label(label, target)
+            lbl = ttk.Label(target, text=display_label)
             lbl.grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
+            _register_settings_search_label(target, lbl, display_label)
             chk = ttk.Checkbutton(target, text=text, variable=var)
             chk.grid(row=r, column=1, sticky="w", pady=6)
             _register_managed_control(chk, "normal", managed=managed)
@@ -17968,8 +18175,10 @@ class PowerTraderHub(tk.Tk):
             managed: bool = True,
         ) -> ttk.Combobox:
             target = parent or frm
-            lbl = ttk.Label(target, text=label)
+            display_label = _clean_settings_label(label, target)
+            lbl = ttk.Label(target, text=display_label)
             lbl.grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
+            _register_settings_search_label(target, lbl, display_label)
             combo = ttk.Combobox(
                 target,
                 textvariable=var,
@@ -17995,8 +18204,10 @@ class PowerTraderHub(tk.Tk):
             tooltip: str = "",
         ) -> ttk.Frame:
             target = parent or frm
-            lbl = ttk.Label(target, text=label)
+            display_label = _clean_settings_label(label, target)
+            lbl = ttk.Label(target, text=display_label)
             lbl.grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
+            _register_settings_search_label(target, lbl, display_label)
             rowf = ttk.Frame(target)
             rowf.grid(row=r, column=1, columnspan=2, sticky="ew", pady=6)
             rowf.columnconfigure(0, weight=1)
@@ -18030,8 +18241,7 @@ class PowerTraderHub(tk.Tk):
         max_total_exposure_var = tk.StringVar(value=str(self.settings.get("max_total_exposure_pct", DEFAULT_SETTINGS.get("max_total_exposure_pct", 0.0))))
         alpaca_base_url_var = tk.StringVar(value=str(self.settings.get("alpaca_base_url", DEFAULT_SETTINGS.get("alpaca_base_url", "")) or ""))
         alpaca_data_url_var = tk.StringVar(value=str(self.settings.get("alpaca_data_url", DEFAULT_SETTINGS.get("alpaca_data_url", "")) or ""))
-        alpaca_paper_var = tk.BooleanVar(value=bool(self.settings.get("alpaca_paper_mode", DEFAULT_SETTINGS.get("alpaca_paper_mode", True))))
-        rollout_stage_var = tk.StringVar(value=str(self.settings.get("market_rollout_stage", DEFAULT_SETTINGS.get("market_rollout_stage", "legacy")) or "legacy"))
+        # Live-only configuration (legacy toggles removed).
         stock_universe_mode_var = tk.StringVar(value=str(self.settings.get("stock_universe_mode", DEFAULT_SETTINGS.get("stock_universe_mode", "core")) or "core"))
         stock_universe_symbols_var = tk.StringVar(value=str(self.settings.get("stock_universe_symbols", DEFAULT_SETTINGS.get("stock_universe_symbols", "")) or ""))
         stock_scan_max_symbols_var = tk.StringVar(value=str(self.settings.get("stock_scan_max_symbols", DEFAULT_SETTINGS.get("stock_scan_max_symbols", 60))))
@@ -18085,7 +18295,6 @@ class PowerTraderHub(tk.Tk):
         stock_symbol_cooldown_reasons_var = tk.StringVar(value=str(self.settings.get("stock_symbol_cooldown_reject_reasons", DEFAULT_SETTINGS.get("stock_symbol_cooldown_reject_reasons", "data_quality,insufficient_bars")) or ""))
         oanda_rest_url_var = tk.StringVar(value=str(self.settings.get("oanda_rest_url", DEFAULT_SETTINGS.get("oanda_rest_url", "")) or ""))
         oanda_stream_url_var = tk.StringVar(value=str(self.settings.get("oanda_stream_url", DEFAULT_SETTINGS.get("oanda_stream_url", "")) or ""))
-        oanda_practice_var = tk.BooleanVar(value=bool(self.settings.get("oanda_practice_mode", DEFAULT_SETTINGS.get("oanda_practice_mode", True))))
         paper_only_guard_var = tk.BooleanVar(value=bool(self.settings.get("paper_only_unless_checklist_green", DEFAULT_SETTINGS.get("paper_only_unless_checklist_green", True))))
         forex_pairs_var = tk.StringVar(value=str(self.settings.get("forex_universe_pairs", DEFAULT_SETTINGS.get("forex_universe_pairs", "")) or ""))
         forex_scan_max_pairs_var = tk.StringVar(value=str(self.settings.get("forex_scan_max_pairs", DEFAULT_SETTINGS.get("forex_scan_max_pairs", 16))))
@@ -18180,8 +18389,7 @@ class PowerTraderHub(tk.Tk):
         oanda_status_var = tk.StringVar(value="")
         settings_mode_hint_var = tk.StringVar(value="")
 
-        # Keep broker live/paper mode switches out of preset auto-fill so manual
-        # execution-mode choices persist across settings reopen/save cycles.
+        # Preset-managed mode locks these values to the selected profile.
         profile_var_map: Dict[str, tk.Variable] = {
             "trade_start_level": trade_start_level_var,
             "start_allocation_pct": start_alloc_pct_var,
@@ -18193,7 +18401,6 @@ class PowerTraderHub(tk.Tk):
             "trailing_gap_pct": trailing_gap_var,
             "max_position_usd_per_coin": max_pos_per_coin_var,
             "max_total_exposure_pct": max_total_exposure_var,
-            "market_rollout_stage": rollout_stage_var,
             "kucoin_unsupported_cooldown_s": kucoin_unsupported_cooldown_var,
             "crypto_price_error_log_cooldown_s": crypto_price_error_log_cd_var,
             "key_rotation_warn_days": key_rotation_warn_days_var,
@@ -18317,7 +18524,6 @@ class PowerTraderHub(tk.Tk):
                 "pm_start_pct_with_dca": 3.5,
                 "trailing_gap_pct": 0.35,
                 "max_total_exposure_pct": 20.0,
-                "market_rollout_stage": "shadow_only",
                 "kucoin_unsupported_cooldown_s": 43200.0,
                 "crypto_price_error_log_cooldown_s": 240.0,
                 "key_rotation_warn_days": 60,
@@ -18417,7 +18623,6 @@ class PowerTraderHub(tk.Tk):
                 "pm_start_pct_with_dca": 1.8,
                 "trailing_gap_pct": 0.75,
                 "max_total_exposure_pct": 65.0,
-                "market_rollout_stage": "live_guarded",
                 "kucoin_unsupported_cooldown_s": 14400.0,
                 "crypto_price_error_log_cooldown_s": 60.0,
                 "key_rotation_warn_days": 45,
@@ -18828,6 +19033,9 @@ class PowerTraderHub(tk.Tk):
         crypto_tab = ttk.Frame(market_settings_nb)
         stocks_tab = ttk.Frame(market_settings_nb)
         forex_tab = ttk.Frame(market_settings_nb)
+        settings_tab_roots["crypto"] = crypto_tab
+        settings_tab_roots["stocks"] = stocks_tab
+        settings_tab_roots["forex"] = forex_tab
         for tab in (crypto_tab, stocks_tab, forex_tab):
             tab.columnconfigure(0, weight=0)
             tab.columnconfigure(1, weight=1)
@@ -18861,13 +19069,21 @@ class PowerTraderHub(tk.Tk):
         stock_advanced_var = tk.BooleanVar(value=show_adv_default)
         forex_advanced_var = tk.BooleanVar(value=show_adv_default)
 
+        stocks_header = ttk.Frame(stocks_tab)
+        stocks_header.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        stocks_header.columnconfigure(0, weight=1)
         ttk.Label(
-            stocks_tab,
+            stocks_header,
             text="Stocks scanner, broker, and execution controls.",
             foreground=DARK_MUTED,
             justify="left",
-            wraplength=660,
-        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+            wraplength=520,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(stocks_header, text="Search:", foreground=DARK_MUTED).grid(row=0, column=1, sticky="e", padx=(8, 4))
+        stocks_search_var = tk.StringVar(value="")
+        settings_search_vars["stocks"] = stocks_search_var
+        ttk.Entry(stocks_header, textvariable=stocks_search_var, width=22).grid(row=0, column=2, sticky="e")
+        stocks_search_var.trace_add("write", lambda *_: _apply_settings_search("stocks"))
         stock_basic_box = ttk.LabelFrame(stocks_tab, text="Basic Settings")
         stock_basic_box.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 8))
         _init_settings_grid(stock_basic_box)
@@ -18882,13 +19098,21 @@ class PowerTraderHub(tk.Tk):
         _init_settings_grid(stock_advanced_box)
         _set_section_visible(stock_advanced_box, bool(stock_advanced_var.get()))
 
+        forex_header = ttk.Frame(forex_tab)
+        forex_header.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        forex_header.columnconfigure(0, weight=1)
         ttk.Label(
-            forex_tab,
+            forex_header,
             text="Forex scanner, OANDA connectivity, and execution controls.",
             foreground=DARK_MUTED,
             justify="left",
-            wraplength=660,
-        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+            wraplength=520,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(forex_header, text="Search:", foreground=DARK_MUTED).grid(row=0, column=1, sticky="e", padx=(8, 4))
+        forex_search_var = tk.StringVar(value="")
+        settings_search_vars["forex"] = forex_search_var
+        ttk.Entry(forex_header, textvariable=forex_search_var, width=22).grid(row=0, column=2, sticky="e")
+        forex_search_var.trace_add("write", lambda *_: _apply_settings_search("forex"))
         forex_basic_box = ttk.LabelFrame(forex_tab, text="Basic Settings")
         forex_basic_box.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 8))
         _init_settings_grid(forex_basic_box)
@@ -18904,13 +19128,21 @@ class PowerTraderHub(tk.Tk):
         _set_section_visible(forex_advanced_box, bool(forex_advanced_var.get()))
 
         cr = 0
+        crypto_header = ttk.Frame(crypto_tab)
+        crypto_header.grid(row=cr, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        crypto_header.columnconfigure(0, weight=1)
         ttk.Label(
-            crypto_tab,
+            crypto_header,
             text="Crypto training/execution controls and runtime behavior.",
             foreground=DARK_MUTED,
             justify="left",
-            wraplength=660,
-        ).grid(row=cr, column=0, columnspan=3, sticky="w", pady=(0, 8))
+            wraplength=520,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(crypto_header, text="Search:", foreground=DARK_MUTED).grid(row=0, column=1, sticky="e", padx=(8, 4))
+        crypto_search_var = tk.StringVar(value="")
+        settings_search_vars["crypto"] = crypto_search_var
+        ttk.Entry(crypto_header, textvariable=crypto_search_var, width=22).grid(row=0, column=2, sticky="e")
+        crypto_search_var.trace_add("write", lambda *_: _apply_settings_search("crypto"))
         cr += 1
         add_row(cr, "Main neural folder:", main_dir_var, browse="dir", parent=crypto_tab); cr += 1
         add_row(cr, "Coins (comma):", coins_var, parent=crypto_tab); cr += 1
@@ -18919,6 +19151,7 @@ class PowerTraderHub(tk.Tk):
         # Start allocation % (shows approx $/coin using the last known account value; always displays the $0.50 minimum).
         start_alloc_label = ttk.Label(crypto_tab, text="Start allocation %:")
         start_alloc_label.grid(row=cr, column=0, sticky="w", padx=(0, 10), pady=6)
+        _register_settings_search_label(crypto_tab, start_alloc_label, _clean_settings_label("Start allocation %:", crypto_tab))
         start_alloc_entry = ttk.Entry(crypto_tab, textvariable=start_alloc_pct_var)
         start_alloc_entry.grid(row=cr, column=1, sticky="ew", pady=6)
         _register_managed_control(start_alloc_entry, "normal", managed=True)
@@ -18991,21 +19224,6 @@ class PowerTraderHub(tk.Tk):
             wraplength=660,
         ).grid(row=cr, column=0, columnspan=3, sticky="w", pady=(0, 6))
         cr += 1
-        add_choice_row(
-            cr,
-            "Market rollout stage:",
-            rollout_stage_var,
-            ["legacy", "scan_expanded", "risk_caps", "execution_v2", "shadow_only", "live_guarded"],
-            parent=crypto_tab,
-        ); cr += 1
-        ttk.Label(
-            crypto_tab,
-            text="Stages: legacy -> scan_expanded -> risk_caps -> execution_v2 -> shadow_only -> live_guarded",
-            foreground=DARK_MUTED,
-            justify="left",
-            wraplength=660,
-        ).grid(row=cr, column=0, columnspan=3, sticky="w", pady=(0, 6))
-        cr += 1
         add_row(cr, "KuCoin unsupported cooldown sec:", kucoin_unsupported_cooldown_var, parent=crypto_tab); cr += 1
         add_row(cr, "Crypto price error log cooldown sec:", crypto_price_error_log_cd_var, parent=crypto_tab); cr += 1
         add_row(cr, "Key rotation warn days:", key_rotation_warn_days_var, parent=crypto_tab); cr += 1
@@ -19057,7 +19275,6 @@ class PowerTraderHub(tk.Tk):
         ); cr += 1
 
         sr = 0
-        add_toggle_row(sr, "Alpaca mode:", "Paper mode", alpaca_paper_var, parent=stock_basic_box, tooltip="Paper mode is simulated. Turn off only when you intend live stock trading."); sr += 1
         add_status_action_row(
             sr,
             "Alpaca API keys:",
@@ -19073,7 +19290,7 @@ class PowerTraderHub(tk.Tk):
         add_row(sr, "Stocks background scan interval seconds:", stock_scan_interval_var, parent=stock_basic_box); sr += 1
         add_row(sr, "Stock order notional USD:", stock_notional_var, parent=stock_basic_box); sr += 1
         add_row(sr, "Stock max open positions:", stock_max_pos_var, parent=stock_basic_box); sr += 1
-        add_toggle_row(sr, "Stocks AI trader:", "Enable auto-trade (paper-safe)", stock_auto_trade_var, parent=stock_basic_box, tooltip="When enabled, stock trader can place paper/live entries based on scanner outputs."); sr += 1
+        add_toggle_row(sr, "Stocks AI trader:", "Enable auto-trade", stock_auto_trade_var, parent=stock_basic_box, tooltip="When enabled, stock trader can place entries based on scanner outputs."); sr += 1
 
         sa = 0
         add_row(sa, "Alpaca base URL:", alpaca_base_url_var, parent=stock_advanced_box); sa += 1
@@ -19102,10 +19319,10 @@ class PowerTraderHub(tk.Tk):
         add_row(sa, "Stock profit target %:", stock_profit_target_var, parent=stock_advanced_box); sa += 1
         add_row(sa, "Stock trailing gap %:", stock_trailing_gap_var, parent=stock_advanced_box); sa += 1
         add_row(sa, "Stock max day trades / day:", stock_day_trades_var, parent=stock_advanced_box); sa += 1
-        add_row(sa, "Stock max position USD/symbol (risk_caps):", stock_max_position_usd_var, parent=stock_advanced_box); sa += 1
-        add_row(sa, "Stock max total exposure % (risk_caps):", stock_max_exposure_var, parent=stock_advanced_box); sa += 1
-        add_row(sa, "Stock live_guarded score multiplier:", stock_guarded_mult_var, parent=stock_advanced_box); sa += 1
-        add_row(sa, "Stock live_guarded min calibrated prob:", stock_min_calib_prob_var, parent=stock_advanced_box); sa += 1
+        add_row(sa, "Stock max position USD/symbol:", stock_max_position_usd_var, parent=stock_advanced_box); sa += 1
+        add_row(sa, "Stock max total exposure %:", stock_max_exposure_var, parent=stock_advanced_box); sa += 1
+        add_row(sa, "Stock score multiplier:", stock_guarded_mult_var, parent=stock_advanced_box); sa += 1
+        add_row(sa, "Stock min calibrated prob:", stock_min_calib_prob_var, parent=stock_advanced_box); sa += 1
         add_row(sa, "Stock max slippage bps:", stock_max_slippage_bps_var, parent=stock_advanced_box); sa += 1
         add_row(sa, "Stock order retry count:", stock_order_retry_count_var, parent=stock_advanced_box); sa += 1
         add_row(sa, "Stock max loss streak:", stock_max_loss_streak_var, parent=stock_advanced_box); sa += 1
@@ -19114,7 +19331,7 @@ class PowerTraderHub(tk.Tk):
         add_row(sa, "Stock loss cooldown seconds:", stock_loss_cooldown_var, parent=stock_advanced_box); sa += 1
         add_row(sa, "Stock max daily loss USD (0=off):", stock_max_daily_loss_usd_var, parent=stock_advanced_box); sa += 1
         add_row(sa, "Stock max daily loss % (0=off):", stock_max_daily_loss_pct_var, parent=stock_advanced_box); sa += 1
-        add_row(sa, "Stock min calibration samples (live_guarded):", stock_min_samples_guarded_var, parent=stock_advanced_box); sa += 1
+        add_row(sa, "Stock min calibration samples:", stock_min_samples_guarded_var, parent=stock_advanced_box); sa += 1
         add_row(sa, "Stock max signal age seconds:", stock_max_signal_age_var, parent=stock_advanced_box); sa += 1
         add_row(sa, "Stock reject drift warn %:", stock_reject_warn_pct_var, parent=stock_advanced_box); sa += 1
         add_toggle_row(sa, "Stock near-close entry block:", "Block new entries near close", stock_block_near_close_var, parent=stock_advanced_box, tooltip="Prevents fresh entries in the final minutes of regular market session."); sa += 1
@@ -19124,8 +19341,7 @@ class PowerTraderHub(tk.Tk):
         add_row(sa, "Stock symbol cooldown reasons:", stock_symbol_cooldown_reasons_var, parent=stock_advanced_box); sa += 1
 
         fr = 0
-        add_toggle_row(fr, "OANDA mode:", "Practice mode", oanda_practice_var, parent=forex_basic_box, tooltip="Practice mode is simulated. Disable only for live forex execution."); fr += 1
-        add_toggle_row(fr, "Live-mode guard:", "Paper-only unless checklist is green", paper_only_guard_var, parent=forex_basic_box, tooltip="Blocks switching to live modes until runtime checklist passes."); fr += 1
+        add_toggle_row(fr, "Live-mode guard:", "Require checklist green", paper_only_guard_var, parent=forex_basic_box, tooltip="Blocks trading until runtime checklist passes."); fr += 1
         add_status_action_row(
             fr,
             "OANDA API keys:",
@@ -19141,7 +19357,7 @@ class PowerTraderHub(tk.Tk):
         add_row(fr, "Forex trade units:", fx_trade_units_var, parent=forex_basic_box); fr += 1
         add_row(fr, "Forex max open positions:", fx_max_pos_var, parent=forex_basic_box); fr += 1
         add_choice_row(fr, "Forex session mode (all/london_ny/london/ny/asia):", fx_session_mode_var, ["all", "london_ny", "london", "ny", "asia"], parent=forex_basic_box); fr += 1
-        add_toggle_row(fr, "Forex AI trader:", "Enable auto-trade (practice only)", fx_auto_trade_var, parent=forex_basic_box, tooltip="Allows forex trader loop to place entries using ranked scanner outputs."); fr += 1
+        add_toggle_row(fr, "Forex AI trader:", "Enable auto-trade", fx_auto_trade_var, parent=forex_basic_box, tooltip="Allows forex trader loop to place entries using ranked scanner outputs."); fr += 1
 
         fa = 0
         add_row(fa, "OANDA REST URL:", oanda_rest_url_var, parent=forex_advanced_box); fa += 1
@@ -19158,16 +19374,16 @@ class PowerTraderHub(tk.Tk):
         add_row(fa, "Forex cached fallback size multiplier (0.1-1.0):", fx_cached_scan_size_mult_var, parent=forex_advanced_box); fa += 1
         add_toggle_row(fa, "Forex data quality entry gate:", "Require thinker data quality OK before entry", fx_require_data_quality_gate_var, parent=forex_advanced_box, tooltip="Blocks entries when scanner quality checks fail."); fa += 1
         add_row(fa, "Forex max reject rate % for entries:", fx_reject_rate_gate_var, parent=forex_advanced_box); fa += 1
-        add_row(fa, "Forex max position USD/pair (risk_caps):", fx_max_pos_usd_pair_var, parent=forex_advanced_box); fa += 1
+        add_row(fa, "Forex max position USD/pair:", fx_max_pos_usd_pair_var, parent=forex_advanced_box); fa += 1
         add_row(fa, "Forex score threshold:", fx_score_threshold_var, parent=forex_advanced_box); fa += 1
         add_toggle_row(fa, "Forex replay adaptive tuning:", "Blend replay recommendation into threshold", fx_replay_adaptive_enabled_var, parent=forex_advanced_box, tooltip="Uses recent scanner score distributions to nudge threshold toward target entry flow."); fa += 1
         add_row(fa, "Forex replay adaptive weight (0-1):", fx_replay_adaptive_weight_var, parent=forex_advanced_box); fa += 1
         add_row(fa, "Forex replay adaptive step cap %:", fx_replay_adaptive_step_cap_var, parent=forex_advanced_box); fa += 1
         add_row(fa, "Forex profit target %:", fx_profit_target_var, parent=forex_advanced_box); fa += 1
         add_row(fa, "Forex trailing gap %:", fx_trailing_gap_var, parent=forex_advanced_box); fa += 1
-        add_row(fa, "Forex max exposure % (risk_caps proxy):", fx_max_exposure_var, parent=forex_advanced_box); fa += 1
-        add_row(fa, "Forex live_guarded score multiplier:", fx_guarded_mult_var, parent=forex_advanced_box); fa += 1
-        add_row(fa, "Forex live_guarded min calibrated prob:", fx_min_calib_prob_var, parent=forex_advanced_box); fa += 1
+        add_row(fa, "Forex max exposure %:", fx_max_exposure_var, parent=forex_advanced_box); fa += 1
+        add_row(fa, "Forex score multiplier:", fx_guarded_mult_var, parent=forex_advanced_box); fa += 1
+        add_row(fa, "Forex min calibrated prob:", fx_min_calib_prob_var, parent=forex_advanced_box); fa += 1
         add_row(fa, "Forex max slippage bps:", fx_max_slippage_bps_var, parent=forex_advanced_box); fa += 1
         add_row(fa, "Forex order retry count:", fx_order_retry_count_var, parent=forex_advanced_box); fa += 1
         add_row(fa, "Forex max loss streak:", fx_max_loss_streak_var, parent=forex_advanced_box); fa += 1
@@ -19176,7 +19392,7 @@ class PowerTraderHub(tk.Tk):
         add_row(fa, "Forex loss cooldown seconds:", fx_loss_cooldown_var, parent=forex_advanced_box); fa += 1
         add_row(fa, "Forex max daily loss USD (0=off):", fx_max_daily_loss_usd_var, parent=forex_advanced_box); fa += 1
         add_row(fa, "Forex max daily loss % (0=off):", fx_max_daily_loss_pct_var, parent=forex_advanced_box); fa += 1
-        add_row(fa, "Forex min calibration samples (live_guarded):", fx_min_samples_guarded_var, parent=forex_advanced_box); fa += 1
+        add_row(fa, "Forex min calibration samples:", fx_min_samples_guarded_var, parent=forex_advanced_box); fa += 1
         add_row(fa, "Forex max signal age seconds:", fx_max_signal_age_var, parent=forex_advanced_box); fa += 1
         add_row(fa, "Forex reject drift warn %:", fx_reject_warn_pct_var, parent=forex_advanced_box); fa += 1
         add_row(fa, "Global max exposure % (all markets, 0=off):", market_global_exposure_var, parent=forex_advanced_box); fa += 1
@@ -19812,54 +20028,11 @@ class PowerTraderHub(tk.Tk):
                     _apply_profile_to_form(profile_key)
                 self.settings["settings_control_mode"] = str(mode_key)
                 self.settings["settings_profile"] = str(profile_key)
-                req_alpaca_live = not bool(alpaca_paper_var.get())
-                req_oanda_live = not bool(oanda_practice_var.get())
-                req_live_markets = []
-                if req_alpaca_live:
-                    req_live_markets.append("Stocks/Alpaca")
-                if req_oanda_live:
-                    req_live_markets.append("Forex/OANDA")
-                paper_guard_enabled = bool(paper_only_guard_var.get())
-                if req_live_markets:
-                    runtime_snapshot = _safe_read_json(os.path.join(self.hub_dir, "runtime_state.json")) or {}
-                    checklist = evaluate_live_mode_checklist(runtime_snapshot)
-                    requested_stage = _normalize_rollout_stage(
-                        str(rollout_stage_var.get() or "").strip().lower(),
-                        str(DEFAULT_SETTINGS.get("market_rollout_stage", "legacy")),
-                    )
-                    effective_stage, rollout_stage_note = _resolve_rollout_stage_for_broker_modes(
-                        requested_stage,
-                        bool(alpaca_paper_var.get()),
-                        bool(oanda_practice_var.get()),
-                    )
-                    if paper_guard_enabled and (not bool(checklist.get("ok", False))):
-                        reasons = ", ".join([str(x) for x in list(checklist.get("reasons", []) or [])[:5]]) or "checklist_not_green"
-                        messagebox.showerror(
-                            "Live mode blocked",
-                            "Live mode is locked because checklist is not green.\n\n"
-                            f"Reasons: {reasons}\n\n"
-                            "Fix Runtime/Alerts first, or disable the paper-only guard in Settings.",
-                        )
-                        return
-                    if not messagebox.askyesno(
-                        "Confirm live mode",
-                        ("You are switching to LIVE execution for:\n"
-                        + "".join([f"  - {m}\n" for m in req_live_markets])
-                        + "\nThis can place real orders with real funds.\n"
-                        + (f"{rollout_stage_note}\n" if rollout_stage_note else "")
-                        + "Continue?"),
-                    ):
-                        return
+                _ = bool(paper_only_guard_var.get())
 
-                alpaca_paper_mode = bool(alpaca_paper_var.get())
-                oanda_practice_mode = bool(oanda_practice_var.get())
-                alpaca_base_default = f"https://{ALPACA_PAPER_HOST}" if alpaca_paper_mode else f"https://{ALPACA_LIVE_HOST}"
-                oanda_rest_default = (
-                    f"https://{OANDA_PRACTICE_REST_HOST}" if oanda_practice_mode else f"https://{OANDA_LIVE_REST_HOST}"
-                )
-                oanda_stream_default = (
-                    f"https://{OANDA_PRACTICE_STREAM_HOST}" if oanda_practice_mode else f"https://{OANDA_LIVE_STREAM_HOST}"
-                )
+                alpaca_base_default = f"https://{ALPACA_LIVE_HOST}"
+                oanda_rest_default = f"https://{OANDA_LIVE_REST_HOST}"
+                oanda_stream_default = f"https://{OANDA_LIVE_STREAM_HOST}"
                 raw_alpaca_base = str(alpaca_base_url_var.get() or "").strip()
                 raw_alpaca_data = str(alpaca_data_url_var.get() or "").strip()
                 raw_oanda_rest = str(oanda_rest_url_var.get() or "").strip()
@@ -19870,34 +20043,26 @@ class PowerTraderHub(tk.Tk):
                 oanda_stream_norm, _, oanda_stream_host = normalize_endpoint_url(raw_oanda_stream, default=oanda_stream_default)
                 if (not raw_alpaca_base) or (not alpaca_base_norm):
                     alpaca_base_url_txt = alpaca_base_default
-                    alpaca_base_host = ALPACA_PAPER_HOST if alpaca_paper_mode else ALPACA_LIVE_HOST
+                    alpaca_base_host = ALPACA_LIVE_HOST
                 else:
                     alpaca_base_url_txt = alpaca_base_norm
-                if alpaca_paper_mode and (alpaca_base_host == ALPACA_LIVE_HOST):
-                    alpaca_base_url_txt = f"https://{ALPACA_PAPER_HOST}"
-                elif (not alpaca_paper_mode) and (alpaca_base_host == ALPACA_PAPER_HOST):
-                    alpaca_base_url_txt = f"https://{ALPACA_LIVE_HOST}"
+                if alpaca_base_host == ALPACA_PAPER_HOST:
+                    alpaca_base_url_txt = alpaca_base_default
                 alpaca_data_url_txt = alpaca_data_norm or f"https://{ALPACA_DATA_HOST}"
                 if (not raw_oanda_rest) or (not oanda_rest_norm):
                     oanda_rest_url_txt = oanda_rest_default
-                    oanda_rest_host = OANDA_PRACTICE_REST_HOST if oanda_practice_mode else OANDA_LIVE_REST_HOST
+                    oanda_rest_host = OANDA_LIVE_REST_HOST
                 else:
                     oanda_rest_url_txt = oanda_rest_norm
                 if (not raw_oanda_stream) or (not oanda_stream_norm):
                     oanda_stream_url_txt = oanda_stream_default
-                    oanda_stream_host = OANDA_PRACTICE_STREAM_HOST if oanda_practice_mode else OANDA_LIVE_STREAM_HOST
+                    oanda_stream_host = OANDA_LIVE_STREAM_HOST
                 else:
                     oanda_stream_url_txt = oanda_stream_norm
-                if oanda_practice_mode:
-                    if oanda_rest_host == OANDA_LIVE_REST_HOST:
-                        oanda_rest_url_txt = f"https://{OANDA_PRACTICE_REST_HOST}"
-                    if oanda_stream_host == OANDA_LIVE_STREAM_HOST:
-                        oanda_stream_url_txt = f"https://{OANDA_PRACTICE_STREAM_HOST}"
-                else:
-                    if oanda_rest_host == OANDA_PRACTICE_REST_HOST:
-                        oanda_rest_url_txt = f"https://{OANDA_LIVE_REST_HOST}"
-                    if oanda_stream_host == OANDA_PRACTICE_STREAM_HOST:
-                        oanda_stream_url_txt = f"https://{OANDA_LIVE_STREAM_HOST}"
+                if oanda_rest_host == OANDA_PRACTICE_REST_HOST:
+                    oanda_rest_url_txt = oanda_rest_default
+                if oanda_stream_host == OANDA_PRACTICE_STREAM_HOST:
+                    oanda_stream_url_txt = oanda_stream_default
 
                 self.settings["main_neural_dir"] = main_dir_var.get().strip()
                 self.settings["coins"] = [c.strip().upper() for c in coins_var.get().split(",") if c.strip()]
@@ -19998,17 +20163,8 @@ class PowerTraderHub(tk.Tk):
                 self.settings["alpaca_secret_key"] = ""
                 self.settings["alpaca_base_url"] = str(alpaca_base_url_txt or alpaca_base_default)
                 self.settings["alpaca_data_url"] = str(alpaca_data_url_txt or f"https://{ALPACA_DATA_HOST}")
-                self.settings["alpaca_paper_mode"] = bool(alpaca_paper_mode)
-                stage = _normalize_rollout_stage(
-                    str(rollout_stage_var.get() or "").strip().lower(),
-                    str(DEFAULT_SETTINGS.get("market_rollout_stage", "legacy")),
-                )
-                stage, rollout_stage_note = _resolve_rollout_stage_for_broker_modes(
-                    stage,
-                    bool(alpaca_paper_mode),
-                    bool(oanda_practice_mode),
-                )
-                self.settings["market_rollout_stage"] = stage
+                self.settings["alpaca_paper_mode"] = False
+                self.settings["market_rollout_stage"] = "live_guarded"
                 mode = str(stock_universe_mode_var.get() or "").strip().lower()
                 if mode not in {"core", "watchlist", "all_tradable_filtered"}:
                     mode = str(DEFAULT_SETTINGS.get("stock_universe_mode", "core"))
@@ -20205,7 +20361,7 @@ class PowerTraderHub(tk.Tk):
                 self.settings["oanda_api_token"] = ""
                 self.settings["oanda_rest_url"] = str(oanda_rest_url_txt or oanda_rest_default)
                 self.settings["oanda_stream_url"] = str(oanda_stream_url_txt or oanda_stream_default)
-                self.settings["oanda_practice_mode"] = bool(oanda_practice_mode)
+                self.settings["oanda_practice_mode"] = False
                 self.settings["paper_only_unless_checklist_green"] = bool(paper_only_guard_var.get())
                 try:
                     self.settings["key_rotation_warn_days"] = max(7, int(float((key_rotation_warn_days_var.get() or "").strip() or 90)))
@@ -20452,8 +20608,6 @@ class PowerTraderHub(tk.Tk):
                 self._refresh_coin_dependent_ui(prev_coins)
 
                 saved_msg = "Settings saved."
-                if rollout_stage_note:
-                    saved_msg += f"\n\n{rollout_stage_note}"
                 messagebox.showinfo("Saved", saved_msg)
                 _close_settings()
 
